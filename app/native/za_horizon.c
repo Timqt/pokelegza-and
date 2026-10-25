@@ -780,6 +780,25 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
               "sm.cnt=%u sm.sess=%u",
               (unsigned long long)(unsigned int)a0, (void *)(uintptr_t)ro,
               pre0, pre8, post8, sm_cnt, sm_sess);
+        // ★ 应答缓冲区定位探针
+        //   sdk+0x14eb60 用 `ldr w9,[x8]` 读应答首字并与 "SFCO"(0x4F434653) 比。
+        //   x8 = [sp+0x90] + idx*4，而 [sp+0x90] 在 sdk+0x14e92c 被 stp xzr,xzr 清零。
+        //   我们要写的就是那块。它落在客机栈上 —— 从 svc 时的 sp 往上/下扫，
+        //   找 0x120 字节全 0 的区域并打印候选，先看清楚再动手。
+        {
+            unsigned long gsp = za_horizon_guest_sp();
+            static int n33;
+            if (n33 < 6 && gsp)
+            {
+                n33++;
+                ZLOGI("  resp-scan: guest sp=%p  head=%016llx %016llx %016llx %016llx",
+                      (void *)(uintptr_t)gsp,
+                      *(unsigned long long *)(uintptr_t)(gsp + 0x40),
+                      *(unsigned long long *)(uintptr_t)(gsp + 0x90),
+                      *(unsigned long long *)(uintptr_t)(gsp + 0xe0),
+                      *(unsigned long long *)(uintptr_t)(gsp + 0x130));
+            }
+        }
         // IPC 应答：sm 的 GetService 之类需要往缓冲区写回复。
         // 目前最小实现：只保证结果码 0 + 清挂起位，让初始化流程能继续。
         return 0;
