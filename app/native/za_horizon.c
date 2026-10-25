@@ -627,21 +627,6 @@ static void za_ensure_reply_buf(unsigned long long addr)
 static void za_write_cmif_reply(unsigned long long ro, unsigned long long reply_buf,
                                  unsigned long long out_ptr, unsigned int hdr0, unsigned int hdr1)
 {
-    /* ★ 域（domain）会话的应答头：请求 [0]=DomainInHeader{cmd, in_objects, …}
-     *   （hdr0=0x6=命令、hdr1=0xc=目标 object_id），应答 [0] 必须是
-     *   DomainOutHeader{out_objects=0, …} —— 不清的话 SDK 把**残留的请求头**
-     *   当成输出对象数解析 ⇒ sf 客户端认为应答损坏 ⇒ tick 超时重试 ⇒ 自旋
-     *   （实测：IsEnabledAccessLog 的 fsp-srv 域命令在 GetSystemTick 循环里打转）。
-     *   ⚠ 只对 fsp-srv 做：pctl/time:u 的会话路径会回读 [0]，无差别清零
-     *     反而让 boot 在更早处 abort（实测 count 103 ⇒ 25 的回归）。 */
-    {
-        const char *nm = za_fake_svc_name((unsigned int)reply_buf);
-        if (nm && strcmp(nm, "fsp-srv") == 0)
-        {
-            unsigned int dom_out[2] = { 0, 0 };
-            memcpy((void *)(uintptr_t)ro, dom_out, sizeof dom_out);
-        }
-    }
     /* 取证：把请求的前 0x40 字节打出来 */
     {
         unsigned int w[16];

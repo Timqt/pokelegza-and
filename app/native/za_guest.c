@@ -825,6 +825,44 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 za_fatal_write(buf, (size_t)(p - buf));
             }
         }
+        // ★ main 的 fs 分配器对象现场（0x3de4b90）+ 它的 vtable（0x3af0ac8）。
+        //   实测崩溃：vtable+0x10 = 0x20 ⇒ br 0x20。看运行时表里到底是什么。
+        {
+            extern unsigned char *za_guest_base;
+            if (za_guest_base)
+            {
+                unsigned long long obj = (unsigned long long)(uintptr_t)za_guest_base + 0x3de4b90ull;
+                unsigned long long vt = 0;
+                memcpy(&vt, (void *)(uintptr_t)obj, 8);
+                char *p2 = buf;
+                p2 = za_put_str(p2, "ZaGuest: MAIN obj=");
+                p2 = za_put_hex(p2, *(unsigned long long *)(uintptr_t)obj);
+                p2 = za_put_str(p2, " obj+8=");
+                p2 = za_put_hex(p2, *(unsigned long long *)(uintptr_t)(obj + 8));
+                p2 = za_put_str(p2, "\n");
+                za_fatal_write(buf, (size_t)(p2 - buf));
+                if (vt >= (unsigned long long)(uintptr_t)za_guest_base &&
+                    vt < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE)
+                {
+                    unsigned long long o = vt - (unsigned long long)(uintptr_t)za_guest_base;
+                    for (int i = 0; i < 6; i++)
+                    {
+                        char *q = buf;
+                        q = za_put_str(q, "ZaGuest: MAIN vt[");
+                        q = za_put_dec(q, i);
+                        q = za_put_str(q, "]=");
+                        q = za_put_hex(q, *(unsigned long long *)(uintptr_t)(vt + i * 8));
+                        q = za_put_str(q, "\n");
+                        za_fatal_write(buf, (size_t)(q - buf));
+                    }
+                    ZLOGI("  (vtable 偏移 = main+%#llx)", o);
+                }
+                else
+                {
+                    ZLOGE("  MAIN obj[0] = %#llx（不在 main 映像内！）", vt);
+                }
+            }
+        }
         za_log_sdk_state((unsigned long)uc->uc_mcontext.regs[19],
                          (unsigned long)uc->uc_mcontext.regs[8]);
         // svc 轨迹：崩溃前最后几次 svc 的服务号 + 调用点 PC + 寄存器
@@ -1802,6 +1840,47 @@ static void *za_sampler_watchdog(void *arg)
         unsigned long long pc = za_guest_last_guest_pc;
         if (pc && pc == stuck_pc) { if (++stuck_n == 40) ZLOGE("★ 客机 200ms 停在同一 PC=%#llx", pc); }
         else { stuck_pc = pc; stuck_n = 0; }
+        // ★ hook 槽监视：0xc90600 应该一直是 za_host_tick_hook（宿主地址）。
+        //   实测被改成 sdk+0x13d9a0（GetSystemTick 自己）⇒ 桩↔函数互跳死循环。
+        //   这里每 2 秒打一次值 + 首个非 hook 值时把桩区头 0x60 字节也倒出来。
+        {
+            extern volatile unsigned long za_sdk_base;
+            extern volatile int za_cnctp_ready;
+            static unsigned long long first_bad;
+            static int dumped;
+            if (za_sdk_base && za_cnctp_ready)
+            {
+                unsigned long long slot = *(volatile unsigned long long *)(za_sdk_base + 0xc90600);
+                unsigned long long hook = (unsigned long long)(uintptr_t)za_host_tick_hook;
+                if (slot != hook && !first_bad)
+                {
+                    first_bad = slot;
+                    ZLOGE("★ hook 槽被改！0xc90600 = %#llx（hook=%#llx）", slot, hook);
+                }
+                /* fs 分配器槽监视：初始 = base+0xdcb90（SDK 默认），
+                 * main 调 SetAllocator 后**合法地**变成 main 映像内的函数。
+                 * 只有既不是默认、也不在 main 映像内才算异常。 */
+                {
+                    static unsigned long long fs_bad;
+                    unsigned long long fs = *(volatile unsigned long long *)(za_sdk_base + 0xb88898);
+                    int ok = (fs == za_sdk_base + 0xdcb90ull) ||
+                             (za_guest_base && fs >= (unsigned long long)(uintptr_t)za_guest_base &&
+                              fs < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE);
+                    if (!ok && !fs_bad)
+                    {
+                        fs_bad = fs;
+                        ZLOGE("★ fs 分配器槽异常！0xb88898 = %#llx（既非 SDK 默认也非 main 函数）", fs);
+                    }
+                }
+                if (first_bad && !dumped && first_bad == slot)
+                {
+                    dumped = 1;
+                    for (unsigned o = 0; o < 0x60; o += 4)
+                        ZLOGE("  桩区[%#x] = %08x", 0xc90000u + o,
+                              *(const volatile unsigned int *)(za_sdk_base + 0xc90000 + o));
+                }
+            }
+        }
     }
     return NULL;
 }

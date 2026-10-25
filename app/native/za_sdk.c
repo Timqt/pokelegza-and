@@ -37,6 +37,7 @@ void *za_sdk_ctx = NULL;
 extern long za_horizon_svc(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long nr);
 extern volatile unsigned long za_horizon_regs[16];
 // 崩溃现场要用它把地址换算成「sdk+偏移」（定义在 za_guest.c）
+volatile int za_cnctp_ready;   /* CNTPCT 桩/hook 槽已装好（看门狗门控用） */
 extern volatile unsigned long za_sdk_base;
 // 只读 TLS 页的绝对地址（SDK 装载时填）。za_horizon.c 的临界区要按同一来源取 owner_id。
 volatile unsigned long za_ro_tls_page = 0;
@@ -370,6 +371,20 @@ int za_sdk_load(za_mod_t *sdk,
         }
     }
 
+    // 5.65) fs 分配器默认槽的基址修正。
+    //   实测：SDK+0xb88898/0xb888a0 文件值 = 0xdcb90/0xdcba0（SDK 内建默认
+    //   alloc/free），但**重定位表里没有这两个槽** ⇒ 不 rebase 就永远不等于
+    //   base+0xdcb90 ⇒ nn::fs::SetAllocator（SDK+0xdc810）的前置检查失败
+    //   ⇒ 它进错误汇报分支（GetSystemTick 循环/断链）且**不保存 main 的分配器**
+    //   ⇒ 之后 nn::fs::detail::Allocate 从 [0xb88898] 取到垃圾指针 ⇒ blr 跳空
+    //   （实测 pc=0x20、x30=sdk+0xdca0c）。
+    {
+        unsigned long long *a = (unsigned long long *)(base + 0xb88898);
+        if (*a == 0xdcb90ull) *a = (unsigned long long)(uintptr_t)(base + 0xdcb90);
+        if (*(a + 1) == 0xdcba0ull) *(a + 1) = (unsigned long long)(uintptr_t)(base + 0xdcba0);
+        ZLOGI("fs 分配器默认槽：%#llx / %#llx（已加基址）", *a, *(a + 1));
+    }
+
     // 5.7) SDK 的 abort 观察者链在我们环境里必然踩空：InvokeSdkAbortObserver
     //      （SDK+0x9c630）遍历的观察者对象由 SDK 运行时注册，我们没有真的
     //      diag/am 运行时 ⇒ 列表里是垃圾 ⇒ abort 一发生就在这里 SIGSEGV，
@@ -396,7 +411,7 @@ int za_sdk_load(za_mod_t *sdk,
             if ((w & 0xFFFFFCE0u) != 0xD53BE020u) continue;   /* mrs Xt,CNTPCT_EL0 */
             unsigned rt = w & 0x1Fu;
             unsigned long long stub_off = bump;
-            bump += 0x14;                                      /* 5 条指令 */
+            bump += 0x1C;                                      /* 7 条指令 */
             unsigned int *s = (unsigned int *)(base + stub_off);
             {   /* adrp x16, <0xc90600 页>
                  * imm21 = 页差；低 2 位放 immlo（bits30-29），高 19 位放 immhi（bits23-5）。
@@ -410,11 +425,18 @@ int za_sdk_load(za_mod_t *sdk,
             /* ldr x16,[x16,#页内偏移] —— ⚠ imm12 按 8 缩放；漏了偏移会读到
              *   桩自己的指令（实测 x16 = 头两条指令字 ⇒ blr 跳垃圾）。 */
             s[1] = 0xF9400000u | (((0xc90600ull & 0xFFFull) >> 3) << 10) | (16u << 5) | 16u;
-            s[2] = 0xD63F0200u;                                /* blr  x16         */
-            s[3] = 0xAA0003E0u | rt;                           /* mov  Xt, x0      */
+            /* ★ 必须保存/恢复 x30！被替换的 mrs 站点可能是**叶子函数**
+             *   （GetSystemTick 就是：x30 = 调用者的返回地址，没有 prologue 保护）。
+             *   blr 覆盖 x30 后，`b 回原址` 落到函数末尾的 `ret` ⇒ ret 跳回桩里
+             *   ⇒ 桩↔ret 无限乒乓（实测：pc 恒在 GetSystemTick+4，x30=桩+0xc，
+             *   100% CPU、无 svc、看门狗 1 秒判死）。 */
+            s[2] = 0xF81F0FFEu;                                /* str x30,[sp,#-0x10]! */
+            s[3] = 0xD63F0200u;                                /* blr  x16         */
+            s[4] = 0xF84107FEu;                                /* ldr  x30,[sp],#0x10  */
+            s[5] = 0xAA0003E0u | rt;                           /* mov  Xt, x0      */
             {   /* b 回原址+4 */
-                long long delta = (long long)(off + 4) - (long long)(stub_off + 0x10);
-                s[4] = 0x14000000u | (unsigned)((delta >> 2) & 0x3FFFFFFu);
+                long long delta = (long long)(off + 4) - (long long)(stub_off + 0x18);
+                s[6] = 0x14000000u | (unsigned)((delta >> 2) & 0x3FFFFFFu);
             }
             {   /* 原址 mrs → b <桩> */
                 long long delta = (long long)stub_off - (long long)off;
@@ -424,6 +446,7 @@ int za_sdk_load(za_mod_t *sdk,
             patched++;
         }
         ZLOGI("CNTPCT 替换：%u 处 → 门区桩（hook @base+0xc90600）", patched);
+        za_cnctp_ready = 1;
     }
 
     // 6) 只读 TLS：客机 SDK 有 123 处 `mrs Xt,TPIDRRO_EL0`，
