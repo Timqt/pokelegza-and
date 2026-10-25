@@ -222,6 +222,11 @@ def main():
     else:
         lg = lg + "\n" + lcat
     cg = adb(serial, "shell", "run-as", PKG, "cat", "files/za_crash.log", timeout=30)
+    # ⚠ 客机线程崩溃的**真正现场**写在 za_fatal.log（za_crash.log 是给渲染线程那次用的，
+    #   客机崩溃时它是 0 字节）⇒ 只收 za_crash.log 会让报告里「崩溃点」永远为空。
+    fg = adb(serial, "shell", "run-as", PKG, "cat", "files/za_fatal.log", timeout=30)
+    if fg.strip():
+        cg = (cg + "\n" + fg) if cg.strip() else fg
     ei = adb(serial, "shell", "dumpsys", "activity", "exit-info", PKG, timeout=60)
     pid = (adb(serial, "shell", "pidof", PKG) or "").strip()
 

@@ -258,6 +258,46 @@ int za_sdk_load(za_mod_t *sdk,
               (void *)gate_bin, gate_len, (size_t)ZA_SVC_GATE_SIZE);
     }
 
+    // 5.5) HLE 接管：把某些 SDK 导出函数换成宿主桩
+    //
+    // 为什么要接管：这些函数在真机上会去连 Horizon 的系统服务（IPC）。
+    // 我们没有那些服务进程 —— 客机走 CMIF 时拿不到出参对象，
+    // SDK+0x3fcbf4 对全局 SDK+0xc024b8 做 NULL 解引用 ⇒ SIGSEGV
+    // （真机实测：signal 0xb，pc=SDK+0x3fcbf4，addr=0x0）。
+    //
+    // ★ 路线与已上线成品 d2r-and 完全一致（按函数名接管，见
+    //   d2r-android/dm/host/hle_sdkinit.c 的 HLE_FORCE("_ZN2nn4pctl10InitializeEv", …)）。
+    //   本版是最小实现：把函数体改写成「直接返回」。
+    //   （要调宿主 C 函数的通用版，可复用 svc 门区那套 trampoline：
+    //    门区里放一个 `mov w9,#hle_id ; b za_horizon_tramp` 小跳板，
+    //    宿主在 za_horizon_dispatch 里按 hle_id 分派。）
+    //
+    // ⚠ 改写长度必须 ≤ 该函数的真实长度，否则会踩坏下一个函数。
+    //   nn::pctl::Initialize（SDK+0x3fbbc0）只是 1 条尾调用跳板 `b 0x6457f0`
+    //   ⇒ 只能写 1 个字（4 字节）。
+    {
+        typedef struct
+        {
+            unsigned int off;     /* SDK 映像内偏移（函数入口） */
+            unsigned int words;   /* 要改写的字数（4 字节/字） */
+            unsigned int w[2];    /* 改写内容 */
+            const char *name;
+        } za_hle_stub_t;
+
+        static const za_hle_stub_t g_hle[] = {
+            /* nn::pctl::Initialize（void）：家长控制服务。单机无家长控制 ⇒ 不建会话 */
+            { 0x3fbbc0u, 1, { 0xd65f03c0u, 0 }, "nn::pctl::Initialize" },
+        };
+
+        for (unsigned i = 0; i < sizeof g_hle / sizeof g_hle[0]; i++)
+        {
+            unsigned int *p = (unsigned int *)(base + g_hle[i].off);
+            for (unsigned k = 0; k < g_hle[i].words && k < 2; k++)
+                p[k] = g_hle[i].w[k];
+            ZLOGI("HLE 接管：%s（SDK+%#x）→ 直接返回", g_hle[i].name, g_hle[i].off);
+        }
+    }
+
     // 6) 只读 TLS：客机 SDK 有 123 处 `mrs Xt,TPIDRRO_EL0`，
     //    而安卓/bionic **从不设置 TPIDRRO_EL0**（一直是 0）⇒ 客机读到空指针直接崩。
     //    做法：把 `mrs` 1:1 换成 `adrp Xt,<我们自备的只读 TLS 页>`（相对偏移全部不变），
