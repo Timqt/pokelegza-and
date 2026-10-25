@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  宝可梦 Z-A 安卓移植 —— 独立应用清单。
+
+  与暗黑破坏神那个 APK 完全分离：
+    包名   org.pokelegza.android.port  （暗黑是 org.d2r.android.port）
+    应用名 宝可梦ZA
+    原生库 libzaandroid.so             （暗黑是 libdmandroid.so）
+  两个包名不同 ⇒ 可以同时装在一台设备上，互不覆盖。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="org.pokelegza.android.port" android:versionCode="1" android:versionName="0.1-m1">
+    <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="35" />
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x00401000" android:required="true" />
+    <uses-feature android:name="android.hardware.vulkan.level" android:version="0x00401000" android:required="false" />
+
+    <application android:label="宝可梦ZA" android:icon="@mipmap/ic_launcher" android:hasCode="false"
+        android:debuggable="true" android:extractNativeLibs="true" android:allowBackup="false">
+        <!-- 平板是 16:10 竖屏为主的设备，游戏按横屏跑；sensorLandscape 让设备在两个横屏方向间跟随旋转。 -->
+        <activity android:name="android.app.NativeActivity" android:exported="true"
+            android:screenOrientation="sensorLandscape"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:theme="@android:style/Theme.Material.NoActionBar">
+            <meta-data android:name="android.app.lib_name" android:value="zaandroid" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

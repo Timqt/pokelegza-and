@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AssemblyName>bnsh_xlate</AssemblyName>
+    <RootNamespace>BnshXlate</RootNamespace>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="Ryujinx.Graphics.Shader">
+      <HintPath>$(TranslatorBin)\Ryujinx.Graphics.Shader.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+    <Reference Include="Ryujinx.Common">
+      <HintPath>$(TranslatorBin)\Ryujinx.Common.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+</Project>

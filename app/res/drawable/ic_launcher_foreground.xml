@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 图标前景：抽象的「Z-A」标记（纯矢量自绘，不含游戏素材）。 -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Z -->
+    <path android:fillColor="#FFF4F6FB"
+        android:pathData="M32,30 L76,30 L76,39 L46,69 L76,69 L76,78 L32,78 L32,69 L62,39 L32,39 Z" />
+    <!-- A 的简化笔画 -->
+    <path android:fillColor="#FF63D2FF"
+        android:pathData="M40,84 L46.5,72 L52.5,72 L59,84 L53.2,84 L51.6,81 L47.2,81 L45.6,84 Z M48.4,77.6 L50.4,77.6 L49.4,75.6 Z" />
+</vector>
