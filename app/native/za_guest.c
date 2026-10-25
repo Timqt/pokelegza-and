@@ -393,6 +393,41 @@ static void za_log_sdk_state(unsigned long x19, unsigned long x8)
 // 拦截 32..62 的实时信号（63 留给 PC 采样器）：只记录「信号号 / 故障 PC / siginfo」后转给致命处理
 static void za_rt_catch(int sig, siginfo_t *info, void *ctx);
 static void za_fatal_handler(int sig, siginfo_t *info, void *ctx);
+// 崩溃时倒出 svc 轨迹（定义在后面）
+void za_dump_svc_trace(void);
+// 客机 PC 采样环形轨迹（定义在后面；fatal handler 在它之前）
+#define ZA_PC_RING 16
+extern volatile unsigned long za_pc_ring[ZA_PC_RING];
+extern volatile unsigned long za_pc_ring_pos;
+static void za_dump_pc_ring(void)
+{
+    char line[256];
+    unsigned long pos = za_pc_ring_pos;
+    {
+        char *p = line;
+        p = za_put_str(p, "ZaGuest: pc-ring total=");
+        p = za_put_dec(p, (unsigned long long)pos);
+        p = za_put_str(p, " (newest first)\n");
+        za_fatal_write(line, (size_t)(p - line));
+    }
+    unsigned long n = pos < ZA_PC_RING ? pos : ZA_PC_RING;
+    for (unsigned long k = 1; k <= n; k++)
+    {
+        unsigned long pc = za_pc_ring[(pos - k) % ZA_PC_RING];
+        const char *tag = "?";
+        unsigned long off = pc;
+        if (za_sdk_base && pc >= za_sdk_base) { off = pc - za_sdk_base; tag = "sdk"; }
+        else if (za_guest_base && pc >= (unsigned long)za_guest_base)
+        { off = pc - (unsigned long)za_guest_base; tag = "main"; }
+        char *p = line;
+        p = za_put_str(p, "ZaGuest:   pc ");
+        p = za_put_str(p, tag);
+        p = za_put_str(p, "+");
+        p = za_put_hex(p, (unsigned long long)off);
+        p = za_put_str(p, "\n");
+        za_fatal_write(line, (size_t)(p - line));
+    }
+}
 // 备用信号栈：栈溢出时处理器自己也要有地方跑，否则进程被静默杀掉（连日志都没有）。
 // ⚠ sigaltstack 是 **per-thread** 的；⚠⚠ 备用栈**不能放 TLS 里**（客机会重写线程 TLS）。
 #define ZA_ALTSTACK_SLOTS 64
@@ -521,6 +556,10 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
         }
         za_log_sdk_state((unsigned long)uc->uc_mcontext.regs[19],
                          (unsigned long)uc->uc_mcontext.regs[8]);
+        // svc 轨迹：崩溃前最后几次 svc 的服务号 + 调用点 PC + 寄存器
+        za_dump_svc_trace();
+        // 客机 PC 采样轨迹：崩溃前最后若干条真实执行地址
+        za_dump_pc_ring();
         za_log_guest_trace((unsigned long)uc->uc_mcontext.sp);
         za_log_stack((unsigned long)uc->uc_mcontext.sp);
     }
@@ -607,12 +646,62 @@ unsigned long za_svc_total_take(void)
 }
 
 // svc 轨迹：记最近 32 次的（服务号, 调用点 PC）
-void za_svc_trace(long nr, unsigned long pc)
+// 另记 x0/x2（第 1/3 参）与 x19（callee-saved）—— 崩溃点几乎总是紧跟在
+// 某条 svc 之后（客机在 svc 前把状态准备好，返回后立刻用它去跳转），
+// 只有记下这条 svc 的现场，才能把「svc 返回了什么」和「客机拿它干了什么」对上。
+unsigned long za_svc_trace_arg0[32];
+unsigned long za_svc_trace_arg2[32];
+unsigned long za_svc_trace_x19[32];
+unsigned long za_svc_trace_sp[32];
+void za_svc_trace_rich(long nr, unsigned long pc,
+                       unsigned long a0, unsigned long a2, unsigned long x19)
 {
     unsigned long pos = za_svc_trace_pos;
-    za_svc_trace_nr[pos % 32] = (unsigned long)nr;
-    za_svc_trace_pc[pos % 32] = pc;
+    unsigned long i = pos % 32;
+    za_svc_trace_nr[i] = (unsigned long)nr;
+    za_svc_trace_pc[i] = pc;
+    za_svc_trace_arg0[i] = a0;
+    za_svc_trace_arg2[i] = a2;
+    za_svc_trace_x19[i] = x19;
+    za_svc_trace_sp[i] = (unsigned long)za_horizon_guest_sp();
     za_svc_trace_pos = pos + 1;
+}
+void za_svc_trace(long nr, unsigned long pc)
+{
+    za_svc_trace_rich(nr, pc, 0, 0, 0);
+}
+// 崩溃时倒出 svc 轨迹（由新到旧）。这是定位「最后一步」最直接的证据。
+void za_dump_svc_trace(void)
+{
+    char line[256];
+    unsigned long pos = __atomic_load_n(&za_svc_trace_pos, __ATOMIC_RELAXED);
+    {
+        char *p = line;
+        p = za_put_str(p, "ZaGuest: svc-trace total=");
+        p = za_put_dec(p, (unsigned long long)pos);
+        p = za_put_str(p, " (newest first, nr pc x0 x2 x19)\n");
+        za_fatal_write(line, (size_t)(p - line));
+    }
+    unsigned long n = pos < 32 ? pos : 32;
+    for (unsigned long k = 1; k <= n; k++)
+    {
+        unsigned long i = (pos - k) % 32;
+        char *p = line;
+        p = za_put_str(p, "ZaGuest:   svc#");
+        p = za_put_dec(p, (unsigned long long)za_svc_trace_nr[i]);
+        p = za_put_str(p, " pc=");
+        p = za_put_hex(p, (unsigned long long)za_svc_trace_pc[i]);
+        p = za_put_str(p, " x0=");
+        p = za_put_hex(p, (unsigned long long)za_svc_trace_arg0[i]);
+        p = za_put_str(p, " x2=");
+        p = za_put_hex(p, (unsigned long long)za_svc_trace_arg2[i]);
+        p = za_put_str(p, " x19=");
+        p = za_put_hex(p, (unsigned long long)za_svc_trace_x19[i]);
+        p = za_put_str(p, " sp=");
+        p = za_put_hex(p, (unsigned long long)za_svc_trace_sp[i]);
+        p = za_put_str(p, "\n");
+        za_fatal_write(line, (size_t)(p - line));
+    }
 }
 
 // #41 GetInfo 的调用点轨迹（哪个 id 被狂问 = 死循环入口）
@@ -1319,20 +1408,27 @@ static volatile int za_pc_timer_ready;
 static volatile unsigned long long za_guest_last_guest_pc;
 static pthread_t za_sampler_thread;
 
+// 客机 PC 环形轨迹：崩溃前最后 ZA_PC_RING 次采样到的客机 PC。
+// 这是唯一能回答「客机到底执行到哪条指令」的运行时证据。
+volatile unsigned long za_pc_ring[ZA_PC_RING];
+volatile unsigned long za_pc_ring_pos;
+
 static void za_pc_sample_handler(int sig, siginfo_t *info, void *ctx)
 {
     (void)sig; (void)info;
     if (!ctx) return;
     ucontext_t *uc = (ucontext_t *)ctx;
     unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
-    if (za_guest_base && pc >= (unsigned long)za_guest_base &&
-        pc < (unsigned long)za_guest_base + ZA_IMAGE_SIZE)
+    if ((za_guest_base && pc >= (unsigned long)za_guest_base &&
+         pc < (unsigned long)za_guest_base + ZA_IMAGE_SIZE) ||
+        (za_sdk_base && pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size))
     {
         za_guest_last_guest_pc = pc;
-    }
-    else if (za_sdk_base && pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size)
-    {
-        za_guest_last_guest_pc = pc;
+        // 环形轨迹：崩溃前最后若干条客机 PC。
+        // 采样间隔 20ms，崩前进度通常只剩几十毫秒 ⇒ 只要 16 格就能覆盖。
+        unsigned long p = za_pc_ring_pos;
+        za_pc_ring[p % ZA_PC_RING] = pc;
+        za_pc_ring_pos = p + 1;
     }
 }
 

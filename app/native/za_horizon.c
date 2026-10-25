@@ -73,6 +73,15 @@ static volatile unsigned long za_svc_seq;
 #define ZA_REG_X6 6
 #define ZA_REG_X7 7
 #define ZA_REG_PC 11     // 客机 x30（svc 调用点的返回地址，日志里用来定位是哪个函数调的服务）
+// 客机 sp：门区 `str x17,[x16,#0x48]` ⇒ 下标 9。
+//   ⚠ 下标 10（+0x50）是**服务号**，11（+0x58）才是客机 x30。
+#define ZA_REG_SP 9
+// 取客机在 svc 那一刻的 sp。用它可以直接量出「sp 漂移」——
+// 若两条 svc 之间客机代码没有动 sp，值必须完全一致；不一致就说明门区写坏了 sp。
+unsigned long za_horizon_guest_sp(void)
+{
+    return za_horizon_regs[ZA_REG_SP];
+}
                          // ★ 2026-10-25：新 trampoline 把栈切到宿主栈再调 C，
                          //   布局变成 [9]=客机 sp [10]=服务号 [11]=客机 x30。
 #define ZA_REG_SP 9      // 客机栈指针（进入 trampoline 时的 sp）
@@ -788,8 +797,9 @@ long za_horizon_svc(long a0, long a1, long a2, long a3,
 {
     // 服务号只有 16 位有效（svc #N）。上位是防御性清零。
     nr &= 0xFFFF;
-    // 轨迹：最近 32 次 svc 的（服务号 + 调用点）⇒ 崩溃时直接定位卡在哪一步
-    za_svc_trace(nr, za_horizon_regs[ZA_REG_PC]);
+    // 轨迹：最近 32 次 svc 的（服务号 + 调用点 PC）⇒ 崩溃时直接定位卡在哪一步
+    za_svc_trace_rich(nr, za_horizon_regs[ZA_REG_PC], (unsigned long)a0,
+                      (unsigned long)a2, za_horizon_regs[19]);
     // 轨迹：客人的 callee-saved（x19/x29）—— 用来定位它们何时变坏
     {
         unsigned long p = za_horizon_regtrace_pos % ZA_SVC_REGTRACE;

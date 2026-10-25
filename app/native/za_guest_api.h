@@ -83,9 +83,19 @@ extern unsigned long za_svc41_trace_id[32];
 extern unsigned long za_svc41_trace_pos;
 // 通用 svc 轨迹（最近 32 次的 服务号 + 调用点PC）
 void za_svc_trace(long nr, unsigned long pc);
+// 富轨迹：额外记 x0 / x2 / x19 —— 「svc 返回了什么」和「客机拿它干了什么」
+// 只有都记下来才能对上：崩溃点几乎总是紧跟某条 svc。
+void za_svc_trace_rich(long nr, unsigned long pc,
+                       unsigned long a0, unsigned long a2, unsigned long x19);
 extern unsigned long za_svc_trace_nr[32];
 extern unsigned long za_svc_trace_pc[32];
+extern unsigned long za_svc_trace_arg0[32];
+extern unsigned long za_svc_trace_arg2[32];
+extern unsigned long za_svc_trace_x19[32];
+extern unsigned long za_svc_trace_sp[32];
 extern unsigned long za_svc_trace_pos;
+// 客机在 svc 那一刻的 sp（由 za_horizon.c 提供）
+unsigned long za_horizon_guest_sp(void);
 unsigned long za_svc_total_take(void);
 
 // ── 线程栈边界登记 ─────────────────────────────────────────────
