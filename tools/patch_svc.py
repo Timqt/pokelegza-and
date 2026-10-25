@@ -153,23 +153,31 @@ def main():
     # ⚠ 必须改写**包装函数的入口**而不是 svc 那条指令：
     #   改 svc 的话 prologue 仍会执行（sp 被压低 16、保存了 x0），
     #   trampoline 的 ret 就会把保存的 x0 当返回地址弹出去 ⇒ 跳到野地址。
-    STR_PRE = 0xF81F0FE0     # str x0,[sp,#-0x10]!
-    STP_PRE = 0xA9BF07E0     # stp x0,x1,[sp,#-0x10]!
+    # ⚠ 必须**掩掉 Rt 位**再比较：包装函数保存的不一定是 x0。
+    #   实测 0x17000c（svc#6）开头是 `str x1,[sp,#-0x10]!`（0xF81F0FE1），
+    #   只比 0xF81F0FE0 会漏判 ⇒ prologue 跑了却被当成没跑 ⇒ sp 永久少 0x10。
+    STR_PRE_MASK = 0xFFFFFFE0
+    STR_PRE = 0xF81F0FE0     # str xN,[sp,#-0x10]!   (N 任意)
+    STP_PRE = 0xA9BF07E0     # stp xN,xM,[sp,#-0x10]! (N=0,M=1 为准，见下)
     shapes = {}
     entries = {}
     for off, nr in hits:
         shape = 1
         entry = off
-        if off >= 4 and words[off // 4 - 1] == STR_PRE:
+        prev = words[off // 4 - 1] if off >= 4 else 0
+        if off >= 4 and (prev & STR_PRE_MASK) == STR_PRE:
             shape = 2
             entry = off - 4
-        elif off >= 4 and words[off // 4 - 1] == STP_PRE:
-            if off >= 8 and words[off // 4 - 2] == (STR_PRE | 2):
-                shape = 4       # svc #47：str x2 + stp x0,x1
+            pro_txt = 'str x%d' % (prev & 0x1F)
+        elif off >= 4 and prev == STP_PRE:
+            if off >= 8 and (words[off // 4 - 2] & STR_PRE_MASK) == STR_PRE:
+                shape = 4       # svc #47：str xN + stp x0,x1
                 entry = off - 8
             else:
                 shape = 3       # stp x0,x1：两个出参
                 entry = off - 4
+        else:
+            pro_txt = '-'
         shapes[nr] = shape
         entries[nr] = entry
     from collections import Counter

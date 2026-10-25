@@ -56,6 +56,42 @@ extern volatile unsigned long za_sdk_size;
 // 日志里用来定位是哪个函数调的服务）。
 __attribute__((visibility("default"))) volatile unsigned long za_horizon_regs[32];
 
+// ── 帧快照探针（2026-10-25 夜）──────────────────────────────────────
+// 目的：把 0x14457c 的 x30 槽「何时变 0」一刀切开。
+//   帧底 sp0 = 客机 svc 时的 sp + 0x10（包装函数先 str x?,[sp,#-0x10]!）。
+//   stp x29,x30,[sp,#0x40] ⇒ x29 槽 = sp0+0x40、x30 槽 = sp0+0x48。
+// 18 words = 0x90 字节：比 0x14457c 的 0x70 帧多留 0x20 余量，
+// 这样无论「包装函数 prologue 有没有跑」，x29/x30 槽都一定在窗口内，
+// 可以直接用「x30 == 0x20013ed84」的出现位置反推真实帧底。
+#define ZA_SNAP_N 18
+volatile unsigned long za_frame_snap[4][ZA_SNAP_N];
+volatile unsigned long za_frame_snap_pc[4];
+volatile unsigned long za_frame_snap_sp[4];
+volatile int za_frame_snap_n;
+
+static void za_frame_snapshot(unsigned long guest_pc, unsigned long guest_sp)
+{
+    // 只对 0x14457c 里那三条 svc 拍快照
+    if (guest_pc != 0x2001445a8ul && guest_pc != 0x2001445ccul &&
+        guest_pc != 0x200144608ul)
+        return;
+    int k = za_frame_snap_n;
+    if (k >= 4) return;
+    // 从 guest_sp 原样起算（不加 0x10）：由 dump 里 x30 的位置反推。
+    unsigned long sp0 = guest_sp;
+    za_frame_snap_pc[k] = guest_pc;
+    za_frame_snap_sp[k] = sp0;
+    for (int i = 0; i < ZA_SNAP_N; i++)
+    {
+        unsigned long v = 0;
+        // 直接读客机栈；越界读由客机影像/栈映射保证可读（同一条线程栈）
+        v = *(volatile unsigned long *)(uintptr_t)(sp0 + (unsigned long)i * 8);
+        za_frame_snap[k][i] = v;
+    }
+    za_frame_snap_n = k + 1;
+}
+
+
 // svc 逐次轨迹：客人的 x19/x29/x30 —— 用来定位「客人的 callee-saved 何时变坏」
 #define ZA_SVC_REGTRACE 16
 volatile unsigned long za_horizon_regtrace[ZA_SVC_REGTRACE][4];  // [nr, pc, x19, x29]
@@ -800,6 +836,8 @@ long za_horizon_svc(long a0, long a1, long a2, long a3,
     // 轨迹：最近 32 次 svc 的（服务号 + 调用点 PC）⇒ 崩溃时直接定位卡在哪一步
     za_svc_trace_rich(nr, za_horizon_regs[ZA_REG_PC], (unsigned long)a0,
                       (unsigned long)a2, za_horizon_regs[19]);
+    // 帧快照：0x14457c 的三条 svc 各拍一张（见 za_frame_snapshot 注释）
+    za_frame_snapshot(za_horizon_regs[ZA_REG_PC], za_horizon_guest_sp());
     // 轨迹：客人的 callee-saved（x19/x29）—— 用来定位它们何时变坏
     {
         unsigned long p = za_horizon_regtrace_pos % ZA_SVC_REGTRACE;
