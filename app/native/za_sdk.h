@@ -29,7 +29,21 @@
 #define ZA_SDK_INIT_ARRSZ  0x2B8ul
 // 映像末尾扩展区的总大小：门区（0xC70000 起）+ 只读 TLS 页（0xF00000 起）
 //                          + SDK 自己的 TLS 上下文页（0xF10000 起）
-#define ZA_SDK_EXT_SIZE    0xF12000ul
+//
+// ⚠⚠⚠ 这个值被 za_sdk.c 当作「**映射总大小**」用：
+//        mapped = (ZA_SDK_TOTAL_SIZE + 0xFFF) & ~0xFFF;
+//        memset(base + ZA_SDK_IMG_SIZE, 0, mapped - ZA_SDK_IMG_SIZE);
+//    所以它必须覆盖到「映像内容末尾(0xC5E000) + 需要的最高偏移」，
+//    **不是**扩展区自己的长度。名字有误导性，改动时务必记住这一点。
+//
+// ★ 2026-10-25 扩到 0x1F00000：Horizon 的「IPC 共享内存」在真机上是 1MB，
+//   客户端的**出参/间接数据区固定在共享内存内偏移 0xF01000**（实测：SDK 发出的
+//   CMIF 请求里反复带着 {0x00f01000, 长度} 这个 (偏移,长度) 对）。
+//   我们的「共享内存」= 只读 TLS 页（TPIDRRO_EL0 指向处）= base+0xF00000，
+//   所以出参区 = base+0xF00000+0xF01000 = base+0x1EF01000。
+//   之前只映射到 base+0xF12000 ⇒ **那一带没映射** ⇒ SDK 拿不到出参 ⇒
+//   nn::pctl 的客户端对象建不起来（全局 0xc024b8 恒为 NULL ⇒ SDK+0x3fcbf4 崩溃）。
+#define ZA_SDK_EXT_SIZE    0x1F00000ul
 
 // 装载 SDK 映像：映射 + 基址重定位 + ELF 重定位
 // （未定义符号依次找：宿主 → main 模块 → SDK 自己的导出表）

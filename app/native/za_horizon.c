@@ -478,8 +478,101 @@ static int za_svc_is_denied(const char *name)
 // ⚠ 不能把 "SFCO" 铺满整页：客机 0x14eb3c 有 `ldrh w8,[sp,#0xb2]; cmp w8,#0x41;
 //   b.hs trap` 的描述符合法性校验，头写错会直接 trap（第一版就是这么炸的）。
 //   所以这里：沿用请求的头，只把 "SFCI" 换成 "SFCO"。
+// 安全读一个客机地址（定义在下方）
+static int za_h_read_word(unsigned long addr, unsigned long *out);
+
+/* ══════════════════════════════════════════════════════════════════
+ *  复刻 SDK 的 CMIF 应答槽位解码（SDK text 0xc4b68 + 0x9a8f0）
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * SDK 读应答（SDK+0x14eb28 起）：
+ *   bl 0xc4b68(out, buffer)        ; buffer = TPIDRRO_EL0 = 我们的 ro 页
+ *   ldr x8, out[0x00]               ; = ro
+ *   ldrb w9, out[0x1f]              ; idx
+ *   add x8, x8, x9, lsl #2
+ *   add x8, x8, #0xf
+ *   and x8, x8, #~0xf               ; 槽位 = align_down_16(ro + idx*4 + 15)
+ *   ldr w9, [x8] ; cmp w9, #"SFCO"  ; 不等 → Abort(0x1a80a)
+ *
+ * 0x9a8f0 的输入是 out[8..0x17]，而 out[8..0x17] 由 0xc4b68 从
+ * buffer[0]/buffer[4]/buffer[8] 算出。下面把两段 1:1 复刻，只为拿 idx。
+ *
+ * ★ 实测校验（真机请求数据）：
+ *   请求 A   buffer=07 00 00 00 08 00 00 00 20 00 ⇒ idx=10 ⇒ 槽位 ro+0x30
+ *   请求 R3  buffer=06 00 00 00 0e 80 00 00 01 00 ⇒ idx=19 ⇒ 槽位 ro+0x50
+ *   （lm::CreateLogServiceByHipc 用的正是 R3 ⇒ 我们以前写 ro+0x10 永远读不到
+ *     ⇒ Abort(0x1a80a)。）
+ */
+static unsigned int za_cmif_slot_offset(const unsigned char *b)
+{
+    unsigned long long w9 = (unsigned long long)b[0] | ((unsigned long long)b[1] << 8) |
+                            ((unsigned long long)b[2] << 16) | ((unsigned long long)b[3] << 24);
+    unsigned long long w8 = (unsigned long long)b[4] | ((unsigned long long)b[5] << 8) |
+                            ((unsigned long long)b[6] << 16) | ((unsigned long long)b[7] << 24);
+
+    /* --- 0xc4b68 --- */
+    unsigned long long x11 = (w9 & 0xffffull) << 32;
+    x11 |= (w8 & 0x3fcull) << 2;
+    unsigned int w10 = (unsigned int)((w8 >> 10) & 0xf);
+    unsigned long long x13 = ((unsigned long long)w10 << 16) + 0xfe0000ull;
+    unsigned long long x14 = x11 | 0x1000000ull;
+    unsigned long long x12 = x11 | 0x2010000ull;
+    x13 = (x11 | x13) | 0x3000000ull;
+    x13 = (w10 != 1) ? x13 : x14;
+    x12 = (w10 == 2) ? x12 : x13;
+    unsigned long long x10 = (w10 == 0) ? x11 : x12;
+
+    unsigned long long x13b = 0, x14b = 0, x11b = 0, x12b = 0;
+    if (w8 & 0x80000000ull)
+    {
+        unsigned long long b8 = (unsigned long long)b[8] | ((unsigned long long)b[9] << 8) |
+                               ((unsigned long long)b[10] << 16) | ((unsigned long long)b[11] << 24);
+        x12b = b8 & 1ull;
+        x13b = ((b8 << 11) & 0xf0000ull) | x12b;
+        x14b = (b8 << 7) & 0xf00ull;
+        x11b = 0x1000000000000ull;
+    }
+    unsigned long long x15 = (w9 << 20) & 0xf000000000000ull;
+    x15 |= (unsigned long long)((w9 >> 24) & 0xf) << 40;
+    unsigned int w17 = ((unsigned int)((w9 >> 8) & 0xf)) & 0xf000000u;
+    unsigned long long x9 = x15 | (((w9 >> 20) & 0xf) << 32);
+    x13b |= (unsigned long long)w17;
+    x13b |= x14b;
+    x12b |= x13b;
+    x9 |= x12b;
+
+    /* out[8..0x17] —— 0x9a8f0 的输入 */
+    unsigned char d[16];
+    for (int i = 0; i < 8; i++) d[i] = (unsigned char)(x9 >> (i * 8));
+    unsigned long long xm = x11b | x10;
+    d[8]  = (unsigned char)(xm);
+    d[9]  = (unsigned char)(xm >> 8);
+    d[10] = (unsigned char)(xm >> 16);
+    d[11] = (unsigned char)(xm >> 24);
+    d[12] = (unsigned char)(xm >> 32);
+    d[13] = (unsigned char)(xm >> 40);
+    d[14] = (unsigned char)(x11b >> 48);
+    d[15] = 0;
+
+    /* --- 0x9a8f0 --- */
+    unsigned int u8 = (unsigned int)d[8] | ((unsigned int)d[9] << 8);
+    if (u8 & 3) return 0x10;               /* 解码失败：退回 ro+0x10 */
+    unsigned int w9b = d[0];
+    unsigned int w10b = 2 + (unsigned int)((w8 >> 31) & 1);
+    w9b = (w9b == 0) ? w10b : (w10b + 2);
+    w9b += d[1];
+    w9b += d[2];
+    unsigned int w11 = (d[3] == 0) ? w9b : (w9b + 2u * d[3]);
+    w11 = (d[4] == 0) ? w11 : (w11 + 3u * d[4]);
+    w11 = (d[5] == 0) ? w11 : (w11 + 3u * d[5]);
+    w11 = (d[6] == 0) ? w11 : (w11 + 3u * d[6]);
+    unsigned int idx = (w11 + (u8 >> 2)) & 0xff;
+    return (idx * 4u + 0xfu) & ~0xfu;      /* align_down_16(idx*4 + 15) */
+}
+
 static void za_write_cmif_reply(unsigned long long ro, unsigned int hdr0, unsigned int hdr1)
 {
+    (void)hdr0; (void)hdr1;
     /* 取证：把请求的前 0x40 字节打出来 */
     {
         unsigned int w[16];
@@ -524,9 +617,35 @@ static void za_write_cmif_reply(unsigned long long ro, unsigned int hdr0, unsign
                       base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             }
         }
+
+        /* 探测「出参/间接数据区」的真实地址。
+         * ★ 请求入参 = {0x00f01000, 2} ⇒ 服务端应从「某基址 + 0xf01000」读 2 个 u32，
+         *   而 SDK 已经把入参写在那儿了 ⇒ 哪个候选能读到非零，就是它。
+         * 全部用 process_vm_readv 安全读，未映射页不会崩。
+         */
+        {
+            struct { unsigned long long base; const char *what; } cand[] = {
+                { (unsigned long long)za_sdk_base + 0x0f00000ull, "SDK基址+0xf00000 (=TPIDRRO页/ro)" },
+                { (unsigned long long)za_sdk_base + 0x0f01000ull, "SDK基址+0xf01000 (RO2页)" },
+                { (unsigned long long)za_sdk_base + 0x1ef01000ull, "SDK基址+0x1ef01000 (ro+0xf01000)" },
+                { (unsigned long long)za_sdk_base + 0x1ef00000ull, "SDK基址+0x1ef00000 (ro)" },
+            };
+            for (unsigned i = 0; i < sizeof cand / sizeof cand[0]; i++)
+            {
+                unsigned long w[16];
+                int ok = 1;
+                for (int k = 0; k < 16; k++)
+                    if (!za_h_read_word(cand[i].base + (unsigned long)(k * 4), &w[k])) { ok = 0; break; }
+                if (!ok) { ZLOGI("    CAND %s: 不可读", cand[i].what); continue; }
+                ZLOGI("    CAND %s:", cand[i].what);
+                for (int k = 0; k < 16; k += 4)
+                    ZLOGI("        +%#04x: %08lx %08lx %08lx %08lx",
+                          k * 4, w[k], w[k + 1], w[k + 2], w[k + 3]);
+            }
+        }
     }
 
-    /* 找 CMIF 请求头 "SFCI" 的位置 */
+    /* 找 CMIF 请求头 "SFCI" 的位置（只用于取证；应答位置不再依赖它） */
     unsigned int cmif_off = 0;
     for (unsigned int off = 0; off < 0x100; off += 4)
     {
@@ -534,35 +653,72 @@ static void za_write_cmif_reply(unsigned long long ro, unsigned int hdr0, unsign
         memcpy(&w, (const void *)(uintptr_t)(ro + (unsigned long long)off), 4);
         if (w == 0x49434653u) { cmif_off = off; break; }
     }
+    ZLOGI("    请求里 SFCI @TLS+%#x（仅取证）", cmif_off);
 
-    /* 应答头：沿用请求的头（Horizon 的应答头与请求头同形） */
-    memcpy((void *)(uintptr_t)(ro + 0), &hdr0, 4);
-    memcpy((void *)(uintptr_t)(ro + 4), &hdr1, 4);
-
-    if (!cmif_off)
+    /* ★★★ 铺满整个 ro 页（每 16 字节一份合法应答），再恢复 SDK 的 TLS 上下文 ★★★
+     *
+     * SDK 读应答的槽位 = align_down_16(ro + idx*4 + 15)，idx 由 0xc4b68+0x9a8f0
+     * 从「读应答那一刻」的 buffer 解出 —— 我们无法确知其最终取值
+     * （实测：清零请求头算出的 idx 与 SDK 实际读的对不上）。
+     * ⇒ 每个候选槽位都放一份合法应答，idx 是几都能命中。
+     *
+     * 写完要把 ro[0x00..0x200] 恢复回去：那里有 SDK 的 TLS 上下文
+     *（+0x1b0 owner_id、+0x1f0 TPIDR_EL0、+0x1f8 self 指针、+0x70/0x78/0x80 指针槽）。
+     * 出参缓冲在 ro+0x1000（= base+0xF01000），不在铺满范围内 ✔
+     */
     {
-        /* ⚠ 这里**不能**兜底写 SFCO！
-         *
-         * 实测（2026-10-25 真机，pctl:a）：有一类请求的 body 里根本没有
-         * "SFCI"（例：hdr0=0x6 hdr1=0x8，body 头是 0x00000002），
-         * 那不是 CMIF 请求，SDK 期望原样读回它自己的数据。
-         * 旧代码兜底往 TLS+0x10 写 "SFCO"，直接覆盖了请求内容 ⇒
-         * SDK 拿到垃圾返回值 ⇒ nn::pctl 的客户端对象建不起来 ⇒
-         * 全局 0xc024b8 保持 NULL ⇒ 0x3fcbf4 解引用崩溃。
-         *
-         * 所以：找不到 CMIF 头就**什么都不写**，让请求原样通过。
+        /* SDK 真正在用的 TLS 槽（za_sdk.c 里的槽位表），铺满后要逐个还原。
+         * ⚠ 之前这里整段恢复 ro[0x00..0x200]，把 0x10..0x1f0 里的 SFCO 又覆盖掉了
+         *   ⇒ 铺满等于白铺（请求 A 的槽位正好是 ro+0x30）。
          */
-        ZLOGI("    CMIF 头未找到 -> 原样放行（不写 SFCO）");
-        return;
+        static const struct { unsigned int off, len; } keep[] = {
+            { 0x00, 8 }, { 0x10, 4 }, { 0x20, 8 }, { 0x70, 8 }, { 0x78, 8 },
+            { 0x80, 8 }, { 0x100, 2 }, { 0x102, 2 }, { 0x104, 1 },
+            { 0x1b0, 4 }, { 0x1e0, 8 }, { 0x1f0, 8 }, { 0x1f8, 8 },
+        };
+        unsigned char save[0x200];
+        memcpy(save, (const void *)(uintptr_t)ro, sizeof save);
+        unsigned int cmif[4] = { 0x4F434653u, 0x00010000u, 0u, 0u };
+        for (unsigned int off = 0; off < 0x1000; off += 0x10)
+            memcpy((void *)(uintptr_t)(ro + off), cmif, sizeof cmif);
+        for (unsigned i = 0; i < sizeof keep / sizeof keep[0]; i++)
+            memcpy((void *)(uintptr_t)(ro + keep[i].off), save + keep[i].off, keep[i].len);
+    }
+    /* 取证：铺满自检（确认还原步骤没有把 SFCO 又覆盖掉） */
+    {
+        unsigned int a = *(const unsigned int *)(uintptr_t)(ro + 0x00);
+        unsigned int b = *(const unsigned int *)(uintptr_t)(ro + 0x10);
+        unsigned int c = *(const unsigned int *)(uintptr_t)(ro + 0x30);
+        unsigned int e = *(const unsigned int *)(uintptr_t)(ro + 0x50);
+        unsigned int f = *(const unsigned int *)(uintptr_t)(ro + 0x90);
+        ZLOGI("    铺满自检: ro+0x0=%08x +0x10=%08x +0x30=%08x +0x50=%08x +0x90=%08x",
+              a, b, c, e, f);
+    }
+    /* 记录一下按算法算出来的那个槽位（取证用） */
+    unsigned char hb[12];
+    for (int i = 0; i < 12; i++)
+        hb[i] = *(const unsigned char *)(uintptr_t)(ro + (unsigned long long)i);
+    unsigned int slot = za_cmif_slot_offset(hb);
+
+    /* ★★ 出参回写（pctl 建不起来的直接原因）★★
+     *
+     * Horizon CMIF 的返回值不放在应答头里，而是放在一个**独立的出参缓冲**，
+     * 地址由客户端在请求里给出（64 位绝对地址 + 长度）。
+     * 实测：请求 +0x20 处是 `0x200f01000`
+     *     = SDK基址 + 0xF01000 = 只读 TLS 页(TPIDRRO_EL0) + 0x1000。
+     * ⇒ 服务端必须把返回值写到那里。我们以前只改请求头、从不写这里
+     *   ⇒ SDK 拿到的返回值恒为 0 ⇒ nn::pctl 的 IPC 客户端对象建不出来
+     *   ⇒ 全局 0xc024b8 保持 NULL ⇒ SDK+0x3fcbf4 解引用 NULL 崩溃。
+     */
+    if (za_sdk_base)
+    {
+        unsigned long long *outp = (unsigned long long *)(za_sdk_base + 0xf01000ul);
+        outp[0] = 0x0000000100000001ull;
+        outp[1] = 0x0000000000000000ull;
+        ZLOGI("    出参写入 base+0xf01000 = %016llx %016llx", outp[0], outp[1]);
     }
 
-    /* CmifOutHeader：sig / version+reserved / Result=0 / InterfaceId=0 */
-    unsigned int cmif[4] = { 0x4F434653u, 0x00010000u, 0u, 0u };
-    memcpy((void *)(uintptr_t)(ro + cmif_off), cmif, sizeof cmif);
-    /* 返回值区：清零（fs 层结果 u16 = 0） */
-    memset((void *)(uintptr_t)(ro + cmif_off + 0x10), 0, 0x10);
-
-    ZLOGI("    CMIF in-header @TLS+%#x -> reply \"SFCO\" @TLS+%#x", cmif_off, cmif_off);
+    ZLOGI("    应答: 槽位 @TLS+%#x <- \"SFCO\"（idx 由 SDK 解码算法算出）", slot);
 }
 
 // 安全读一个客机地址（客机地址空间我们自己映射的，直接读也可能踩未映射页，
