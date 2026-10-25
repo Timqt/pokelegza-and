@@ -612,3 +612,345 @@ void za_svc41_trace(unsigned long pc, long id)
     za_svc41_trace_id[pos % 32] = (unsigned long)id;
     za_svc41_trace_pos = pos + 1;
 }
+// ── 线程栈边界登记（栈溢出时才知道「哪条线程、栈多大、用了多少」）────
+#define ZA_STACK_REGIONS 64
+typedef struct
+{
+    long tid;
+    unsigned long lo, hi;
+    const char *who;
+} za_stack_region_t;
+static za_stack_region_t za_stack_regions[ZA_STACK_REGIONS];
+
+void za_stack_register(long tid, unsigned long lo, unsigned long hi, const char *who)
+{
+    for (int i = 0; i < ZA_STACK_REGIONS; i++)
+    {
+        if (za_stack_regions[i].tid == tid || za_stack_regions[i].tid == 0)
+        {
+            za_stack_regions[i].tid = tid;
+            za_stack_regions[i].lo = lo;
+            za_stack_regions[i].hi = hi;
+            za_stack_regions[i].who = who;
+            return;
+        }
+    }
+}
+
+const za_stack_region_t *za_stack_find(long tid)
+{
+    for (int i = 0; i < ZA_STACK_REGIONS; i++)
+        if (za_stack_regions[i].tid == tid) return &za_stack_regions[i];
+    return NULL;
+}
+
+// 从 /proc/self/maps 里找出「包含这个地址」的映射区间
+static int za_map_bounds_of(unsigned long addr, unsigned long *lo, unsigned long *hi)
+{
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return 0;
+    static char buf[8192];
+    ssize_t got;
+    int found = 0;
+    while ((got = read(fd, buf, sizeof buf - 1)) > 0)
+    {
+        buf[got] = 0;
+        char *ln = buf;
+        while (ln && *ln && !found)
+        {
+            unsigned long a = 0, b = 0;
+            if (sscanf(ln, "%lx-%lx", &a, &b) == 2 && addr >= a && addr < b)
+            {
+                *lo = a;
+                *hi = b;
+                found = 1;
+            }
+            char *nl = ln;
+            while (*nl && *nl != 10) nl++;
+            ln = (*nl ? nl + 1 : NULL);
+        }
+    }
+    close(fd);
+    return found;
+}
+
+void za_stack_register_current(long tid, const char *who)
+{
+    unsigned long sp = 0;
+    __asm__ __volatile__("mov %0, sp" : "=r"(sp));
+    unsigned long lo = 0, hi = 0;
+    if (za_map_bounds_of(sp, &lo, &hi)) za_stack_register(tid, lo, hi, who);
+    else za_stack_register(tid, 0, 0, who);
+}
+
+// ── 客机 TLS 描述符（影子块）────────────────────────────────────────
+//   客机算 `tp16 = TPIDR & ~0x1FFF`，再读 `[tp16+0x98]` 当「本模块 TLS 块偏移」。
+//   ⚠ TPIDR_EL0 **不动**（换了它线程里任何 bionic 调用都崩）；
+//     真正切换的是那个描述符槽：进宿主还 bionic 原值、出宿主写客机期望值。
+#define ZA_TLS_SLOTS 64
+#define ZA_TLS_STACK 16
+typedef struct
+{
+    int depth;
+    void *saved[ZA_TLS_STACK];
+    void *tp;           // 本线程 bionic 的 TLS
+    void *area;         // 本线程的客机 TLS 变量区
+    unsigned long long slot_orig;   // [tp16+0x98] 的 bionic 原值
+    unsigned long long slot_guest;  // 客机期望值（变量区相对 tp16 的偏移 / 8）
+    unsigned long tp16;
+} za_tls_state_t;
+static za_tls_state_t za_tls_states[ZA_TLS_SLOTS];
+
+static void *za_get_tls(void)
+{
+    unsigned long tp = 0;
+    __asm__ __volatile__("mrs %0, TPIDR_EL0" : "=r"(tp));
+    return (void *)(uintptr_t)tp;
+}
+
+static za_tls_state_t *za_tls_cur(void)
+{
+    long tid = syscall(SYS_gettid);
+    return &za_tls_states[tid % ZA_TLS_SLOTS];
+}
+
+void za_tls_enter(void)
+{
+    za_tls_state_t *st = za_tls_cur();
+    if (st->depth == 0 && st->tp16)
+        *(unsigned long long *)(st->tp16 + 0x98) = st->slot_orig;
+    if (st->depth < ZA_TLS_STACK) st->saved[st->depth] = za_get_tls();
+    st->depth++;
+}
+void za_tls_leave(void)
+{
+    za_tls_state_t *st = za_tls_cur();
+    if (st->depth > 0) st->depth--;
+    if (st->depth == 0 && st->tp16)
+        *(unsigned long long *)(st->tp16 + 0x98) = st->slot_guest;
+}
+
+// 只读 TLS 页的绝对地址（za_horizon.c 的临界区按同一来源取 owner_id）
+volatile unsigned long za_ro_tls_page = 0;
+
+void za_os_install_tls_descriptor(void)
+{
+    void *b = za_get_tls();
+    if (!b) { ZLOGE("读不到 TPIDR_EL0"); return; }
+    unsigned long b16 = (unsigned long)b & ~0x1FFFul;
+    // 客机算 `add x8, tp16, x9, lsl #3`，x9 是 **32 位有符号偏移**
+    // ⇒ 变量区必须落在 tp16 + (int32 范围) 内，且越近越好；bionic 上方多半被占，
+    //   所以逐页往上找空位（找不到就退回任意地址并明确报出来）。
+    size_t area = 4 * 1024 * 1024;
+    void *t = MAP_FAILED;
+    for (unsigned long k = 0x8000; k <= 0x400000; k += 0x4000)
+    {
+        t = mmap((void *)(b16 + k), area, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (t != MAP_FAILED) break;
+    }
+    if (t == MAP_FAILED)
+    {
+        t = mmap(NULL, area, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (t == MAP_FAILED) { ZLOGE("客机 TLS 变量区申请失败"); return; }
+        ZLOGE("客机 TLS: 近处没空位，变量区落在 %p（偏移 %lld）", t,
+              (long long)((unsigned long)(uintptr_t)t - b16));
+    }
+    memset(t, 0, area);
+    za_tls_state_t *st = za_tls_cur();
+    st->tp16 = (unsigned long)b16;
+    st->tp = b;
+    st->area = t;
+    st->slot_orig = *(unsigned long long *)(b16 + 0x98);
+    st->slot_guest = (unsigned long long)(((long long)((unsigned long)(uintptr_t)t - b16)) / 8);
+    *(unsigned long long *)(b16 + 0x98) = st->slot_guest;
+    ZLOGI("客机 TLS: [tp16+0x98] %#llx -> %#llx，tp=%p 变量区=%p",
+          st->slot_orig, st->slot_guest, b, t);
+}
+
+unsigned long za_os_guest_tls_area(void)
+{
+    return (unsigned long)(uintptr_t)za_tls_cur()->area;
+}
+
+// 客机 GetCurrentThread 要非空指针：给每线程一个假对象
+#define ZA_THREAD_OBJ_SLOTS 64
+static unsigned long long za_thread_obj[ZA_THREAD_OBJ_SLOTS];
+void *za_os_current_thread_obj(void)
+{
+    long tid = syscall(SYS_gettid);
+    unsigned long long *p = &za_thread_obj[tid % ZA_THREAD_OBJ_SLOTS];
+    if (!*p) *p = 0x1000000000000ull | (unsigned long long)tid;
+    return p;
+}
+// ════════════════════════════════════════════════════════════════
+//  宿主符号解析
+// ════════════════════════════════════════════════════════════════
+typedef struct { const char *name; void *fn; } za_host_sym_t;
+
+// 缺实现的符号 → 专属陷阱桩：客机一调到就 SIGTRAP，日志里明确打出缺哪个
+static void *za_trap_alloc(const char *name);
+static unsigned char *za_trap_page;
+
+static void *za_trap_alloc(const char *name)
+{
+    ZLOGI("缺实现 -> %s（落到陷阱桩）", name ? name : "(null)");
+    if (!za_trap_page)
+    {
+        za_trap_page = (unsigned char *)mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (za_trap_page == MAP_FAILED) { za_trap_page = NULL; return NULL; }
+        memset(za_trap_page, 0xDD, 4096);           // brk 的编码位模式
+        mprotect(za_trap_page, 4096, PROT_READ | PROT_EXEC);
+    }
+    return za_trap_page;
+}
+
+// NVN 图形入口：客机给它函数名，它回函数地址（图形层未接 ⇒ 回陷阱桩）
+static void *za_nvn_bootstrap_loader(const char *name)
+{
+    ZLOGI("★ NVN: 客机要取 %s —— 图形层未接", name ? name : "(null)");
+    return za_trap_alloc(name);
+}
+
+// loader 提供的「runtime object file」= 映像里 MOD0 头的地址
+static void *za_host_runtime_object_file(void)
+{
+    unsigned char *base = za_guest_base;
+    if (!base) return NULL;
+    unsigned int mod0 = 0;
+    memcpy(&mod0, base + 4, 4);
+    if (!mod0 || mod0 >= ZA_IMAGE_SIZE) return NULL;
+    ZLOGI("宿主提供 runtime object file：main+%#x（MOD0 头）", mod0);
+    return base + mod0;
+}
+
+static unsigned long long za_get_system_tick(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+static unsigned long long za_get_system_tick_frequency(void) { return 19200000ull; }
+// 宿主符号表：客机导入的 nn::* 由我们实现的这些顶替（表在解析链的第一位）。
+static const za_host_sym_t za_host_syms[] = {
+    // loader 提供的「runtime object file」（真机由 nnrtld 提供）
+    { "__nnDetailNintendoSdkRuntimeObjectFile", (void *)za_host_runtime_object_file },
+
+    // NVN 图形入口（图形层未接：回陷阱桩，客机一调就知道缺哪个）
+    { "nvnBootstrapLoader", (void *)za_nvn_bootstrap_loader },
+
+    // 时间
+    { "_ZN2nn2os13GetSystemTickEv", (void *)za_get_system_tick },
+    { "_ZN2nn2os22GetSystemTickFrequencyEv", (void *)za_get_system_tick_frequency },
+    { "_ZN2nn2os11SleepThreadENS_8TimeSpanE", (void *)za_os_sleep_thread },
+    { "_ZN2nn2os11YieldThreadEv", (void *)za_os_yield_thread },
+
+    // 线程
+    { "_ZN2nn2os16GetCurrentThreadEv", (void *)za_os_get_current_thread },
+    { "_ZN2nn2os11GetThreadIdEPKNS_10ThreadTypeE", (void *)za_os_get_thread_id },
+    { "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi", (void *)za_os_create_thread },
+    { "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii", (void *)za_os_create_thread },
+    { "_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE", (void *)za_os_start_thread },
+    { "_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE", (void *)za_os_destroy_thread },
+
+    // 互斥锁
+    { "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi", (void *)za_os_initialize_mutex },
+    { "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE", (void *)za_os_lock_mutex },
+    { "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE", (void *)za_os_unlock_mutex },
+
+    // 信号量
+    { "_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii", (void *)za_os_initialize_semaphore },
+    { "_ZN2nn2os16AcquireSemaphoreEPNS0_13SemaphoreTypeE", (void *)za_os_acquire_semaphore },
+    { "_ZN2nn2os19TryAcquireSemaphoreEPNS0_13SemaphoreTypeE", (void *)za_os_try_acquire_semaphore },
+    { "_ZN2nn2os16ReleaseSemaphoreEPNS0_13SemaphoreTypeE", (void *)za_os_release_semaphore },
+    { "_ZN2nn2os16ReleaseSemaphoreEPNS0_13SemaphoreTypeEi", (void *)za_os_release_semaphore },
+
+    // 事件
+    { "_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE", (void *)za_os_initialize_event },
+    { "_ZN2nn2os9WaitEventEPNS0_9EventTypeE", (void *)za_os_wait_event },
+    { "_ZN2nn2os12TryWaitEventEPNS0_9EventTypeE", (void *)za_os_try_wait_event },
+    { "_ZN2nn2os11SignalEventEPNS0_9EventTypeE", (void *)za_os_signal_event },
+    { "_ZN2nn2os10ClearEventEPNS0_9EventTypeE", (void *)za_os_clear_event },
+    { "_ZN2nn2os20InitializeLightEventEPNS0_14LightEventTypeEbNS0_14EventClearModeE", (void *)za_os_initialize_light_event },
+    { "_ZN2nn2os16SignalLightEventEPNS0_14LightEventTypeE", (void *)za_os_signal_light_event },
+    { "_ZN2nn2os14WaitLightEventEPNS0_14LightEventTypeE", (void *)za_os_wait_light_event },
+
+    // 线程局部存储 / 分配器
+    { "_ZN2nn2os15AllocateTlsSlotEPNS0_7TlsSlotEPFvmE", (void *)za_os_allocate_tls_slot },
+    { "_ZN2nn2os11SetTlsValueENS0_7TlsSlotEm", (void *)za_os_set_tls_value },
+    { "_ZN2nn2os11GetTlsValueENS0_7TlsSlotE", (void *)za_os_get_tls_value },
+    { "_ZN2nn2os11FreeTlsSlotENS0_7TlsSlotE", (void *)za_os_free_tls_slot },
+    { "nnosAllocateMemoryForThreadLocal", (void *)za_os_alloc_thread_local },
+    { "nnosFreeMemoryForThreadLocal", (void *)za_os_free_thread_local },
+
+    // errno / DSO
+    { "_ZN2nn2os11GetHostArgcEv", (void *)za_os_get_host_argc },
+    { "__nnmusl_init_dso", (void *)za_os_nnmusl_init_dso },
+
+    { NULL, NULL }      // 结束标记
+};
+// ── 已装载的两个模块（导出符号表）：main 与 SDK ──────────────────────
+static za_mod_t za_main_mod;
+static za_mod_t za_sdk_mod;
+static unsigned char *za_guest_main_base;
+
+// 解析客机导入的符号。顺序与上游 d2r-mobile 的 guest_sym 一致：
+//   ① 宿主自己的 nn::* 实现  ② 模块导出表（SDK→main）  ③ 系统 libc/libc++
+// ⚠ **模块导出表优先于 dlsym**：裸 malloc/free 是 main NSO 导出的**客机自己的 musl 分配器**，
+//   落到 dlsym 会变成 bionic 的分配器 ⇒ SDK 与客机不是同一套堆。
+void *za_resolve_host(const char *name)
+{
+    if (name)
+    {
+        size_t n = strlen(name);
+        if (n >= sizeof za_last_sym) n = sizeof za_last_sym - 1;
+        memcpy(za_last_sym, name, n);
+        za_last_sym[n] = 0;
+    }
+    for (const za_host_sym_t *h = za_host_syms; h->name; h++)
+        if (!strcmp(h->name, name)) return h->fn;
+    void *p = za_mod_lookup(&za_sdk_mod, name);
+    if (p) return p;
+    p = za_mod_lookup(&za_main_mod, name);
+    if (p) return p;
+    return dlsym(RTLD_DEFAULT, name);
+}
+
+static void *za_resolve(const char *name, unsigned index)
+{
+    void *p = za_resolve_host(name);
+    if (p) return p;
+    if (index < ZA_STUB_COUNT) return (void *)za_stub_table[index];
+    return za_trap_alloc(name);
+}
+
+// 桩被调用时上报（每个符号只打印一次，但每次调用都写进崩溃日志 —— 崩前最后一串就是「缺什么」）
+static unsigned char za_stub_called_once[ZA_STUB_COUNT];
+void za_stub_hit(unsigned index)
+{
+    if (index >= ZA_STUB_COUNT) return;
+    {
+        char buf[320];
+        char *p = buf;
+        p = za_put_str(p, "ZaGuest: STUB ");
+        p = za_put_str(p, za_imports[index].name);
+        p = za_put_str(p, "\n");
+        za_fatal_write(buf, (size_t)(p - buf));
+    }
+    if (za_stub_called_once[index]) return;
+    za_stub_called_once[index] = 1;
+    ZLOGI("未实现(桩) -> %s", za_imports[index].name);
+}
+
+// 客机的 C++ 运行时要 libc++；Android 的 libc++ 与 NSO 用**同一套 Itanium mangling**，
+// 所以那 400 多个符号能直接 dlsym 命中，只有 nn::* 需要自己实现。
+static void za_load_host_libs(void)
+{
+    static const char *libs[] = { "libc++_shared.so", "libm.so", "libz.so", NULL };
+    for (int i = 0; libs[i]; i++)
+    {
+        void *h = dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
+        ZLOGI("宿主库 %s %s", libs[i], h ? "已加载" : "加载失败");
+    }
+}
