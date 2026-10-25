@@ -284,17 +284,88 @@ int za_sdk_load(za_mod_t *sdk,
             const char *name;
         } za_hle_stub_t;
 
+        /* ★ 目前**没有**需要接管的函数。
+         *   pctl 的问题已经从**协议层**解决（应答槽+0x20 写非 0 token，
+         *   见 za_horizon.c 的 za_write_cmif_reply），所以这里恢复走真实 CMIF 路径。
+         *   保留这张表：以后遇到「SDK 一进去就连某个我们没有的系统服务」的导出函数，
+         *   就照 d2r-and 的 hle_sdkinit.c 那样按函数名接管。 */
         static const za_hle_stub_t g_hle[] = {
-            /* nn::pctl::Initialize（void）：家长控制服务。单机无家长控制 ⇒ 不建会话 */
-            { 0x3fbbc0u, 1, { 0xd65f03c0u, 0 }, "nn::pctl::Initialize" },
+            { 0, 0, { 0, 0 }, NULL },     /* 占位（name==NULL 表示不用） */
         };
 
         for (unsigned i = 0; i < sizeof g_hle / sizeof g_hle[0]; i++)
         {
+            if (!g_hle[i].name) continue;
             unsigned int *p = (unsigned int *)(base + g_hle[i].off);
             for (unsigned k = 0; k < g_hle[i].words && k < 2; k++)
                 p[k] = g_hle[i].w[k];
             ZLOGI("HLE 接管：%s（SDK+%#x）→ 直接返回", g_hle[i].name, g_hle[i].off);
+        }
+    }
+
+    // 5.6) 假的 ApplicationFunctions
+    //
+    // nn::am::GetApplicationFunctions()（SDK+0x1c61c0）只是读全局 SDK+0xbaca10：
+    //     ldr x19,[x8,#0xa10] ; cbz x19, <返回 NULL> ; ... ; mov x0,x19
+    // 它是 0 的时候，nn::diag::InitializeApplicationAbortObserver 注册的回调
+    // （SDK+0x349e40）会 `ldr x8,[x0]` 解引用 NULL ⇒ SIGSEGV
+    // （真机实测：pc=SDK+0x349e64 addr=0x0，x1=0x2a2）。
+    //
+    // 我们没有真的 am 服务 ⇒ 自己造一个「什么都返回 0」的空壳对象，
+    // 并把 GetApplicationFunctions 改成直接返回它。
+    // ⚠ 不能只填全局：SDK 的 am 初始化会把那个全局重新写回 0。
+    {
+        /* 代码页：mov w0,#0 ; ret（客机可以直接 blr 过去）
+         * ⚠ 必须先 RW 映射、写完再 mprotect 成 R+X —— 直接以 R+X 映射然后
+         *   str 会 SIGSEGV（真机实测：pc=za_sdk_load+1688，恰在 5.6 步）。 */
+        unsigned int *stub = (unsigned int *)mmap(NULL, 0x1000, PROT_READ | PROT_WRITE,
+                                                 MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (stub == MAP_FAILED)
+        {
+            ZLOGE("假的 ApplicationFunctions：代码页 mmap 失败");
+        }
+        else
+        {
+            stub[0] = 0x52800000u;      /* mov w0, #0 */
+            stub[1] = 0xd65f03c0u;      /* ret */
+            mprotect(stub, 0x1000, PROT_READ | PROT_EXEC);
+
+            /* 数据页：vtable + 对象（对象第 0 格放 vtable 指针） */
+            unsigned long long *data = (unsigned long long *)mmap(NULL, 0x1000,
+                                                                  PROT_READ | PROT_WRITE,
+                                                                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (data == MAP_FAILED)
+            {
+                ZLOGE("假的 ApplicationFunctions：数据页 mmap 失败");
+                munmap(stub, 0x1000);
+            }
+            else
+            {
+                enum { ZA_DUMMY_VT_SLOTS = 24 };
+                for (int i = 0; i < ZA_DUMMY_VT_SLOTS; i++)
+                    data[i] = (unsigned long long)(uintptr_t)stub;
+                unsigned long long *obj = data + ZA_DUMMY_VT_SLOTS;
+                obj[0] = (unsigned long long)(uintptr_t)data;   /* vtable */
+
+                /* 打补丁：nn::am::GetApplicationFunctions 直接返回 obj
+                 *   movz x0, #lo16 ; movk x0, #m16, lsl #16 ; movk x0, #m32, lsl #32 ; ret
+                 * ⚠ 必须 3 条指令拼满 64 位：只写低 32 位的话高位是调用方残留
+                 *   （真机实测：SDK+0x349e64 `ldr x8,[x0]` 解引用截断指针 ⇒ SIGSEGV）。
+                 * （原函数 0x44 字节，够写；写 4 条指令，不动后面的代码；
+                 *   movz 自带清零高位，48 位用户地址的 bits48..63 = 0 无需再 movk） */
+                unsigned int *fn = (unsigned int *)(base + 0x1c61c0);
+                unsigned long long a = (unsigned long long)(uintptr_t)obj;
+                fn[0] = 0xd2800000u | (unsigned int)(a & 0xffffu);        /* movz x0, #lo16 */
+                fn[1] = 0xf2a00000u | (unsigned int)((a >> 16) & 0xffffu); /* movk x0, #m16, lsl 16 */
+                fn[2] = 0xf2c00000u | (unsigned int)((a >> 32) & 0xffffu); /* movk x0, #m32, lsl 32 */
+                fn[3] = 0xd65f03c0u;                                        /* ret */
+
+                /* 同时把全局也填上（万一别处直接读它） */
+                *(unsigned long long *)(base + 0xbaca10) = a;
+
+                ZLOGI("假的 ApplicationFunctions：对象=%p vtable=%p（GetApplicationFunctions 已改写）",
+                      (void *)obj, (void *)data);
+            }
         }
     }
 
