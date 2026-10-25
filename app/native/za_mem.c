@@ -316,6 +316,56 @@ unsigned char *za_mem_stack_alloc(size_t size)
     return p;
 }
 
+// MapSharedMemory / UnmapSharedMemory（svc#19 / #20）
+//
+// 客机流程（实测反汇编 SDK+0x143c44）：
+//   ① SDK 自己的地址空间分配器（SDK+0x636f20）在 ASLR 区内挑一块空位
+//      ⇒ 例如 0x404b60000
+//   ② svc#19 MapSharedMemory(handle, 0x404b60000, 0x1000, perm)
+//   ③ SDK+0x636f30 把它登记进自己的页表
+//   ④ 之后 SDK 就当这块内存存在（seqlock 读它）
+//
+// 以前 svc#19 是**空实现** ⇒ ②什么都没做 ⇒ ④读 0x404b60038 ⇒ SIGSEGV
+// （真机实测：pc=SDK+0x42ff34 addr=0x404b60038，x9=0x404b60000）。
+//
+// ⚠ ASLR 区是整块 PROT_NONE 预留的（mmap PROT_NONE + 5GB），
+//   所以**不能用 mmap**（那段地址已经被预留映射占了），
+//   只能用 mprotect 在预留块里开口子。
+int za_mem_map_shared(unsigned long long addr, unsigned long long size)
+{
+    if (!g_as) za_mem_init();
+    if (!g_as || !addr || !size) return 0;
+    size = (size + 0xFFF) & ~0xFFFull;
+    if (addr < (unsigned long long)(uintptr_t)g_as ||
+        addr + size > (unsigned long long)(uintptr_t)g_as + ZA_MEM_RESERVE)
+    {
+        ZLOGE("MapSharedMemory：%#llx 不在客机地址空间内，拒绝", addr);
+        return 0;
+    }
+    if (za_mem_map_find(addr))
+        ZLOGI("MapSharedMemory：%#llx 已落在已登记区间内，仍按共享内存开口", addr);
+    if (mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_READ | PROT_WRITE) != 0)
+    {
+        ZLOGE("MapSharedMemory 开放失败（%#llx+%#llx）：%s", addr, size, strerror(errno));
+        return 0;
+    }
+    za_mem_map_add(addr, size, 0, 0x0B);
+    return 1;
+}
+
+int za_mem_unmap_shared(unsigned long long addr, unsigned long long size)
+{
+    if (!g_as || !addr || !size) return 0;
+    size = (size + 0xFFF) & ~0xFFFull;
+    if (addr < (unsigned long long)(uintptr_t)g_as ||
+        addr + size > (unsigned long long)(uintptr_t)g_as + ZA_MEM_RESERVE)
+        return 0;
+    // 收回成 PROT_NONE（ASLR 区本来就是预留的）
+    mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_NONE);
+    za_mem_map_add(addr, 0, 0, 0);      /* size=0 ⇒ za_mem_map_find 当成没占用 */
+    return 1;
+}
+
 // MapMemory(dst, src, size)：把 src 的内容搬到 dst（src=0 就只是占位）。
 // 客机建线程时用它把堆上的栈搬进栈区。
 // 语义照 d2r-and 的 hle_svc.c（那边是已上线的成品）：

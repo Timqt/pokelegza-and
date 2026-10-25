@@ -466,10 +466,16 @@ static int za_fake_svc_is_tipc(unsigned int h)
 // 接口对象 ⇒ SIGSEGV（实测：nn::am = applet manager，服务名 "apm"，
 // nn::am::InitializeApplicationInterfaces 在 SDK+0x1c99d4 崩）。
 // 正确做法是让 GetServiceHandle **失败**：SDK 会走「服务不存在」的正常分支。
+//
+// ⚠⚠ 2026-10-25 修正：**"apm" 不能拒**！
+//   真机上**每个标题都有 apm（applet manager）服务**，只有 applet 专有的
+//   "appletOE" / "ae" 才对独立标题不存在。
+//   我们拒掉 apm ⇒ nn::am::GetApplicationFunctions()（SDK+0x1c61c0）返回 NULL
+//   ⇒ nn::diag::InitializeApplicationAbortObserver（SDK+0x349e40）在
+//      `ldr x8,[x0]` 处解引用 NULL ⇒ SIGSEGV（真机实测 pc=SDK+0x349e64）。
 static const char *g_svc_deny[] = {
-    "apm",        /* applet manager —— 只有 applet 才有 */
-    "appletOE",   /* applet operation environment */
-    "ae",         /* applet extra */
+    "appletOE",   /* applet operation environment（只有 applet 才有） */
+    "ae",         /* applet extra（只有 applet 才有） */
 };
 #define ZA_SVC_DENY_N ((int)(sizeof(g_svc_deny) / sizeof(g_svc_deny[0])))
 #define ZA_SVC_NOT_FOUND 0x202u     /* Horizon: 服务名找不到 */
@@ -686,13 +692,35 @@ static void za_write_cmif_reply(unsigned long long ro, unsigned long long reply_
         }
     }
 
-    /* 找 CMIF 请求头 "SFCI" 的位置 —— **应答必须写在同一个槽位** */
+    /* ── 找应答槽位 ────────────────────────────────────────────────
+     *
+     * ★ 协议（静态逆向 SDK+0x10be2c 路径 B / SDK+0x14eb28 路径 A 确认）：
+     *   应答槽 = align16(应答缓冲 + idx*4 + 15)，idx 由**应答头**算出。
+     *   槽内字段：
+     *     路径 B（魔数在槽+0x10）：槽+0x10="SFCO"、槽+0x18=Result(必须0)、槽+0x20=token
+     *     路径 A（魔数在槽+0x00）：槽+0x00="SFCO"、槽+0x08=Result(必须0)、槽+0x10=u16 返回值
+     *   统一律：**SFCO 魔数的落点 == 请求侧 SFCI 魔数的落点**
+     *   ⇒ 两条路径都写成「SFCI 位置 + 0x00 = "SFCO"、+0x08 = 0、+0x10 = token」。
+     */
     unsigned int cmif_off = 0;
     for (unsigned int off = 0; off < 0x100; off += 4)
     {
         unsigned int w;
         memcpy(&w, (const void *)(uintptr_t)(ro + (unsigned long long)off), 4);
         if (w == 0x49434653u) { cmif_off = off; break; }
+    }
+    if (!cmif_off)
+    {
+        /* 没找到 SFCI ⇒ SDK 这次**没有重写魔数**（实测：time:u 的 cmd=0x2 那次，
+         * 请求里 [0x20] 还是我们上次写的 "SFCO"）⇒ 沿用上次应答的 "SFCO" 位置。 */
+        for (unsigned int off = 0; off < 0x100; off += 4)
+        {
+            unsigned int w;
+            memcpy(&w, (const void *)(uintptr_t)(ro + (unsigned long long)off), 4);
+            if (w == 0x4f434653u) { cmif_off = off; break; }
+        }
+        if (cmif_off)
+            ZLOGI("    请求里没有 SFCI（SDK 未重写魔数），沿用上次应答槽位 TLS+%#x", cmif_off);
     }
     ZLOGI("    请求里 SFCI @TLS+%#x（应答就写在这里）", cmif_off);
 
@@ -754,21 +782,63 @@ static void za_write_cmif_reply(unsigned long long ro, unsigned long long reply_
          *                          → 0x7c02fc8048000000
          *     ldr x8,[x8,#8]       → 野指针 ⇒ SIGSEGV（pc=sdk+0x3c46a8）
          *
-         * 出参真正该待的地方是**应答共享内存**：SFCO 槽 +0x18 = 出参句柄，
-         * 槽 +0x20 = 类型码。现在两者都是 0 ⇒ SDK 走「无出参」分支，
-         * 它会自己把 *a4 清零并跳过虚函数调用 —— 正是我们要的行为。
+         * 出参**不在** a4，也不在应答缓冲里的一段数据：
+         * SDK 在发请求**之前**就预建好 56 字节的 CmifProxy 出参代理对象
+         * （SDK+0x3fcf58），应答里只用「SFCO 槽 +0x18 = Result」和
+         * 「+0x20 = token」两个字段决定它是否被激活。
+         *   token == 0 ⇒ SDK 走「无出参」分支，自己把出参指针清 0
+         *              ⇒ 全局 SDK+0xc024b8 = NULL ⇒ 下次 SDK+0x3fcbf4 崩
+         *   token != 0 ⇒ 出参代理被激活并交付出参指针
+         * 所以这里必须写一个非 0 的 token（见下面）。
          */
         ZLOGI("    a4=%#llx（不写：这是 SDK 的 Object** 槽，内核不碰它）", out_ptr);
 
         /* 应答内容（写在 SFCI 的位置）：
-         *   +0x00 "SFCO"    +0x04 保留     +0x08 IPC 结果码 / 出参句柄（0）
-         *   +0x0c 保留       +0x10 命令返回(u16) / 类型码（0）
+         *   +0x00 "SFCO"    +0x04 保留     +0x08 IPC Result（必须 0）
+         *   +0x0c 保留       +0x10 token（路径 B）/ 命令返回 u16（路径 A）
          * ★ 路径 A（SDK+0x14eb28）读 槽位+0 / +0x8 / +0x10；
          *   路径 B（SDK+0x10be2c）读 槽位+0x10 / +0x18 / +0x20，
-         *   而路径 B 的槽位 = SFCI 位置 − 0x10 ⇒ 两条路径要求的字段完全一致。 */
+         *   而路径 B 的槽位 = SFCI 位置 − 0x10 ⇒ 两条路径要求的字段完全一致。
+         *
+         * ★★ token（+0x10）必须非 0（SDK+0x10bf98 `cbz w23, <无出参分支>`）：
+         *   token == 0 ⇒ SDK 走「无出参」分支 ⇒ 它自己把出参指针清 0
+         *   ⇒ SDK+0x3fcaac 把 NULL 写进全局 SDK+0xc024b8
+         *   ⇒ 下一次 SDK+0x3fcbf4 对 NULL 解引用 ⇒ SIGSEGV（真机实测）。
+         *   SDK 不校验 token 的值，只把它原样回填进下一次请求的 SFCI+0x04，
+         *   所以我们自己编一个递增的就行。
+         */
         unsigned char hdr[0x20];
         memset(hdr, 0, sizeof hdr);
         memcpy(hdr + 0x00, "SFCO", 4);
+
+        /* ── 路径判定 ────────────────────────────────────────────────
+         * 路径 B（普通命令 / 取子对象）的请求描述符在 **SFCI 位置前 0x10**：
+         *   描述符 slot+0x00 = 0x00180001（取子对象）或 0x00100001（普通命令），
+         *   描述符 slot+0x10 = "SFCI"。
+         * 路径 A 的描述符在 **SFCI 位置后 0x10**（slot+0x00 = SFCO、slot+0x08 = Result、
+         *   slot+0x10 = u16 命令返回）。
+         *
+         * 实测对照（真机日志）：
+         *   cmd=0x7 hdr0=7 hdr1=8  ⇒ SFCI@0x10、[0x00]=7      ⇒ 路径 A
+         *   cmd=0x6 hdr0=6 hdr1=0xc ⇒ SFCI@0x20、[0x10]=0x00100001 ⇒ 路径 B
+         */
+        int path_b = 0;
+        if (cmif_off >= 0x10)
+        {
+            unsigned int w = 0;
+            memcpy(&w, (const void *)(uintptr_t)(ro + (unsigned long long)cmif_off - 0x10), 4);
+            if (w == 0x00180001u || w == 0x00100001u) path_b = 1;
+        }
+
+        /* token（路径 B 的槽+0x20 = SFCI 位置 + 0x10）必须非 0；
+         * 路径 A 的同一位置是「u16 命令返回」，应当是 0。 */
+        if (path_b)
+        {
+            static unsigned int g_cmif_token = 1;
+            unsigned int token = ++g_cmif_token;
+            if (!token) token = ++g_cmif_token;     /* 0 是保留值，绕开 */
+            memcpy(hdr + 0x10, &token, 4);
+        }
 
         /* ★ 写回 IPC 缓冲的槽位（SDK 校验的就是这里）*/
         memcpy((void *)(uintptr_t)((unsigned long long)ro + slot), hdr, sizeof hdr);
@@ -1220,8 +1290,26 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         return 0;
 
     // ── 句柄 / 共享内存 ──
-    case 19: // MapSharedMemory(shmem=x0, addr=x1, size=x2, perm=w3)
-    case 20: // UnmapSharedMemory(shmem=x0, addr=x1)
+    case 19: // MapSharedMemory(handle=x0, addr=x1, size=x2, perm=w3)
+    {
+        // ★ 以前这里是**空实现**（直接 return 0），害得 SDK 随后读未映射地址崩：
+        //   真机实测 pc=SDK+0x42ff34 addr=0x404b60038（seqlock 读共享内存）
+        // 客机流程（SDK+0x143c44 反汇编）：
+        //   ① SDK 自己的分配器在 ASLR 区挑空位（0x404b60000）
+        //   ② svc#19(handle, addr, size, perm) ← 内核要在这儿真的映射出来
+        //   ③ SDK+0x636f30 登记进自己的页表
+        //   ④ SDK 之后直接当这块内存存在
+        if (!za_mem_map_shared((unsigned long long)a1, (unsigned long long)a2))
+            return 0xDC01;
+        ZLOGI("svc#19 MapSharedMemory：%#llx 映射 %llu 字节（handle=%#lx）",
+              (unsigned long long)a1, (unsigned long long)a2, (unsigned long)a0);
+        return 0;
+    }
+    case 20: // UnmapSharedMemory(handle=x0, addr=x1, size=x2)
+    {
+        za_mem_unmap_shared((unsigned long long)a1, (unsigned long long)a2);
+        return 0;
+    }
     case 21: // CreateTransferMemory(out_handle=x0, addr=x1, size=x2, perm=w3) → W1
     {
         if (nr == 21)

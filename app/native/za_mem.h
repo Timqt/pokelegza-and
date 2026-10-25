@@ -19,6 +19,10 @@ unsigned char *za_mem_stack_alloc(size_t size);
 // MapMemory / UnmapMemory / QueryMemory
 int za_mem_map_memory(unsigned long long dst, unsigned long long src, unsigned long long size);
 int za_mem_unmap_memory(unsigned long long dst, unsigned long long src, unsigned long long size);
+// MapSharedMemory / UnmapSharedMemory（svc#19 / #20）：
+// 客机先在 ASLR 区内挑一块空位，再让内核把共享内存映射到那个地址上。
+int za_mem_map_shared(unsigned long long addr, unsigned long long size);
+int za_mem_unmap_shared(unsigned long long addr, unsigned long long size);
 // QueryMemory：填 MemoryInfo（base/size/state/attr/perm 六个字段），返回页信息（W1）。
 unsigned long long za_mem_query_memory(unsigned long long addr, unsigned long long *mi);
 
