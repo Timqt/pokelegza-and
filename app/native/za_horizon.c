@@ -328,13 +328,17 @@ extern volatile unsigned long za_ro_tls_page;
 static unsigned int za_current_owner_id(void)
 {
     unsigned long ro = (unsigned long)za_ro_tls_page;
-    if (!ro) return 1;                       // 兜底：与 za_sdk.c 里写入的 owner_id 一致
+    // 兜底也必须是「真实 tid」：owner_id 的唯一权威来源就是 svc#37 GetThreadId，
+    // 客机加锁时把它的返回值写进锁字，解锁时用 [self+0x1b0] 比。
+    unsigned int fallback = (unsigned int)syscall(SYS_gettid);
+    if (!fallback) fallback = 1;
+    if (!ro) return fallback;
     unsigned long self = 0;
     __builtin_memcpy(&self, (void *)(ro + 0x1f8), 8);
-    if (!self) return 1;
+    if (!self) return fallback;
     unsigned int oid = 0;
     __builtin_memcpy(&oid, (void *)(self + 0x1b0), 4);
-    return oid ? oid : 1;
+    return oid ? oid : fallback;
 }
 static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                                 long a4, long a5, long a6, long a7, long nr)

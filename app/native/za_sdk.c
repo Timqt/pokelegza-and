@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #include "za_common.h"
 #include "za_mod.h"
@@ -304,10 +306,16 @@ int za_sdk_load(za_mod_t *sdk,
         //   （实测就是这里 AbortImpl 崩的：nn::os 的 CriticalSection::Enter）。
         //   客机加锁时把锁字写成 owner_id（见 SDK 0x145fb8: stxr w9,w8,[x0]），
         //   所以两边用同一个值即可自洽。bit29 必须为 0（比较前会被掩掉）。
-        *(unsigned int *)(ro2 + 0x1b0) = 1u;
+        // ★ owner_id 必须等于 svc#37 GetThreadId 返回的 tid。
+        //   客机加锁时把 GetThreadId 的值写进锁字（sdk+0x144600），解锁时
+        //   （sdk+0x14604c）拿 [self+0x1b0] 去比；两边不同源 => 永远不相等
+        //   => 判「锁不属于当前线程」=> abort（实测 error 0x1a80a）。
+        //   以前这里写死 1u，是这一整串崩溃的直接原因。
+        *(unsigned int *)(ro2 + 0x1b0) = (unsigned int)syscall(SYS_gettid);
         za_ro_tls_page = (unsigned long)(uintptr_t)ro;      // 供 za_horizon.c 取 owner_id
-        ZLOGI("只读 TLS：改写 %u 处 TPIDRRO_EL0，页=%p（self=%p，owner_id=%u）",
-              ZA_TLSRO_PATCH_COUNT, (void *)ro, (void *)ro2, 1u);
+        ZLOGI("只读 TLS：改写 %u 处 TPIDRRO_EL0，页=%p（self=%p，owner_id=%u=本线程 tid）",
+              ZA_TLSRO_PATCH_COUNT, (void *)ro, (void *)ro2,
+              (unsigned)syscall(SYS_gettid));
     }
 
     // 8) 客机不许动 bionic 的 TLS 指针
