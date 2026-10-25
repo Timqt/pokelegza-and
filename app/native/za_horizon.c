@@ -660,6 +660,16 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         if (nr == 27)
         {
             // ArbitrateUnlock(ptr = x0)
+            {
+                static int n27;
+                if (n27 < 12)
+                {
+                    n27++;
+                    unsigned int cur = a0 ? *(unsigned int *)(uintptr_t)a0 : 0;
+                    ZLOGI("svc#27 ArbitrateUnlock lock=%p before=%#x owner=%u",
+                          (void *)(uintptr_t)a0, cur, za_current_owner_id());
+                }
+            }
             if (a0) __atomic_store_n((unsigned int *)(uintptr_t)a0, 0u, __ATOMIC_RELEASE);
             return 0;
         }
@@ -668,6 +678,15 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             unsigned int *lock = (unsigned int *)(uintptr_t)a1;
             if (!lock) return 0;
             unsigned int owner = za_current_owner_id();
+            {
+                static int n26;
+                if (n26 < 12)
+                {
+                    n26++;
+                    ZLOGI("svc#26 ArbitrateLock lock=%p before=%#x owner=%u host_tid=%u",
+                          (void *)lock, *lock, owner, (unsigned)syscall(SYS_gettid));
+                }
+            }
             unsigned int expect = 0;
             if (__atomic_compare_exchange_n(lock, &expect, owner, 0,
                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
@@ -800,6 +819,24 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             extern unsigned long long za_mem_getinfo(long id);
             ZLOGI("  GetInfo: id0(CpuMask)=%#llx id23(IsApplication)=%#llx",
                   za_mem_getinfo(0), za_mem_getinfo(23));
+        }
+        // ③ 临界区实况：self / owner_id / 本线程 tid
+        //   ⚠ 不要读 Break 的 a0 当锁字 —— a0 是 reason（恒为 0），
+        //     上一版据此报「lockword=0 match=NO」是自己造的假结论。
+        {
+            unsigned long ro = (unsigned long)za_ro_tls_page;
+            unsigned long self = 0;
+            if (ro)
+                memcpy(&self, (void *)(uintptr_t)(ro + 0x1f8), 8);
+            unsigned int oid = 0;
+            if (self)
+                memcpy(&oid, (void *)(uintptr_t)(self + 0x1b0), 4);
+            unsigned int mine = za_current_owner_id();
+            unsigned int tid = (unsigned)syscall(SYS_gettid);
+            ZLOGI("  cs: ro=%p self=%p [self+0x1b0]=%u cur_owner_id=%u host_tid=%u "
+                  "consistent=%s",
+                  (void *)(uintptr_t)ro, (void *)(uintptr_t)self, oid, mine, tid,
+                  (oid && oid == tid) ? "YES" : "NO(以 [self+0x1b0] 为准)");
         }
         // 顺便把客机栈里的返回地址扫出来 ⇒ 能看出是哪条调用链走到这个断言
         {
