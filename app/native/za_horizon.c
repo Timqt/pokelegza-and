@@ -396,22 +396,72 @@ static const za_fake_svc_t g_fake_svcs[] = {
 
 // 名字 → 句柄；不认识的名字也返回一个「通用 CMIF 句柄」，
 // 免得 SDK 因为拿到 0 而直接失败。
-static unsigned int za_fake_svc_handle(const char *name)
+//
+// ⚠ 每个服务名必须给**独立句柄**：SDK 会按句柄缓存每个服务的客户端状态，
+//   像 "pctl" / "pctl:s" / "pctl:a" / "pctl:r" 是四个不同的服务，
+//   共用一个句柄会让 SDK 把它们当成同一个 ⇒ 内部对象错乱。
+static char g_fake_names[64][9];
+static unsigned int g_fake_handles[64];
+static int g_fake_tipc[64];
+static int g_fake_count;
+
+// 名字 → 协议属性（静态表只提供属性，不再隐含句柄索引）
+static int za_fake_svc_tipc_by_name(const char *name)
 {
     for (int i = 0; i < ZA_FAKE_SVC_N; i++)
-        if (strcmp(name, g_fake_svcs[i].name) == 0)
-            return ZA_FAKE_SVC_BASE + (unsigned int)i;
-    return ZA_FAKE_SVC_BASE + 0x100u;   /* 通用 CMIF */
+        if (strcmp(g_fake_svcs[i].name, name) == 0)
+            return g_fake_svcs[i].tipc;
+    return 0;   /* 未知服务一律按 CMIF */
+}
+
+static unsigned int za_fake_svc_handle(const char *name)
+{
+    for (int i = 0; i < g_fake_count; i++)
+        if (strcmp(g_fake_names[i], name) == 0)
+            return g_fake_handles[i];
+    if (g_fake_count >= 64)
+        return ZA_FAKE_SVC_BASE + 0x100u;
+    int idx = g_fake_count++;
+    snprintf(g_fake_names[idx], 9, "%s", name);
+    g_fake_handles[idx] = ZA_FAKE_SVC_BASE + (unsigned int)idx;
+    g_fake_tipc[idx] = za_fake_svc_tipc_by_name(name);
+    return g_fake_handles[idx];
 }
 
 // 句柄 → 是否 TIPC（-1 = 未知句柄）
+//
+// ⚠ 必须按**名字**查协议，不能拿句柄数值去索引静态表：句柄是按调用顺序动态
+//   分配的，数值和 g_fake_svcs 的下标毫无关系。
+//   实测踩坑：ectx:aw 拿到 0x7002，静态表 g_fake_svcs[2] 恰好是 "sm:m"（TIPC）
+//   ⇒ ectx:aw 被误判成 TIPC ⇒ 没写 "SFCO" 应答头 ⇒ SDK Abort(0x1a80a)。
 static int za_fake_svc_is_tipc(unsigned int h)
 {
     if (h < ZA_FAKE_SVC_BASE) return -1;
     unsigned int i = h - ZA_FAKE_SVC_BASE;
     if (i == 0x100u) return 0;
-    if (i >= (unsigned int)ZA_FAKE_SVC_N) return -1;
-    return g_fake_svcs[i].tipc;
+    if (i >= (unsigned int)g_fake_count) return -1;
+    return g_fake_tipc[i];
+}
+
+// 独立（非 applet）标题**根本不存在**的系统服务。
+// 我们若给它们返回假句柄，SDK 会以为服务可用，接着解引用一个永远为 NULL 的
+// 接口对象 ⇒ SIGSEGV（实测：nn::am = applet manager，服务名 "apm"，
+// nn::am::InitializeApplicationInterfaces 在 SDK+0x1c99d4 崩）。
+// 正确做法是让 GetServiceHandle **失败**：SDK 会走「服务不存在」的正常分支。
+static const char *g_svc_deny[] = {
+    "apm",        /* applet manager —— 只有 applet 才有 */
+    "appletOE",   /* applet operation environment */
+    "ae",         /* applet extra */
+};
+#define ZA_SVC_DENY_N ((int)(sizeof(g_svc_deny) / sizeof(g_svc_deny[0])))
+#define ZA_SVC_NOT_FOUND 0x202u     /* Horizon: 服务名找不到 */
+
+static int za_svc_is_denied(const char *name)
+{
+    for (int i = 0; i < ZA_SVC_DENY_N; i++)
+        if (strcmp(name, g_svc_deny[i]) == 0)
+            return 1;
+    return 0;
 }
 
 // 写 CMIF 应答。
@@ -430,29 +480,81 @@ static int za_fake_svc_is_tipc(unsigned int h)
 //   所以这里：沿用请求的头，只把 "SFCI" 换成 "SFCO"。
 static void za_write_cmif_reply(unsigned long long ro, unsigned int hdr0, unsigned int hdr1)
 {
-    /* 取证：把请求的前 0x60 字节打出来 */
+    /* 取证：把请求的前 0x40 字节打出来 */
     {
-        unsigned int w[12];
-        for (int i = 0; i < 12; i++)
+        unsigned int w[16];
+        for (int i = 0; i < 16; i++)
             memcpy(&w[i], (const void *)(uintptr_t)(ro + (unsigned long long)(i * 4)), 4);
-        ZLOGI("    req[0..0x30]=%08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+        ZLOGI("    req[0..0x40]=%08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
               w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
-              w[8], w[9], w[10], w[11]);
+              w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15]);
+    }
+
+    /* 取证（首次）：把整页前 0x100 字节 dump 出来，确定
+     *   ① SDK 把请求写在哪些槽位
+     *   ② SDK 从哪个槽位读应答（槽位 = align_down_16(buffer + idx*4 + 0xf)，
+     *      idx 由 0x9a8f0 从 buffer[0..0xa] 解出，不是固定 +0x10）
+     */
+    static int dumped = 0;
+    if (!dumped)
+    {
+        dumped = 1;
+        for (unsigned int base = 0; base < 0x100; base += 0x20)
+        {
+            unsigned int w[8];
+            for (int i = 0; i < 8; i++)
+                memcpy(&w[i], (const void *)(uintptr_t)(ro + base + (unsigned long long)(i * 4)), 4);
+            ZLOGI("    PAGE[%#05x]=%08x %08x %08x %08x %08x %08x %08x %08x",
+                  base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+        }
+
+        /* 取证（首次）：ro2 页 = SDK基址 + 0xf01000。
+         * ★ 请求里反复出现 {0x00f01000, 0x00000002}，这就是 Horizon CMIF 的
+         *   「间接传参」对：(数据区偏移, 长度) ⇒ 真正的数据交换发生在这一页。
+         */
+        if (za_sdk_base)
+        {
+            unsigned long long ro2 = (unsigned long long)za_sdk_base + 0xf01000ul;
+            for (unsigned int base = 0; base < 0x100; base += 0x20)
+            {
+                unsigned int w[8];
+                for (int i = 0; i < 8; i++)
+                    memcpy(&w[i], (const void *)(uintptr_t)(ro2 + base + (unsigned long long)(i * 4)), 4);
+                ZLOGI("    RO2  [%#05x]=%08x %08x %08x %08x %08x %08x %08x %08x",
+                      base, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+            }
+        }
     }
 
     /* 找 CMIF 请求头 "SFCI" 的位置 */
     unsigned int cmif_off = 0;
-    for (unsigned int off = 0; off < 0x80; off += 4)
+    for (unsigned int off = 0; off < 0x100; off += 4)
     {
         unsigned int w;
         memcpy(&w, (const void *)(uintptr_t)(ro + (unsigned long long)off), 4);
         if (w == 0x49434653u) { cmif_off = off; break; }
     }
-    if (!cmif_off) cmif_off = 0x10;   /* 兜底 */
 
     /* 应答头：沿用请求的头（Horizon 的应答头与请求头同形） */
     memcpy((void *)(uintptr_t)(ro + 0), &hdr0, 4);
     memcpy((void *)(uintptr_t)(ro + 4), &hdr1, 4);
+
+    if (!cmif_off)
+    {
+        /* ⚠ 这里**不能**兜底写 SFCO！
+         *
+         * 实测（2026-10-25 真机，pctl:a）：有一类请求的 body 里根本没有
+         * "SFCI"（例：hdr0=0x6 hdr1=0x8，body 头是 0x00000002），
+         * 那不是 CMIF 请求，SDK 期望原样读回它自己的数据。
+         * 旧代码兜底往 TLS+0x10 写 "SFCO"，直接覆盖了请求内容 ⇒
+         * SDK 拿到垃圾返回值 ⇒ nn::pctl 的客户端对象建不起来 ⇒
+         * 全局 0xc024b8 保持 NULL ⇒ 0x3fcbf4 解引用崩溃。
+         *
+         * 所以：找不到 CMIF 头就**什么都不写**，让请求原样通过。
+         */
+        ZLOGI("    CMIF 头未找到 -> 原样放行（不写 SFCO）");
+        return;
+    }
 
     /* CmifOutHeader：sig / version+reserved / Result=0 / InterfaceId=0 */
     unsigned int cmif[4] = { 0x4F434653u, 0x00010000u, 0u, 0u };
@@ -969,11 +1071,23 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 char nm[9];
                 memset(nm, 0, sizeof nm);
                 memcpy(nm, (void *)(uintptr_t)(ro + 8), 8);
-                unsigned int h = za_fake_svc_handle(nm);
-                memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);      // result
-                memcpy((void *)(uintptr_t)(ro + 0xc), &h, 4);      // 服务句柄
-                memcpy((void *)(uintptr_t)(ro + 0x10), &zero, 4);   // 返回码
-                ZLOGI("  IPC TIPC GetServiceHandle(\"%s\") -> handle %#x", nm, h);
+                if (za_svc_is_denied(nm))
+                {
+                    /* 服务不存在：句柄给 0、服务级返回码给「找不到」⇒ SDK 走正常分支 */
+                    unsigned int nf = ZA_SVC_NOT_FOUND;
+                    memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
+                    memcpy((void *)(uintptr_t)(ro + 0xc), &zero, 4);
+                    memcpy((void *)(uintptr_t)(ro + 0x10), &nf, 4);
+                    ZLOGI("  IPC TIPC GetServiceHandle(\"%s\") -> 不存在（返回 %#x）", nm, nf);
+                }
+                else
+                {
+                    unsigned int h = za_fake_svc_handle(nm);
+                    memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);      // result
+                    memcpy((void *)(uintptr_t)(ro + 0xc), &h, 4);      // 服务句柄
+                    memcpy((void *)(uintptr_t)(ro + 0x10), &zero, 4);   // 返回码
+                    ZLOGI("  IPC TIPC GetServiceHandle(\"%s\") -> handle %#x", nm, h);
+                }
             }
             else
             {
