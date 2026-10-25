@@ -87,6 +87,16 @@ static char *za_put_str(char *p, const char *s)
     return p;
 }
 
+static char *za_put_dec(char *p, unsigned long long v)
+{
+    char tmp[24];
+    int n = 0;
+    if (!v) { *p++ = '0'; return p; }
+    while (v) { tmp[n++] = (char)('0' + (v % 10)); v /= 10; }
+    while (n) *p++ = tmp[--n];
+    return p;
+}
+
 static char *za_put_hex(char *p, unsigned long long v)
 {
     static const char dig[] = "0123456789abcdef";
@@ -478,7 +488,7 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             for (int i = base; i < base + 4 && i < 32; i++)
             {
                 p = za_put_str(p, " x");
-                p = za_put_hex(p, (unsigned long long)i);
+                p = za_put_dec(p, (unsigned long long)i);
                 p = za_put_str(p, "=");
                 p = za_put_hex(p, (unsigned long long)uc->uc_mcontext.regs[i]);
             }
