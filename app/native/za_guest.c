@@ -77,6 +77,10 @@ unsigned long za_svc_trace_pc[32];
 unsigned long za_svc_trace_pos;
 
 // ── 小工具（信号处理器里也只能用这些，不能碰 libc）──────────────────
+// 前置声明：mrs TPIDR_EL0 替换桩的宿主回调（实现在后面）
+unsigned long za_tls_mrs_hook(void);
+unsigned long za_os_guest_tls_area(void);
+
 static char *za_put_str(char *p, const char *s)
 {
     while (*s) *p++ = *s++;
@@ -614,12 +618,7 @@ void za_svc41_trace(unsigned long pc, long id)
 }
 // ── 线程栈边界登记（栈溢出时才知道「哪条线程、栈多大、用了多少」）────
 #define ZA_STACK_REGIONS 64
-typedef struct
-{
-    long tid;
-    unsigned long lo, hi;
-    const char *who;
-} za_stack_region_t;
+// za_stack_region_t 由 za_guest_api.h 提供，这里只放存储
 static za_stack_region_t za_stack_regions[ZA_STACK_REGIONS];
 
 void za_stack_register(long tid, unsigned long lo, unsigned long hi, const char *who)
@@ -731,7 +730,8 @@ void za_tls_leave(void)
 }
 
 // 只读 TLS 页的绝对地址（za_horizon.c 的临界区按同一来源取 owner_id）
-volatile unsigned long za_ro_tls_page = 0;
+// za_ro_tls_page 由 za_sdk.c 定义并写入（SDK 装载时填真实页地址）
+extern volatile unsigned long za_ro_tls_page;
 
 void za_os_install_tls_descriptor(void)
 {
@@ -953,4 +953,496 @@ static void za_load_host_libs(void)
         void *h = dlopen(libs[i], RTLD_NOW | RTLD_GLOBAL);
         ZLOGI("宿主库 %s %s", libs[i], h ? "已加载" : "加载失败");
     }
+}
+// ════════════════════════════════════════════════════════════════
+//  映像映射与重定位
+// ════════════════════════════════════════════════════════════════
+
+// 映射客机映像到固定基址 0x100000000（客机代码里硬编码，不能换）。
+// 映射范围除映像本身外，还要留：
+//   · 客机 TLS 描述符区 + 变量区（见 za_tls_patch.h）
+//   · mrs TPIDR_EL0 的替换桩区（见 za_tls_mrs_blob.h）
+//
+// ⚠ 整块先按可读写映射（GOT 在 .data 里、装载时要写），text/rodata 的只读权限等重定位做完再收紧。
+int za_guest_map(const unsigned char *text, const unsigned char *rodata,
+                 const unsigned char *data_seg, size_t bss, unsigned char **out_base)
+{
+    if (!text || !rodata || !data_seg || !out_base) return -1;
+    size_t page = 4096;
+    size_t total = ZA_DATA_OFF + ZA_DATA_SIZE + bss;
+    size_t tls_end = ZA_TLS_VAR_OFF + ZA_TLS_VAR_SIZE;
+    if (tls_end > total) total = tls_end;
+    size_t stub_end = ZA_TLS_HOOK_SLOT + 8;
+    if (stub_end > total) total = stub_end;
+    size_t mapped = (total + page - 1) & ~(page - 1);
+
+    void *want = (void *)ZA_GUEST_BASE_ADDR;
+    unsigned char *base = (unsigned char *)mmap(want, mapped, PROT_READ | PROT_WRITE,
+                                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (base == MAP_FAILED || base != want)
+    {
+        // 固定地址拿不到就退回随机地址（客机里的硬编码常量会错，但至少能跑起来看日志）
+        base = (unsigned char *)mmap(NULL, mapped, PROT_READ | PROT_WRITE,
+                                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (base == MAP_FAILED) { ZLOGE("客机映像映射失败"); return -1; }
+        ZLOGE("客机映像没能映射到 %#lx（实际 %p），硬编码地址会错", ZA_GUEST_BASE_ADDR, (void *)base);
+    }
+    memcpy(base + ZA_TEXT_OFF, text, ZA_TEXT_SIZE);
+    memcpy(base + ZA_RODATA_OFF, rodata, ZA_RODATA_SIZE);
+    memcpy(base + ZA_DATA_OFF, data_seg, ZA_DATA_SIZE);
+    memset(base + ZA_DATA_OFF + ZA_DATA_SIZE, 0, bss);
+
+    za_guest_base = base;
+
+    // TLS helper 改写：`mrs Xt,TPIDR_EL0 / ubfm|and` → `adrp Xt,<描述符区> / nop`
+    // （这批表由 tools/patch_tls_helpers.py 生成，4756 条：ubfm 697 + and 4059）
+    {
+        unsigned int n = 0;
+        for (unsigned i = 0; i < ZA_TLS_PATCH_COUNT; i++)
+        {
+            unsigned int *at = (unsigned int *)(base + za_tls_patches[i].off);
+            *at = za_tls_patches[i].w0;
+            *(unsigned int *)(base + za_tls_patches[i].off + 4) = za_tls_patches[i].w1;
+            n++;
+        }
+        ZLOGI("客机 TLS: 改写 %u 个 helper，描述符区=%#x 变量区=%#x",
+              n, (unsigned)ZA_TLS_DESC_OFF, (unsigned)ZA_TLS_VAR_OFF);
+    }
+
+    // mrs TPIDR_EL0 全量替换：`b <桩>`，桩里回调宿主取线程基址（10,193 条）
+    {
+        memcpy(base + ZA_TLS_STUB_OFF, za_tls_mrs_blob, (size_t)ZA_TLS_STUB_SIZE);
+        *(unsigned long long *)(base + ZA_TLS_HOOK_SLOT) = (unsigned long long)(uintptr_t)za_tls_mrs_hook;
+        unsigned int patched = 0;
+        for (unsigned i = 0; i < ZA_TLS_MRS_COUNT; i++)
+        {
+            const za_tls_mrs_t *e = &za_tls_mrs[i];
+            if (e->off + 4 > ZA_TEXT_SIZE) continue;
+            unsigned int *at = (unsigned int *)(base + e->off);
+            if (*at != e->orig) continue;                 // 只改原字节仍匹配的
+            long long delta = (long long)e->stub - (long long)e->off;
+            if (delta < -(1LL << 27) || delta >= (1LL << 27)) continue;
+            *at = 0x14000000u | (unsigned int)((delta >> 2) & 0x3FFFFFF);
+            patched++;
+        }
+        ZLOGI("TLS mrs 改写：%u / %u 条已替换（桩区 %#x..%#x）",
+              patched, (unsigned)ZA_TLS_MRS_COUNT,
+              (unsigned)ZA_TLS_STUB_OFF, (unsigned)(ZA_TLS_STUB_OFF + ZA_TLS_STUB_SIZE));
+    }
+
+    *out_base = base;
+    return 0;
+}
+// mrs TPIDR_EL0 替换桩的宿主回调：返回本线程的客机 TLS 基址。
+// 桩里是 `adrp x16,<桩区>; ldr x16,[x16,#off]; blr x16; mov xN,x0`，
+// 所以这里返回什么，客机的 `mrs TPIDR_EL0` 就得到什么。
+// ⚠ 本函数不能依赖 TPIDR_EL0（此时它还可能是 bionic 的）；
+//   za_tls_cur() 用 syscall(SYS_gettid)，符合要求。
+unsigned long za_os_guest_tls_area(void);   // 前置声明（定义在后面）
+
+unsigned long za_tls_mrs_hook(void)
+{
+    return za_os_guest_tls_area();
+}
+
+// ── 基址重定位 ──────────────────────────────────────────────────
+// NSO 里**一条 RELATIVE 重定位都没有**：.data 里的模块内指针要自己加基址。
+// 判据：0x1000 <= v < 映像大小 ⇒ 视为模块内指针。
+static unsigned long long za_relocate_base(unsigned char *base)
+{
+    unsigned long long moved = 0;
+    for (size_t off = 0; off + 8 <= ZA_DATA_SIZE; off += 8)
+    {
+        unsigned long long *slot = (unsigned long long *)(base + ZA_DATA_OFF + off);
+        unsigned long long v = *slot;
+        if (v >= 0x1000 && v < ZA_IMAGE_SIZE)
+        {
+            *slot = (unsigned long long)(uintptr_t)base + v;
+            moved++;
+        }
+    }
+    return moved;
+}
+
+// 导入解析 + 重定位表应用。za_relocs[] 由 tools/gen_guest_headers.py 从 .dynamic 生成：
+//   kind 0 = 写宿主解析出的符号地址（host_index 指向 za_imports[]）
+//   kind 1 = 写「基址 + 符号值」   kind 2 = 写「基址 + addend」
+int za_guest_relocate(unsigned char *base, za_guest_t *out)
+{
+    if (!base || !out) return -1;
+    memset(out, 0, sizeof *out);
+    out->base = base;
+    out->size = ZA_IMAGE_SIZE;
+
+    unsigned long long moved = za_relocate_base(base);
+    ZLOGI("基址重定位：修正 %llu 个模块内指针", moved);
+
+    int resolved = 0, stubbed = 0, missing = 0;
+    for (unsigned i = 0; i < ZA_RELOC_COUNT; i++)
+    {
+        const za_reloc_t *r = &za_relocs[i];
+        if (r->slot + 8 > ZA_IMAGE_SIZE) continue;
+        void **slot = (void **)(base + r->slot);
+        if (r->kind == 0)
+        {
+            const char *name = (r->host_index < ZA_IMPORT_COUNT)
+                             ? za_imports[r->host_index].name : NULL;
+            void *p = name ? za_resolve(name, r->host_index) : NULL;
+            if (p)
+            {
+                // 分清「真实现」和「自动桩」：桩的地址落在 za_stub_table 里
+                int is_stub = 0;
+                for (unsigned k = 0; k < ZA_STUB_COUNT; k++)
+                    if ((void *)za_stub_table[k] == p) { is_stub = 1; break; }
+                if (is_stub) stubbed++; else resolved++;
+                *slot = p;
+            }
+            else
+            {
+                missing++;
+                *slot = za_trap_alloc(name);
+            }
+        }
+        else if (r->kind == 1) *slot = (void *)(uintptr_t)((unsigned long long)(uintptr_t)base + r->value);
+        else if (r->kind == 2) *slot = (void *)(uintptr_t)((unsigned long long)(uintptr_t)base + r->value);
+        else *slot = NULL;
+    }
+    out->resolved = resolved;
+    out->stubbed = stubbed;
+    out->missing = missing;
+    ZLOGI("映像 %p（%u 字节），重定位 %u 条；宿主符号：系统解析 %d，落到自动桩 %d，无解 %d",
+          (void *)base, (unsigned)ZA_IMAGE_SIZE, (unsigned)ZA_RELOC_COUNT,
+          resolved, stubbed, missing);
+
+    // 段权限收紧：text=RX / rodata=R / data=RW
+    mprotect(base + ZA_TEXT_OFF, ZA_TEXT_SIZE, PROT_READ | PROT_EXEC);
+    mprotect(base + ZA_RODATA_OFF, ZA_DATA_OFF - ZA_RODATA_OFF, PROT_READ);
+    mprotect(base + ZA_DATA_OFF, (ZA_DATA_SIZE + ZA_BSS_SIZE + 0xFFF) & ~0xFFFul,
+             PROT_READ | PROT_WRITE);
+    ZLOGI("段权限: text=RX rodata=R data=RW");
+    return 0;
+}
+
+// 建立 main 模块的导出符号视图（SDK 查 nnMain/nninitStartup 用）
+int za_guest_mod_init(unsigned char *base, const unsigned char *exp_bin, size_t exp_len)
+{
+    if (za_mod_from_exports(&za_main_mod, base, exp_bin, exp_len) != 0) return -1;
+    za_guest_main_base = base;
+    ZLOGI("main 导出符号 %u 个（基址 %p）", za_main_mod.export_count, (void *)base);
+    return 0;
+}
+// ════════════════════════════════════════════════════════════════
+//  启动：扮演 nnrtld，按真机顺序驱动 SDK
+// ════════════════════════════════════════════════════════════════
+
+// 查 SDK 导出表里的符号
+static void *za_sdk_sym(const char *n)
+{
+    return za_mod_lookup(&za_sdk_mod, n);
+}
+
+// rtld 三回调：A 只置标志（略）、B = 各模块 DT_INIT、C = 析构（不做）
+static void za_rtld_flag_cb(void) {}
+
+static void za_rtld_module_inits_cb(void)
+{
+    ZLOGI("里程碑 M4: 回调B（各模块 DT_INIT）");
+    za_sdk_run_init(&za_sdk_mod);
+    if (ZA_DT_INIT)
+    {
+        void (*init)(void) = (void (*)(void))(za_guest_main_base + ZA_DT_INIT);
+        ZLOGI("调 main _init @%#x", (unsigned long long)ZA_DT_INIT);
+        init();
+    }
+    if (ZA_DT_INIT_ARRAY && ZA_DT_INIT_ARRAYSZ)
+    {
+        unsigned long long n = ZA_DT_INIT_ARRAYSZ / 8;
+        void (**arr)(void) = (void (**)(void))(za_guest_main_base + ZA_DT_INIT_ARRAY);
+        ZLOGI("调 %llu 个静态构造器", n);
+        for (unsigned long long i = 0; i < n; i++)
+            if (arr[i]) arr[i]();
+    }
+    // 进程参数交给 SDK（真机上由 nn::init 从参数区取，经 SetHostArgc/Argv 交给 SDK）
+    static char *argv[] = { (char *)"main", NULL };
+    void (*set_argc)(int) = (void (*)(int))za_sdk_sym("_ZN2nn2os11SetHostArgcEi");
+    void (*set_argv)(char **) = (void (*)(char **))za_sdk_sym("_ZN2nn2os11SetHostArgvEPPc");
+    if (set_argc) { ZLOGI("SetHostArgc(1)"); set_argc(1); }
+    if (set_argv) { ZLOGI("SetHostArgv"); set_argv(argv); }
+    ZLOGI("里程碑 M5: SetHostArgc/Argv 已设置（即将进 nnMain）");
+}
+
+static void za_rtld_fini_cb(void) {}
+
+// 客机启动。顺序（全部实测确认）：
+//   ① 模块链表登记（扮演 nnrtld —— SDK 靠它认识模块）
+//   ② 只读 TLS 页 +0x1f0 / +0x1f8（临界区要读 [self+0x1b0]=owner_id）
+//   ③ 参数区 → 调 SDK 的 nn::init::Start（真机上由 nnrtld 调它）
+//
+// ⚠ ①②必须在 Start 之前 —— 写成 `start(); return 0;` 会让它们永远不执行。
+int za_guest_boot(za_guest_t *g)
+{
+    if (!g || !g->base) return -1;
+    za_guest_start_sampler();
+    za_os_install_tls_descriptor();
+    za_guest_tid = syscall(SYS_gettid);
+
+    {
+        sigset_t cur;
+        pthread_sigmask(SIG_BLOCK, NULL, &cur);
+        ZLOGI("客机线程信号屏蔽: TERM=%d ABRT=%d SEGV=%d",
+              sigismember(&cur, SIGTERM), sigismember(&cur, SIGABRT), sigismember(&cur, SIGSEGV));
+    }
+    za_guest_main_base = g->base;
+
+    // ① 模块链表：SDK 的 nn::ro::LoadModule 靠这条链找模块
+    za_sdk_register_modules(g->base, (unsigned long long)ZA_IMAGE_SIZE);
+
+    // ② 只读 TLS 的两个关键指针槽
+    {
+        unsigned long tp = 0;
+        __asm__ __volatile__("mrs %0, TPIDR_EL0" : "=r"(tp));
+        unsigned long guest_tls = za_os_guest_tls_area();
+        int use_guest = 0;
+        {
+            const char *e = getenv("ZA_TLS_TP");
+            if (e && *e) use_guest = (*e != '0');
+        }
+        unsigned long val = (use_guest && guest_tls) ? guest_tls : tp;
+        za_sdk_set_ro_tls_tpidr(val);
+        ZLOGI("只读 TLS: +0x1f0 ← %p（%s）  客机区=%p bionic_tp=%p",
+              (void *)val, use_guest ? "客机 TLS 区" : "bionic tp",
+              (void *)guest_tls, (void *)tp);
+    }
+
+    // ③ 走 SDK 自己的 nn::init::Start（= 真机上 nnrtld 做的事）
+    {
+        typedef void (*za_cb)(void);
+        void (*start)(unsigned long, unsigned long, za_cb, za_cb, za_cb) =
+            (void (*)(unsigned long, unsigned long, za_cb, za_cb, za_cb))
+            za_sdk_sym("_ZN2nn4init5StartEmmPFvvES2_S2_");
+        if (start)
+        {
+            void *argdata = za_build_startup_info();
+            ZLOGI("里程碑 M3: 进入 nn::init::Start(argc=1, argdata=%p, A, B, C)", argdata);
+            za_reinstall_signal_handlers();
+            start(1, (unsigned long)(uintptr_t)argdata,
+                  za_rtld_flag_cb, za_rtld_module_inits_cb, za_rtld_fini_cb);
+            za_reinstall_signal_handlers();
+            ZLOGI("里程碑 M6: nn::init::Start 返回");
+            return 0;
+        }
+        ZLOGE("SDK 里找不到 nn::init::Start");
+        return -1;
+    }
+}
+
+// ════════════════════════════════════════════════════════════════
+//  日志 / 采样子系统（其余几个 .c 都靠这些）
+// ════════════════════════════════════════════════════════════════
+
+// 日志**同时**写 logcat 与 files/za_log.txt。
+// ⚠ 为什么必须落文件：logcat 缓冲会被系统日志刷掉（实测跑 18 秒我们的行就没了），
+//   下一轮迭代就看不到上一轮遇到过什么。
+static int za_log_fd = -1;
+static pthread_mutex_t za_log_mtx = PTHREAD_MUTEX_INITIALIZER;
+
+void za_log_print(int prio, const char *tag, const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    __android_log_vprint(prio, tag, fmt, ap);
+    va_end(ap);
+
+    char buf[1024];
+    va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    if (n <= 0) return;
+    if (n > (int)sizeof buf - 2) n = (int)sizeof buf - 2;
+    buf[n] = '\n';
+    buf[n + 1] = 0;
+    pthread_mutex_lock(&za_log_mtx);
+    if (za_log_fd < 0)
+        za_log_fd = open("/data/data/org.pokelegza.android.port/files/za_log.txt",
+                         O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+    if (za_log_fd >= 0) { ssize_t w = write(za_log_fd, buf, (size_t)n + 1); (void)w; }
+    pthread_mutex_unlock(&za_log_mtx);
+}
+
+// 崩溃日志文件（旧机制保留：现在现场主走 za_fatal_write，这里只建文件）
+static int za_crash_fd = -1;
+void za_open_crash_log(void)
+{
+    if (za_crash_fd >= 0) return;
+    za_crash_fd = open("/data/data/org.pokelegza.android.port/files/za_crash.log",
+                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (za_crash_fd < 0) ZLOGE("崩溃日志文件打不开: %s", strerror(errno));
+}
+
+// 详细日志开关：存在 files/verbose 就开（不用重装 APK，下次冷启动生效）。
+// ⚠ 默认关：客机每秒几十万次 svc，逐条打印会把客机线程全耗在 liblog 里。
+static int za_verbose_state = -1;
+int za_verbose_is_on(void)
+{
+    if (za_verbose_state < 0)
+    {
+        za_verbose_state = 0;
+        int fd = open("/data/data/org.pokelegza.android.port/files/verbose",
+                      O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) { za_verbose_state = 1; close(fd); }
+    }
+    return za_verbose_state;
+}
+// ════════════════════════════════════════════════════════════════
+//  PC 采样器（崩溃时知道客机卡在哪）
+// ════════════════════════════════════════════════════════════════
+//
+// 用 POSIX 定时器按线程投递信号，处理器把当时的 PC 记下来。
+// ⚠ 信号号必须挑 SDK **没屏蔽**的：
+//   安卓的 SIGRTMIN == 42（bionic 自己占它做 POSIX 定时器），SIGRTMAX == 64；
+//   SDK 初始化后把掩码设成 0xffffffffbaff（56 位）⇒ 只放行 bit56..63。
+//   ⇒ 用 **63**（42 被 bionic 占，别抢）。
+#define ZA_SAMPLER_SIG 63
+
+static timer_t za_pc_timer;
+static volatile int za_pc_timer_ready;
+static volatile unsigned long long za_guest_last_guest_pc;
+static pthread_t za_sampler_thread;
+
+static void za_pc_sample_handler(int sig, siginfo_t *info, void *ctx)
+{
+    (void)sig; (void)info;
+    if (!ctx) return;
+    ucontext_t *uc = (ucontext_t *)ctx;
+    unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
+    if (za_guest_base && pc >= (unsigned long)za_guest_base &&
+        pc < (unsigned long)za_guest_base + ZA_IMAGE_SIZE)
+    {
+        za_guest_last_guest_pc = pc;
+    }
+    else if (za_sdk_base && pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size)
+    {
+        za_guest_last_guest_pc = pc;
+    }
+}
+
+// 每次 svc 之后重装采样信号（SDK 会把实时信号段全屏蔽掉）
+void za_reinstall_sampler_handler(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = za_pc_sample_handler;
+    sa.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(ZA_SAMPLER_SIG, &sa, NULL);
+    sigset_t m;
+    sigemptyset(&m);
+    sigaddset(&m, ZA_SAMPLER_SIG);
+    pthread_sigmask(SIG_UNBLOCK, &m, NULL);
+}
+
+static void *za_sampler_watchdog(void *arg)
+{
+    (void)arg;
+    for (;;)
+    {
+        struct timespec ts = { 0, 50 * 1000 * 1000 };   // 50ms
+        nanosleep(&ts, NULL);
+        if (!(za_verbose_is_on())) continue;
+        unsigned long long pc = za_guest_last_guest_pc;
+        if (pc) ZLOGI("客机 PC=%p 段=%s", (void *)(uintptr_t)pc, "");
+    }
+    return NULL;
+}
+
+void za_guest_start_sampler(void)
+{
+    static int started;
+    if (started) return;
+    started = 1;
+    if (getenv("ZA_NO_SAMPLER")) { ZLOGI("PC 采样器已禁用（ZA_NO_SAMPLER）"); return; }
+    za_reinstall_sampler_handler();
+    struct sigevent sev;
+    memset(&sev, 0, sizeof sev);
+    sev.sigev_notify = SIGEV_THREAD_ID;
+    sev.sigev_signo = ZA_SAMPLER_SIG;
+    sev.sigev_notify_thread_id = (pid_t)syscall(SYS_gettid);
+    if (timer_create(CLOCK_MONOTONIC, &sev, &za_pc_timer) != 0)
+    {
+        ZLOGE("PC 采样定时器创建失败");
+        return;
+    }
+    struct itimerspec its;
+    its.it_value.tv_sec = 0;
+    its.it_value.tv_nsec = 20 * 1000 * 1000;      // 20ms
+    its.it_interval = its.it_value;
+    if (timer_settime(za_pc_timer, 0, &its, NULL) != 0)
+    {
+        ZLOGE("PC 采样定时器启动失败");
+        return;
+    }
+    za_pc_timer_ready = 1;
+    pthread_create(&za_sampler_thread, NULL, za_sampler_watchdog, NULL);
+    pthread_detach(za_sampler_thread);
+    ZLOGI("PC 采样器已启动（20ms 采样 + 50ms 看门狗，信号 %d）", ZA_SAMPLER_SIG);
+}
+
+// 自检：打印本线程信号掩码（SDK 会改掉它，看看到底屏蔽了什么）
+void za_dump_thread_mask(const char *tag)
+{
+    sigset_t cur;
+    pthread_sigmask(SIG_BLOCK, NULL, &cur);
+    char buf[320];
+    char *p = buf;
+    p = za_put_str(p, "ZaGuest: 信号掩码[");
+    p = za_put_str(p, tag ? tag : "?");
+    p = za_put_str(p, "] ");
+    for (int s = 1; s <= 64; s++)
+    {
+        if (sigismember(&cur, s) == 1)
+        {
+            p = za_put_str(p, "挡:");
+            p = za_put_hex(p, (unsigned long long)s);
+            p = za_put_str(p, " ");
+        }
+    }
+    p = za_put_str(p, "\n");
+    za_fatal_write(buf, (size_t)(p - buf));
+}
+// ════════════════════════════════════════════════════════════════
+//  SDK 模块装载（转接 za_sdk.c）
+// ════════════════════════════════════════════════════════════════
+// 装载分两步，因为两个模块互相依赖：
+//   1) map main（导出表不依赖重定位）→ 2) 装 SDK（它的未定义符号查 main 导出表）
+//   → 3) relocate main（它的未定义符号查 SDK 导出表）。顺序不能换。
+// za_sdk_load 要的两个回调：查宿主 / 查 main 的导出表
+static void *za_resolve_host_cb(const char *name, void *ctx)
+{
+    (void)ctx;
+    return za_resolve_host(name);
+}
+static void *za_lookup_main_cb(const char *name, void *ctx)
+{
+    (void)ctx;
+    return za_mod_lookup(&za_main_mod, name);
+}
+
+int za_guest_load_sdk(const unsigned char *text, size_t tsz,
+                      const unsigned char *rodata, size_t rsz,
+                      const unsigned char *data, size_t dsz, size_t bss,
+                      const unsigned char *exp, size_t explen,
+                      const unsigned char *rel, size_t rellen,
+                      const unsigned char *gate, size_t gatelen)
+{
+    return za_sdk_load(&za_sdk_mod, text, tsz, rodata, rsz, data, dsz, bss,
+                       exp, explen, rel, rellen, gate, gatelen,
+                       (void *(*)(const char *, void *))za_resolve_host_cb,
+                       za_lookup_main_cb, NULL);
+}
+
+
+// 跑 SDK 自己的 _init 与静态构造器（必须在 main 的 _init 之前）
+int za_guest_run_sdk_init(void)
+{
+    return za_sdk_run_init(&za_sdk_mod);
 }
