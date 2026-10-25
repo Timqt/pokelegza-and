@@ -678,7 +678,7 @@ static void za_write_cmif_reply(unsigned long long ro, unsigned long long reply_
         }
     }
 
-    /* 找 CMIF 请求头 "SFCI" 的位置（只用于取证；应答位置不再依赖它） */
+    /* 找 CMIF 请求头 "SFCI" 的位置 —— **应答必须写在同一个槽位** */
     unsigned int cmif_off = 0;
     for (unsigned int off = 0; off < 0x100; off += 4)
     {
@@ -686,7 +686,7 @@ static void za_write_cmif_reply(unsigned long long ro, unsigned long long reply_
         memcpy(&w, (const void *)(uintptr_t)(ro + (unsigned long long)off), 4);
         if (w == 0x49434653u) { cmif_off = off; break; }
     }
-    ZLOGI("    请求里 SFCI @TLS+%#x（仅取证）", cmif_off);
+    ZLOGI("    请求里 SFCI @TLS+%#x（应答就写在这里）", cmif_off);
 
     /* ★★★ 应答写到「服务自己的共享内存」★★★
      *
@@ -702,51 +702,81 @@ static void za_write_cmif_reply(unsigned long long ro, unsigned long long reply_
      *   应答写到 SDK基址 + 0x1100000 + 槽位偏移。
      */
     {
-        unsigned int cmif[4] = { 0x4F434653u, 0x00010000u, 0u, 0u };
-
-        /* ★★★ 应答写到 **reply buffer**（svc#33 的 a2）★★★
+        /* ★★★ 应答写回 **IPC 缓冲（请求缓冲本身）** ★★★
          *
-         * svc#33 的参数（实测 2026-10-25 真机）：
-         *   a0 = session handle      a1 = 请求缓冲（CMIF 时 = ro 页）
-         *   a2 = **应答缓冲地址**    a3 = 同样是应答缓冲
-         *   a4 = 出参指针（无出参时 = 4；有出参时 = 客机堆上的真实地址）
+         * SDK 的 SFCO 校验（SDK+0x14eb28 / +0x10be2c，真机实测）：
+         *     bl 0xc4b68(out, buffer)     ; out[0x00] = buffer（= ro 页），out[0x1f] = idx
+         *     ldr  x8, [out[0x00]]        ; base = buffer
+         *     ldrb w9, [out[0x1f]]       ; idx
+         *     add  x8, x8, x9, lsl #2
+         *     add  x8, x8, #0xf
+         *     and  x8, x8, #0xfffffffffffffff0   ; 槽位 = align16(buffer + idx*4 + 15)
+         *     ldr  w9, [x8]               ; ★ 槽位+0 必须 == "SFCO"
+         *     cmp  w9, #"SFCO" ; b.ne → Abort(0x1a80a)
+         *     ldr  w0, [x8, #0x8]         ; 槽位+8 = IPC 结果码（必须 0）
+         *     ldrh w8, [x8, #0x10]        ; 槽位+0x10 = 命令返回（u16）
          *
-         * ⇒ 内核（我们）的职责：把应答写进 a2，把返回值写进 a4。
-         *   真机上 a2 是内核为该 session 分配的共享内存；
-         *   我们给 SDK 的假句柄（0x7000+）被它原样当成地址传了下来
-         *   ⇒ 只要把这块地址映射出来就能用（客机与宿主同一地址空间）。
+         * ⇒ 请求与应答**共用同一块 IPC 缓冲、同一个槽位**：SDK 把请求头
+         *   （"SFCI"）写在槽位上，内核把应答头（"SFCO"）写回**同一位置**。
+         *   两条校验路径都印证这一点：
+         *     路径 A（SDK+0x14eb28）：查 槽位+0            ⇒ 槽位 = SFCI 位置
+         *     路径 B（SDK+0x10be2c）：查 槽位+0x10         ⇒ 槽位 = SFCI 位置 − 0x10
+         *   ⇒ 结论：**SFCO 必须写在 "SFCI" 所在的位置**。
+         *   我们以前固定写 +0x10 ⇒ 请求位置一变就错位 ⇒ Abort(0x1a80a)。
+         *
+         * 实测：请求头 = 07 00 00 00 08 00 00 00 20 00 时 SFCI 在 ro+0x10；
+         *       另一个请求（06 00 00 00 0e 80 00 00 01 00）SFCI 在 ro+0x30。
          */
-        unsigned long long rb = reply_buf ? reply_buf : ro;
-        if (rb < 0x1000) rb = ro;          /* 明显不是有效地址时退回 ro */
-        za_ensure_reply_buf(rb);
+        unsigned int slot = cmif_off;   /* ★ SFCO 必须与 SFCI 同槽位 */
+        if (slot == 0 || slot > 0x100) slot = za_cmif_slot_offset((const unsigned char *)(uintptr_t)ro);
+        if (slot < 0x10 || slot > 0x800) slot = 0x10;   /* 解码异常时退回旧位置 */
 
-        /* SDK 算 idx 用的是 reply_buf[0..0xa] ⇒ 应答头必须写在这里。
-         * 清零 ⇒ 按 SDK 的解码 idx = 2 ⇒ 槽位 = align16(rb + 8 + 15) = rb + 0x10。 */
-        memset((void *)(uintptr_t)rb, 0, 0x10);
-        memcpy((void *)(uintptr_t)(rb + 0x10), cmif, sizeof cmif);
-        memset((void *)(uintptr_t)(rb + 0x20), 0, 0x10);
+        /* ★★★ a4：**绝对不能写** ★★★
+         *
+         * 2026-10-25 真机实测（反汇编 SDK+0x10be2c，nn::hipc 的派发函数）：
+         *     mov  x19, x4            ; a4 = 一个 Object** 槽（不是出参缓冲）
+         *     ldr  x0, [x19]          ; x0 = *a4 ← SDK 刚建好的 IPC 对象指针
+         *     cbz  w23, <无出参分支> ; w23 = SFCO 槽 +0x20 的类型码
+         *     str  xzr, [x19]        ; ← SDK **自己**把 *a4 清零
+         *
+         * ⇒ 内核（我们）**从不**往 a4 写任何东西；a4 是 SDK 调用方的局部变量。
+         *   我们以前往这里塞占位 {0x0000000100000001, 0}，正好把 SDK 刚建好的
+         *   IPC 对象指针顶掉 ⇒ SDK 拿 0x100000001 当对象解引用：
+         *     ldr x8,[0x100000001] → 读到 main 映像头部（+1 处 8 字节）
+         *                          → 0x7c02fc8048000000
+         *     ldr x8,[x8,#8]       → 野指针 ⇒ SIGSEGV（pc=sdk+0x3c46a8）
+         *
+         * 出参真正该待的地方是**应答共享内存**：SFCO 槽 +0x18 = 出参句柄，
+         * 槽 +0x20 = 类型码。现在两者都是 0 ⇒ SDK 走「无出参」分支，
+         * 它会自己把 *a4 清零并跳过虚函数调用 —— 正是我们要的行为。
+         */
+        ZLOGI("    a4=%#llx（不写：这是 SDK 的 Object** 槽，内核不碰它）", out_ptr);
 
-        /* ro 上也放一份（有的路径仍从 ro 读） */
-        memcpy((void *)(uintptr_t)(ro + 0x10), cmif, sizeof cmif);
+        /* 应答内容（写在 SFCI 的位置）：
+         *   +0x00 "SFCO"    +0x04 保留     +0x08 IPC 结果码 / 出参句柄（0）
+         *   +0x0c 保留       +0x10 命令返回(u16) / 类型码（0）
+         * ★ 路径 A（SDK+0x14eb28）读 槽位+0 / +0x8 / +0x10；
+         *   路径 B（SDK+0x10be2c）读 槽位+0x10 / +0x18 / +0x20，
+         *   而路径 B 的槽位 = SFCI 位置 − 0x10 ⇒ 两条路径要求的字段完全一致。 */
+        unsigned char hdr[0x20];
+        memset(hdr, 0, sizeof hdr);
+        memcpy(hdr + 0x00, "SFCO", 4);
 
-        /* ★ 出参：写进 SDK 给的出参指针 a4（不是我们猜的固定地址！） */
-        if (out_ptr > 0x1000)
+        /* ★ 写回 IPC 缓冲的槽位（SDK 校验的就是这里）*/
+        memcpy((void *)(uintptr_t)((unsigned long long)ro + slot), hdr, sizeof hdr);
+
+        /* 共享内存（svc#33 的 a2 = 假句柄当地址用）里也放一份：
+         *   - 同一相对偏移（rb 的头被清零 ⇒ 那边的 idx 恒为 2 ⇒ 落在 rb+0x10）
+         *   - 两个位置都写，成本为零，纯保险 */
         {
-            unsigned long long *outp = (unsigned long long *)(uintptr_t)out_ptr;
-            outp[0] = 0x0000000100000001ull;
-            outp[1] = 0x0000000000000000ull;
-            ZLOGI("    出参写入 a4=%#llx -> %016llx %016llx", out_ptr, outp[0], outp[1]);
+            unsigned long long rb = reply_buf ? reply_buf : ro;
+            if (rb < 0x1000) rb = ro;          /* 明显不是有效地址时退回 ro */
+            za_ensure_reply_buf(rb);
+            memcpy((void *)(uintptr_t)(rb + slot), hdr, sizeof hdr);
+            memcpy((void *)(uintptr_t)(rb + 0x10), hdr, sizeof hdr);
+            ZLOGI("    应答: ro=%#llx 槽位=%#x（\"SFCO\" @ro+槽位），共享内存 rb=%#llx",
+                  ro, slot, rb);
         }
-        else
-        {
-            /* 没有出参指针时，仍写一份到 SDK TLS 约定位置（base+0xF01000） */
-            unsigned long long *outp =
-                (unsigned long long *)(uintptr_t)((unsigned long long)za_sdk_base + 0xf01000ul);
-            outp[0] = 0x0000000100000001ull;
-            outp[1] = 0x0000000000000000ull;
-        }
-
-        ZLOGI("    应答: reply_buf=%#llx <- \"SFCO\" @+0x10（out_ptr=%#llx）", rb, out_ptr);
     }
 }
 
