@@ -372,7 +372,15 @@ static unsigned int za_current_owner_id(void)
 //    静态预知 ⇒ 把同样的 16 字节 CmifOutHeader 模式填满前 0xf0 字节，
 //    无论客机挑哪个槽都能命中。0x1f8 是 SDK 的 `self` 槽，不能碰。
 
-#define ZA_FAKE_SVC_BASE 0x7000u   /* 我们伪造的服务句柄基址 */
+// 我们伪造的服务「句柄」。
+// ⚠ 句柄是 **u32**（SDK 读 `ldp w8,w0,[x20,#0xc]`）。
+// ★★ 但 SDK 会把它**当成地址**用！实测：句柄 0x7000 时 SDK 直接去读 0x7000
+//   ⇒ SIGSEGV(addr=0x7000)。所以它必须是一块**我们自己映射的**可写内存。
+// ⚠ 地址必须 ≥ 0x10000：Linux 的 vm.mmap_min_addr 默认 65536，
+//   低于它的地址 mmap 会被内核拒绝（实测 0x7000 映射失败）。
+// ★ 真机上这个地址是内核按 session 分配的 IPC 共享内存；
+//   这里用 SDK 扩展区之外的一块独立映射，每服务 0x400 字节。
+#define ZA_FAKE_SVC_BASE 0x10000u   /* 我们伪造的服务句柄基址（应答缓冲） */
 
 typedef struct
 {
@@ -423,7 +431,9 @@ static unsigned int za_fake_svc_handle(const char *name)
         return ZA_FAKE_SVC_BASE + 0x100u;
     int idx = g_fake_count++;
     snprintf(g_fake_names[idx], 9, "%s", name);
-    g_fake_handles[idx] = ZA_FAKE_SVC_BASE + (unsigned int)idx;
+    /* ★ 每个服务 0x400 字节：SDK 读应答的槽位最大到 +0x3f0，
+     *   服务之间不能重叠（否则应答会互相踩）。 */
+    g_fake_handles[idx] = ZA_FAKE_SVC_BASE + (unsigned int)idx * 0x400u;
     g_fake_tipc[idx] = za_fake_svc_tipc_by_name(name);
     return g_fake_handles[idx];
 }
@@ -437,7 +447,7 @@ static unsigned int za_fake_svc_handle(const char *name)
 static int za_fake_svc_is_tipc(unsigned int h)
 {
     if (h < ZA_FAKE_SVC_BASE) return -1;
-    unsigned int i = h - ZA_FAKE_SVC_BASE;
+    unsigned int i = (h - ZA_FAKE_SVC_BASE) / 0x400u;   /* 每服务 0x400 步进 */
     if (i == 0x100u) return 0;
     if (i >= (unsigned int)g_fake_count) return -1;
     return g_fake_tipc[i];
@@ -570,7 +580,30 @@ static unsigned int za_cmif_slot_offset(const unsigned char *b)
     return (idx * 4u + 0xfu) & ~0xfu;      /* align_down_16(idx*4 + 15) */
 }
 
-static void za_write_cmif_reply(unsigned long long ro, unsigned int hdr0, unsigned int hdr1)
+/* 把「假句柄」那块地址映射出来。
+ * ★ SDK 把我们给的假句柄（0x7000+）当作**应答缓冲地址**传回 svc#33 的 a2，
+ *   内核（我们）必须能把应答写进那里。
+ * ★ 客机与宿主是同一个进程、同一个地址空间 ⇒ 只要 mmap 出来就能写。
+ */
+static void za_ensure_reply_buf(unsigned long long addr)
+{
+    static unsigned long long lo = 1, hi = 0;
+    if (addr < 0x1000) return;
+    if (addr >= lo && addr < hi) return;
+    size_t sz = 0x20000;
+    void *p = mmap((void *)(uintptr_t)addr, sz, PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (p == MAP_FAILED)
+    {
+        ZLOGE("假句柄应答缓冲 %#llx 映射失败", addr);
+        return;
+    }
+    lo = addr; hi = addr + sz;
+    ZLOGI("假句柄应答缓冲已映射：%#llx..%#llx", lo, hi);
+}
+
+static void za_write_cmif_reply(unsigned long long ro, unsigned long long reply_buf,
+                                 unsigned long long out_ptr, unsigned int hdr0, unsigned int hdr1)
 {
     (void)hdr0; (void)hdr1;
     /* 取证：把请求的前 0x40 字节打出来 */
@@ -655,70 +688,66 @@ static void za_write_cmif_reply(unsigned long long ro, unsigned int hdr0, unsign
     }
     ZLOGI("    请求里 SFCI @TLS+%#x（仅取证）", cmif_off);
 
-    /* ★★★ 铺满整个 ro 页（每 16 字节一份合法应答），再恢复 SDK 的 TLS 上下文 ★★★
+    /* ★★★ 应答写到「服务自己的共享内存」★★★
      *
-     * SDK 读应答的槽位 = align_down_16(ro + idx*4 + 15)，idx 由 0xc4b68+0x9a8f0
-     * 从「读应答那一刻」的 buffer 解出 —— 我们无法确知其最终取值
-     * （实测：清零请求头算出的 idx 与 SDK 实际读的对不上）。
-     * ⇒ 每个候选槽位都放一份合法应答，idx 是几都能命中。
+     * svc#33 的原始参数（实测 2026-10-25 真机）：
+     *   TIPC(sm:) : a0=0x1 a1=0x200b9c59c(请求缓冲) a2=0x200b3b2b8(**应答缓冲**) a3=0x200bebdb0
+     *   CMIF(lm)  : a0=0x7000 a1=0x200f00000(ro,请求缓冲) a2=0x7000(**应答缓冲**) a3=0x7000
      *
-     * 写完要把 ro[0x00..0x200] 恢复回去：那里有 SDK 的 TLS 上下文
-     *（+0x1b0 owner_id、+0x1f0 TPIDR_EL0、+0x1f8 self 指针、+0x70/0x78/0x80 指针槽）。
-     * 出参缓冲在 ro+0x1000（= base+0xF01000），不在铺满范围内 ✔
+     * ★★ a2 在真机上就是这个服务的**共享内存地址**（内核按 session 分配），
+     *   SDK 把它当「应答缓冲区」用。我们返回的假句柄被 SDK 直接当成地址传下来了
+     *   ⇒ 只要让**句柄本身是一个真实可写的地址**，SDK 就会从那里读我们的应答！
+     *
+     * ⇒ 做法：句柄 = SDK基址 + 0x1100000（扩展区里一块专用页），
+     *   应答写到 SDK基址 + 0x1100000 + 槽位偏移。
      */
     {
-        /* SDK 真正在用的 TLS 槽（za_sdk.c 里的槽位表），铺满后要逐个还原。
-         * ⚠ 之前这里整段恢复 ro[0x00..0x200]，把 0x10..0x1f0 里的 SFCO 又覆盖掉了
-         *   ⇒ 铺满等于白铺（请求 A 的槽位正好是 ro+0x30）。
-         */
-        static const struct { unsigned int off, len; } keep[] = {
-            { 0x00, 8 }, { 0x10, 4 }, { 0x20, 8 }, { 0x70, 8 }, { 0x78, 8 },
-            { 0x80, 8 }, { 0x100, 2 }, { 0x102, 2 }, { 0x104, 1 },
-            { 0x1b0, 4 }, { 0x1e0, 8 }, { 0x1f0, 8 }, { 0x1f8, 8 },
-        };
-        unsigned char save[0x200];
-        memcpy(save, (const void *)(uintptr_t)ro, sizeof save);
         unsigned int cmif[4] = { 0x4F434653u, 0x00010000u, 0u, 0u };
-        for (unsigned int off = 0; off < 0x1000; off += 0x10)
-            memcpy((void *)(uintptr_t)(ro + off), cmif, sizeof cmif);
-        for (unsigned i = 0; i < sizeof keep / sizeof keep[0]; i++)
-            memcpy((void *)(uintptr_t)(ro + keep[i].off), save + keep[i].off, keep[i].len);
-    }
-    /* 取证：铺满自检（确认还原步骤没有把 SFCO 又覆盖掉） */
-    {
-        unsigned int a = *(const unsigned int *)(uintptr_t)(ro + 0x00);
-        unsigned int b = *(const unsigned int *)(uintptr_t)(ro + 0x10);
-        unsigned int c = *(const unsigned int *)(uintptr_t)(ro + 0x30);
-        unsigned int e = *(const unsigned int *)(uintptr_t)(ro + 0x50);
-        unsigned int f = *(const unsigned int *)(uintptr_t)(ro + 0x90);
-        ZLOGI("    铺满自检: ro+0x0=%08x +0x10=%08x +0x30=%08x +0x50=%08x +0x90=%08x",
-              a, b, c, e, f);
-    }
-    /* 记录一下按算法算出来的那个槽位（取证用） */
-    unsigned char hb[12];
-    for (int i = 0; i < 12; i++)
-        hb[i] = *(const unsigned char *)(uintptr_t)(ro + (unsigned long long)i);
-    unsigned int slot = za_cmif_slot_offset(hb);
 
-    /* ★★ 出参回写（pctl 建不起来的直接原因）★★
-     *
-     * Horizon CMIF 的返回值不放在应答头里，而是放在一个**独立的出参缓冲**，
-     * 地址由客户端在请求里给出（64 位绝对地址 + 长度）。
-     * 实测：请求 +0x20 处是 `0x200f01000`
-     *     = SDK基址 + 0xF01000 = 只读 TLS 页(TPIDRRO_EL0) + 0x1000。
-     * ⇒ 服务端必须把返回值写到那里。我们以前只改请求头、从不写这里
-     *   ⇒ SDK 拿到的返回值恒为 0 ⇒ nn::pctl 的 IPC 客户端对象建不出来
-     *   ⇒ 全局 0xc024b8 保持 NULL ⇒ SDK+0x3fcbf4 解引用 NULL 崩溃。
-     */
-    if (za_sdk_base)
-    {
-        unsigned long long *outp = (unsigned long long *)(za_sdk_base + 0xf01000ul);
-        outp[0] = 0x0000000100000001ull;
-        outp[1] = 0x0000000000000000ull;
-        ZLOGI("    出参写入 base+0xf01000 = %016llx %016llx", outp[0], outp[1]);
-    }
+        /* ★★★ 应答写到 **reply buffer**（svc#33 的 a2）★★★
+         *
+         * svc#33 的参数（实测 2026-10-25 真机）：
+         *   a0 = session handle      a1 = 请求缓冲（CMIF 时 = ro 页）
+         *   a2 = **应答缓冲地址**    a3 = 同样是应答缓冲
+         *   a4 = 出参指针（无出参时 = 4；有出参时 = 客机堆上的真实地址）
+         *
+         * ⇒ 内核（我们）的职责：把应答写进 a2，把返回值写进 a4。
+         *   真机上 a2 是内核为该 session 分配的共享内存；
+         *   我们给 SDK 的假句柄（0x7000+）被它原样当成地址传了下来
+         *   ⇒ 只要把这块地址映射出来就能用（客机与宿主同一地址空间）。
+         */
+        unsigned long long rb = reply_buf ? reply_buf : ro;
+        if (rb < 0x1000) rb = ro;          /* 明显不是有效地址时退回 ro */
+        za_ensure_reply_buf(rb);
 
-    ZLOGI("    应答: 槽位 @TLS+%#x <- \"SFCO\"（idx 由 SDK 解码算法算出）", slot);
+        /* SDK 算 idx 用的是 reply_buf[0..0xa] ⇒ 应答头必须写在这里。
+         * 清零 ⇒ 按 SDK 的解码 idx = 2 ⇒ 槽位 = align16(rb + 8 + 15) = rb + 0x10。 */
+        memset((void *)(uintptr_t)rb, 0, 0x10);
+        memcpy((void *)(uintptr_t)(rb + 0x10), cmif, sizeof cmif);
+        memset((void *)(uintptr_t)(rb + 0x20), 0, 0x10);
+
+        /* ro 上也放一份（有的路径仍从 ro 读） */
+        memcpy((void *)(uintptr_t)(ro + 0x10), cmif, sizeof cmif);
+
+        /* ★ 出参：写进 SDK 给的出参指针 a4（不是我们猜的固定地址！） */
+        if (out_ptr > 0x1000)
+        {
+            unsigned long long *outp = (unsigned long long *)(uintptr_t)out_ptr;
+            outp[0] = 0x0000000100000001ull;
+            outp[1] = 0x0000000000000000ull;
+            ZLOGI("    出参写入 a4=%#llx -> %016llx %016llx", out_ptr, outp[0], outp[1]);
+        }
+        else
+        {
+            /* 没有出参指针时，仍写一份到 SDK TLS 约定位置（base+0xF01000） */
+            unsigned long long *outp =
+                (unsigned long long *)(uintptr_t)((unsigned long long)za_sdk_base + 0xf01000ul);
+            outp[0] = 0x0000000100000001ull;
+            outp[1] = 0x0000000000000000ull;
+        }
+
+        ZLOGI("    应答: reply_buf=%#llx <- \"SFCO\" @+0x10（out_ptr=%#llx）", rb, out_ptr);
+    }
 }
 
 // 安全读一个客机地址（客机地址空间我们自己映射的，直接读也可能踩未映射页，
@@ -1198,6 +1227,12 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     // ── IPC（svc#33）：生成真正的应答 ──
     case 33: // SendSyncRequest(session=x0)
     {
+        // ★★ 取证：svc#33 的全部原始参数。真机上普通服务（CMIF）的请求/应答
+        //   缓冲区**不是** TPIDRRO_EL0，而是「按 session 分配的 IPC 共享内存」，
+        //   它的地址应当出现在 svc 参数里 —— 打印出来才能定位。
+        ZLOGI("  svc#33 RAW a0=%#lx a1=%#lx a2=%#lx a3=%#lx a4=%#lx a5=%#lx a6=%#lx a7=%#lx",
+              (unsigned long)a0, (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
+              (unsigned long)a4, (unsigned long)a5, (unsigned long)a6, (unsigned long)a7);
         // ★ 见上面「IPC 应答生成」注释块：这一页（za_ro_tls_page）就是内核
         //   的应答缓冲区，请求也在这里。
         unsigned long long ro = za_ro_tls_page;   // 由 za_sdk.c 在装载时填
@@ -1240,9 +1275,16 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 {
                     unsigned int h = za_fake_svc_handle(nm);
                     memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);      // result
-                    memcpy((void *)(uintptr_t)(ro + 0xc), &h, 4);      // 服务句柄
+                    memcpy((void *)(uintptr_t)(ro + 0xc), &h, 4);      // 服务句柄 (u32!)
                     memcpy((void *)(uintptr_t)(ro + 0x10), &zero, 4);   // 返回码
-                    ZLOGI("  IPC TIPC GetServiceHandle(\"%s\") -> handle %#x", nm, h);
+                    /* ★★ 实验：在应答里**额外**带一个 u64 的「共享内存地址」。
+                     *   真机上 CMIF 服务的应答缓冲区地址不是句柄（句柄是 u32），
+                     *   而是服务管理器通过 IPC 内存偏移表下发的另一个 u64。
+                     *   这里试把它放在 ro+0x14，看 SDK 后续 svc#33 的 a2 会不会变。 */
+                    unsigned long long shared = (unsigned long long)za_sdk_base + 0x1100000ull;
+                    memcpy((void *)(uintptr_t)(ro + 0x14), &shared, 8);
+                    ZLOGI("  IPC TIPC GetServiceHandle(\"%s\") -> handle %#x (+u64 shared=%#llx @ro+0x14)",
+                          nm, h, shared);
                 }
             }
             else
@@ -1267,7 +1309,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             }
             else
             {
-                za_write_cmif_reply(ro, hdr0, hdr1);
+                za_write_cmif_reply(ro, (unsigned long long)a2, (unsigned long long)a4, hdr0, hdr1);
                 ZLOGI("  IPC CMIF session=%#x hdr0=%#x hdr1=%#x -> reply written",
                       sess, hdr0, hdr1);
             }
