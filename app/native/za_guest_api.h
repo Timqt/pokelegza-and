@@ -75,6 +75,7 @@ unsigned long za_svc_count_take(long nr);
 unsigned long za_svc_count_peek(long nr);
 // svc #41 GetInfo 的按 id 计数（哪个 id 被狂问 = 死循环入口）
 void za_svc41_count(long id);
+unsigned long long za_host_tick_hook(void);   // 客机 CNTPCT_EL0 的宿主替身
 unsigned long za_svc41_peek(long id);
 // #41 调用点轨迹（最近 32 次的 调用点PC + id）
 void za_svc41_trace(unsigned long pc, long id);

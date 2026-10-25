@@ -27,7 +27,6 @@
 
 // SDK 的「os 上下文」对象（za_sdk_load 里建，za_guest_boot 用）。
 void *za_sdk_ctx = NULL;
-static int za_vamm_bump_init_pending = 0;
 #include "za_mem.h"
 #include "za_guest_api.h"
 #include "za_os.h"
@@ -330,38 +329,7 @@ int za_sdk_load(za_mod_t *sdk,
             stub[0] = 0x52800000u;      /* mov w0, #0 */
             stub[1] = 0xd65f03c0u;      /* ret */
 
-            /* ★ VammManager::AllocateAddressRegion 宿主桩（stub+0x10 起）。
-             *   SDK 的 SystemResource 分配走 VammManager，其区域空闲链表由
-             *   SDK 侧初始化，实测只种了 ≈1GB 的 alias 区 ⇒ 12GB 的堆申请
-             *   永远失败 ⇒ CentralHeap::Init 返回错误 ⇒ nn::diag abort。
-             *   真机上这一块由 OS 预先建好；我们就是 OS —— 桩直接在声明区
-             *   （0x900000000 起，实际预留之外）步进分配，*out = 基址、返回 0，
-             *   调用方随后 svc#44 现场映射（已带 MAP_NORESERVE）。
-             *   步进指针槽放在我们自己的 ro2 页空闲区 base+0xF01E00
-             *   （SDK bss 的 0xb9b500 实测被 SDK 数据初始化占用，不能用）。 */
-            {
-                /* this=x0, out=x1, size=x2 → *out=基址, 返回 0 */
-                unsigned long long bump_slot = 0x200F01E00ull;   /* = base + 0xF01E00（我们自己的 ro2 页空闲区） */
-                unsigned int *s = stub + 4;
-                s[0] = 0xd2800000u | (unsigned int)((bump_slot & 0xffffu) << 5) | 3;  /* movz x3,#lo16 */
-                s[1] = 0xf2a00000u | (unsigned int)(((bump_slot >> 16) & 0xffffu) << 5) | 3; /* movk x3,#m16,lsl16 */
-                s[2] = 0xf2c00000u | (unsigned int)(((bump_slot >> 32) & 0xffffu) << 5) | 3; /* movk x3,#m32,lsl32 */
-                s[3] = 0xf9400064u;         /* ldr  x4, [x3]        ; bump */
-                s[4] = 0x8b020085u;         /* add  x5, x4, x2      ; end = bump+size */
-                s[5] = 0xf9000065u;         /* str  x5, [x3]        ; bump = end */
-                s[6] = 0xf9000024u;         /* str  x4, [x1]        ; *out = 基址 */
-                s[7] = 0x52800000u;         /* mov  w0, #0 */
-                s[8] = 0xd65f03c0u;         /* ret */
-
-                mprotect(stub, 0x1000, PROT_READ | PROT_EXEC);
-
-                /* 劫持 PLT：所有调用方都经 0x636eb0 → GOT 0xb7af08 */
-                *(unsigned long long *)(base + 0xb7af08) = (unsigned long long)(uintptr_t)s;
-                ZLOGI("VammAllocate 桩：GOT 0xb7af08 → %p", (void *)s);
-                /* 步进指针初值在下面第 6 步 memset **之后**写（槽在 ro2 页里，
-                 *   在 memset 前写会被抹掉 —— 实测桩返回 base=0 ⇒ abort）。 */
-                za_vamm_bump_init_pending = 1;
-            }
+            mprotect(stub, 0x1000, PROT_READ | PROT_EXEC);
 
             /* 数据页：vtable + 对象（对象第 0 格放 vtable 指针） */
             unsigned long long *data = (unsigned long long *)mmap(NULL, 0x1000,
@@ -412,6 +380,52 @@ int za_sdk_load(za_mod_t *sdk,
     //        这样能看到真正的断言原因。
     *(unsigned int *)(base + 0x9c630) = 0xd65f03c0u;   /* ret */
 
+    // 5.8) CNTPCT_EL0 读取替换：这台设备的内核在 EL0 挡了 CNTPCT
+    //      （实测 SIGILL：pc=sdk+0x13d9a0 = GetSystemTick 的 `mrs x0,CNTPCT_EL0`）。
+    //      SDK 有 40 处 `mrs Xt,CNTPCT_EL0`，每处换成 `b <桩>`；桩从槽
+    //      （base+0xc90600，门区尾部 padding，实测全零）调宿主 hook 取 tick
+    //      写回 Xt，再跳回原址下一条。桩体放门区 padding（0xc80200 起），
+    //      步骤 7 的 clear_cache/R|X 覆盖整个门区。
+    {
+        *(unsigned long long *)(base + 0xc90600) = (unsigned long long)(uintptr_t)za_host_tick_hook;
+        unsigned long long bump = 0xc90000ull;
+        unsigned patched = 0;
+        for (unsigned off = 0; off + 4 <= (unsigned)ZA_SDK_RODATA_OFF; off += 4)
+        {
+            unsigned int w = *(const unsigned int *)(base + off);
+            if ((w & 0xFFFFFCE0u) != 0xD53BE020u) continue;   /* mrs Xt,CNTPCT_EL0 */
+            unsigned rt = w & 0x1Fu;
+            unsigned long long stub_off = bump;
+            bump += 0x14;                                      /* 5 条指令 */
+            unsigned int *s = (unsigned int *)(base + stub_off);
+            {   /* adrp x16, <0xc90600 页>
+                 * imm21 = 页差；低 2 位放 immlo（bits30-29），高 19 位放 immhi（bits23-5）。
+                 * ⚠ 拆反了会 ×4 错位（实测桩读到自己 ⇒ 跳垃圾地址）。 */
+                long long pg = ((long long)(0xc90600ull & ~0xFFFull) -
+                                (long long)(stub_off & ~0xFFFull)) >> 12;
+                unsigned immlo = (unsigned)(pg & 3);
+                unsigned immhi = (unsigned)((pg >> 2) & 0x7FFFF);
+                s[0] = 0x90000000u | (immlo << 29) | (immhi << 5) | 16u;
+            }
+            /* ldr x16,[x16,#页内偏移] —— ⚠ imm12 按 8 缩放；漏了偏移会读到
+             *   桩自己的指令（实测 x16 = 头两条指令字 ⇒ blr 跳垃圾）。 */
+            s[1] = 0xF9400000u | (((0xc90600ull & 0xFFFull) >> 3) << 10) | (16u << 5) | 16u;
+            s[2] = 0xD63F0200u;                                /* blr  x16         */
+            s[3] = 0xAA0003E0u | rt;                           /* mov  Xt, x0      */
+            {   /* b 回原址+4 */
+                long long delta = (long long)(off + 4) - (long long)(stub_off + 0x10);
+                s[4] = 0x14000000u | (unsigned)((delta >> 2) & 0x3FFFFFFu);
+            }
+            {   /* 原址 mrs → b <桩> */
+                long long delta = (long long)stub_off - (long long)off;
+                *(unsigned int *)(base + off) =
+                    0x14000000u | (unsigned)((delta >> 2) & 0x3FFFFFFu);
+            }
+            patched++;
+        }
+        ZLOGI("CNTPCT 替换：%u 处 → 门区桩（hook @base+0xc90600）", patched);
+    }
+
     // 6) 只读 TLS：客机 SDK 有 123 处 `mrs Xt,TPIDRRO_EL0`，
     //    而安卓/bionic **从不设置 TPIDRRO_EL0**（一直是 0）⇒ 客机读到空指针直接崩。
     //    做法：把 `mrs` 1:1 换成 `adrp Xt,<我们自备的只读 TLS 页>`（相对偏移全部不变），
@@ -433,31 +447,8 @@ int za_sdk_load(za_mod_t *sdk,
         unsigned char *ro2 = base + ZA_TLSRO2_OFF;
         memset(ro, 0, ZA_TLSRO_SIZE);
         memset(ro2, 0, ZA_TLSRO2_SIZE);
-        /* ★ VammAllocate 桩的步进指针初值（ro2 页刚被清零，现在写才留得住）：
-         *   声明区高位，实际预留 16GB 之外，与四块区域无重叠。 */
-        if (za_vamm_bump_init_pending)
-        {
-            *(unsigned long long *)(base + 0xF01E00) = 0x900000000ull;
-            za_vamm_bump_init_pending = 0;
-            ZLOGI("VammAllocate 步进指针初值 = 0x900000000（base+0xF01E00）");
-        }
         unsigned long long p2 = (unsigned long long)(uintptr_t)ro2;
         // 指针型槽都指向第二页（客机的「线程自己」结构）
-        //
-        // ⚠⚠ **+0x1f0 不在其中**（2026-10-25 实测定位）：SDK 的 init 结尾有
-        //       mrs x8, TPIDRRO_EL0 ; ldr x8,[x8,#0x1f0] ; msr TPIDR_EL0,x8
-        //   ⇒ 那一格是「**要恢复回 TPIDR_EL0 的值**」，在真机上就是**本线程真实的 TPIDR_EL0**。
-        //   填成 ro2 ⇒ SDK 把 TPIDR_EL0 指到 SDK 自己的结构 ⇒
-        //   客机的 TLS 基准（[tp+0x98] 等）全落在 SDK 的结构里 ⇒
-        //   SDK 往某个指针字段里写了个 32 位值 ⇒ 野指针 0x6d00000000
-        //   （实测崩溃：pc=0x6d00000000，x30 同值；客机栈上同一处也看到这个值）。
-        //   正确值由宿主在**客机线程里**、调 SDK init 之前写入：za_sdk_set_ro_tls_tpidr()。
-        // ★★ 2026-10-25：+0x1f8 必须指回 **ro2**（不能留 0，也不能指客机 TLS 区）。
-        //   SDK 的临界区（sdk+0x145fec）这样用它：
-        //       mrs x8,TPIDRRO_EL0 ; ldr x8,[x8,#0x1f8] ; ldr w8,[x8,#0x1b0]
-        //   `+0x1b0` 是 **owner_id**（本文件已写成 1u）。若 +0x1f8 是 0 或全 0 的区，
-        //   owner_id 就是 0 ⇒ 临界区判「锁不属于当前线程」⇒ 走进错误分支 ⇒ blr 到野地址。
-        //   （本轮实测：把 +0x1f8 留给客机 TLS 区、或干脆不写 ⇒ dump 里 +0x1f8=0 ⇒ 必崩。）
         const int ptr_slots[] = { 0x00, 0x20, 0x70, 0x78, 0x80, 0x1e0, 0x1f8 };
         for (unsigned i = 0; i < sizeof ptr_slots / sizeof ptr_slots[0]; i++)
             *(unsigned long long *)(ro + ptr_slots[i]) = p2;
@@ -533,6 +524,9 @@ int za_sdk_load(za_mod_t *sdk,
     __builtin___clear_cache((char *)base, (char *)base + ZA_SDK_RODATA_OFF);
     __builtin___clear_cache((char *)base + ZA_SVC_GATE_BASE,
                             (char *)base + ZA_SVC_GATE_BASE + ZA_SVC_GATE_SIZE);
+    // ★ CNTPCT 替换桩 + hook 槽（0xc90000..0xc90700，见 5.8）：区域在门区之外，
+    //   初始 mmap 是 RW ⇒ 不收紧就是 NX。mprotect 成 R+X。
+    mprotect(base + 0xc90000, 0x1000, PROT_READ | PROT_EXEC);
     mprotect(base, ZA_SDK_RODATA_OFF, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_SVC_GATE_BASE, ZA_SVC_GATE_SIZE, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_SDK_RODATA_OFF, ZA_SDK_DATA_OFF - ZA_SDK_RODATA_OFF, PROT_READ);
@@ -557,13 +551,11 @@ int za_sdk_load(za_mod_t *sdk,
         // 拿不到自洽的布局 ⇒ SDK 的 AddressSpaceAllocator 在空区间上空转（栈溢出）。
         za_mem_init();
 
-        typedef void *(*za_alloc_fn)(unsigned long, unsigned long);
-        typedef void (*za_free_fn)(void *, unsigned long);
-        void (*set_alloc)(za_alloc_fn, za_free_fn) =
-            (void (*)(za_alloc_fn, za_free_fn))(base + 0x140d20);
-        set_alloc(za_os_alloc_thread_local, za_os_free_thread_local);
-        ZLOGI("OS 注入：线程局部内存分配器已注册（alloc=%p free=%p）",
-              (void *)za_os_alloc_thread_local, (void *)za_os_free_thread_local);
+        // ★ 2026-10-25：**不再在这里注册**！SetMemoryAllocatorForThreadLocal
+        //   （SDK+0x140d20）对 [0xb9b008]!=0 直接 AbortImpl —— main 的
+        //   nninitStartup（main+0x19e8910）在 init::Start 之后会自己注册，
+        //   我们抢先注册 ⇒ 它再注册 ⇒ 「已注册」断言 ⇒ abort（实测）。
+        //   真机流程就是 main 注册的，OS 侧不碰。
 
         void *arg0 = za_build_startup_info();
         *(void **)(base + 0xb738e8) = arg0;

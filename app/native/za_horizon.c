@@ -221,6 +221,14 @@ static unsigned long long za_cntpct(void)
     return (ns / 1000000000ull) * ZA_TICK_HZ + (ns % 1000000000ull) * ZA_TICK_HZ / 1000000000ull;
 }
 
+// ★ 客机 CNTPCT_EL0 读取的宿主替身：这台设备的内核在 EL0 挡了 CNTPCT
+//   （实测 SIGILL，pc=sdk+0x13d9a0 GetSystemTick），za_sdk.c 把 40 处
+//   `mrs Xt,CNTPCT_EL0` 换成门区桩经这里取 tick。与 svc#30 同源。
+unsigned long long za_host_tick_hook(void)
+{
+    return za_cntpct();
+}
+
 // ───────────────────────── 服务名 ─────────────────────────
 static const char *za_svc_name(long nr)
 {
@@ -1678,6 +1686,9 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         //   AddressSpaceAllocator 在空区间上空转 100 万次 ⇒ 客机线程栈溢出 256MB。
         //   语义（id 枚举）见 za_mem.c 文件头；值必须自洽。
         unsigned long long v = za_mem_getinfo((long)a1);
+        ZLOGI("svc#41 GetInfo id=%#lx -> %#llx (pc=sdk+%#lx)",
+              (unsigned long)a1, v,
+              (unsigned long)(za_horizon_regs[ZA_REG_PC] - (unsigned long)za_sdk_base));
         za_svc41_count((long)a1);
         za_svc41_trace(za_horizon_regs[ZA_REG_PC], (long)a1);
         za_horizon_regs[ZA_REG_X1] = (unsigned long)v;

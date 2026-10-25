@@ -55,19 +55,24 @@
 //   （实测：StandardAllocator::Initialize 断言、Break 调用者 sdk+0x9ab48）。
 // ★ 必须带 MAP_NORESERVE：heap_ensure/svc#44 会把 12GB 转 RW，
 //   没有 NORESERVE 时内核要一次性预留 12GB commit ⇒ 8GB 设备直接 ENOMEM。
-#define ZA_MEM_RESERVE (16ull << 30)
+#define ZA_MEM_RESERVE (36ull << 30)
 // ★ 报给客机的 ASLR 区大小（GetInfo 12/13、QueryMemory 的空闲上界）。
 //   真机 Switch 上这个值约 512GB；客机的地址空间分配器要在「四块区域之外的
 //   空闲」里放下一整个 12GB 的系统资源块，16GB 实际预留扣掉 alias/stack/heap
 //   后凑不出来。声明区可以远大于实际预留：超出部分 QueryMemory 照报空闲，
 //   客机真要用时 svc#44 会现场 mmap（也要 NORESERVE）。
 #define ZA_MEM_ASLR_DECL (64ull << 30)
-// 四块区域的划分（相对预留块基址），与 d2r-and 保持一致
+// 四块区域的划分（相对预留块基址）。
+// ★ 2026-10-25：alias 区 512MB ⇒ 16GB。VammManager（SystemResource 的分配器）
+//   的管理窗 = [GetInfo(2), +GetInfo(3)−GetInfo(28)]（SDK+0x1422ac 一带实测：
+//   ctor 依次读 id2/id3/id1c），游戏的 12GB 堆要从这个窗里出 —— 512MB 放不下
+//   ⇒ AllocateMemoryPages 返回 0xE03 ⇒ CentralHeap::Init 失败 ⇒ nn::diag abort。
+//   alias 扩到 16GB 后 stack/heap 顺延，全部仍在实际预留内（svc#44 走 mprotect）。
 #define ZA_MEM_ALIAS_OFF 0x10000000ull
-#define ZA_MEM_ALIAS_CAP 0x20000000ull   // 512MB
-#define ZA_MEM_STACK_OFF 0x30000000ull
+#define ZA_MEM_ALIAS_CAP 0x400000000ull  // 16GB —— VammManager 管理窗，≥ 12GB 堆
+#define ZA_MEM_STACK_OFF 0x500000000ull
 #define ZA_MEM_STACK_CAP 0x10000000ull   // 256MB
-#define ZA_MEM_HEAP_OFF  0x40000000ull
+#define ZA_MEM_HEAP_OFF  0x510000000ull
 #define ZA_MEM_HEAP_CAP  0x300000000ull  // 12GB —— ≥ nn::init::Start 要的 0x300000000
 
 // 报给游戏的「应用内存池」：Switch 上是 3285MB，这里多给一点（d2r 加 512MB）

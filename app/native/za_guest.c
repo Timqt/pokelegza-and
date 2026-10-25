@@ -1405,6 +1405,11 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
     {
         memcpy(base + ZA_TLS_STUB_OFF, za_tls_mrs_blob, (size_t)ZA_TLS_STUB_SIZE);
         *(unsigned long long *)(base + ZA_TLS_HOOK_SLOT) = (unsigned long long)(uintptr_t)za_tls_mrs_hook;
+        // ★ 桩区必须可执行！它在文件映像（bss 末 0x5f7a000）之外、初始 mmap 是
+        //   RW ⇒ 不收紧就是 NX ⇒ mrs 替换点第一次执行就 SIGSEGV（pc=桩地址）。
+        //   实测：main+0x16526E0 的 TLS 桩 0x602E3B4，boot 首次跑到就崩。
+        mprotect(base + ZA_TLS_STUB_OFF, (ZA_TLS_HOOK_SLOT + 8 - ZA_TLS_STUB_OFF + 0xFFF) & ~0xFFFull,
+                 PROT_READ | PROT_EXEC);
         unsigned int patched = 0;
         for (unsigned i = 0; i < ZA_TLS_MRS_COUNT; i++)
         {
