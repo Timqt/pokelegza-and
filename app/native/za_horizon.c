@@ -438,6 +438,14 @@ static unsigned int za_fake_svc_handle(const char *name)
     return g_fake_handles[idx];
 }
 
+// 句柄 → 服务名（只用于日志；未知句柄返回 "??"）
+static const char *za_fake_svc_name(unsigned int h)
+{
+    unsigned int i = (h - ZA_FAKE_SVC_BASE) / 0x400u;   /* 每服务 0x400 步进 */
+    if (i >= (unsigned int)g_fake_count) return "??";
+    return g_fake_names[i];
+}
+
 // 句柄 → 是否 TIPC（-1 = 未知句柄）
 //
 // ⚠ 必须按**名字**查协议，不能拿句柄数值去索引静态表：句柄是按调用顺序动态
@@ -1340,8 +1348,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             else
             {
                 za_write_cmif_reply(ro, (unsigned long long)a2, (unsigned long long)a4, hdr0, hdr1);
-                ZLOGI("  IPC CMIF session=%#x hdr0=%#x hdr1=%#x -> reply written",
-                      sess, hdr0, hdr1);
+                ZLOGI("  IPC CMIF 服务=\"%s\" session=%#x cmd=%#x hdr0=%#x hdr1=%#x -> reply written",
+                      za_fake_svc_name(sess), sess, cmd, hdr0, hdr1);
             }
         }
         else
