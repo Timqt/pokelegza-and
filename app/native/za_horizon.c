@@ -768,6 +768,17 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             unsigned int zero = 0;
             memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
             memcpy(&post8, (void *)(uintptr_t)(ro + 8), 4);
+
+            // ★ 命令缓冲区 = ro 页（x20 = TPIDRRO_EL0 已改写成 ro）。
+            //   sdk+0x154058 会 `ldp w8,w0,[x20,#0xc]` —— [ro+0xc] 必须是
+            //   IPC Result（0 = 成功），否则上层直接判失败。
+            memcpy((void *)(uintptr_t)(ro + 0xc), &zero, 4);
+
+            // ⚠ 曾在这里把 0x4F434653("SFCO") 写进 ro+0x10，实测**错位**：
+            //   Break 的值立刻从 0x1a80a 变成 0x4f434653 ⇒ 证明这块被客机
+            //   当成 **Result** 读走（0x154058 `ldp w8,w0,[x20,#0xc]`）。
+            //   所以这里只保证 Result=0，SFCO 要写在上层解析出的结构体里
+            //   （sdk+0x14eb60 的 x8 = [sp+0x90] + idx*4，对齐后读首字）。
         }
         // SDK bss 里的 sm 计数/会话句柄（反汇编 0x153e54 / 0x153efc 得来）
         unsigned int sm_cnt = 0, sm_sess = 0;
