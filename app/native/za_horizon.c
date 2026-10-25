@@ -696,6 +696,18 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     }
     case 31: // ConnectToNamedPort(out_handle=x0, name=x1) → W1
     {
+        // 取证：客机连的是哪个服务（无结尾 NUL，按 8 字节打印）
+        {
+            const char *nm = (const char *)(uintptr_t)a1;
+            if (nm)
+            {
+                unsigned long long w0v = 0, w1v = 0;
+                memcpy(&w0v, nm, 8);
+                memcpy(&w1v, nm + 8, 8);
+                ZLOGI("svc#31 ConnectToNamedPort name=%.8s%s (raw %016llx %016llx) out=%p",
+                      nm, (w0v >> 56) ? "" : "...", w0v, w1v, (void *)(uintptr_t)a0);
+            }
+        }
         int id = za_handle_alloc(ZA_H_MEMORY);
         if (id < 0) return 1;
         if (a0) *(unsigned int *)(uintptr_t)a0 = (unsigned int)id;
@@ -705,6 +717,50 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
 
     // ── IPC（客机用不上真 IPC，给个空实现让它别崩）──
     case 33: // SendSyncRequest(session=x0)
+    {
+        // ★ 取证 + 关键修复（见本次补丁头部注释）
+        //
+        // 客机在 sdk+0x153edc 这样用 svc#33（反汇编实测）：
+        //     str  w8,[tp16+8]      ; = 1
+        //     ldr  w0,[0xb9c59c]    ; session
+        //     bl   svc#33
+        //     cbnz w0, error        ; 必须返回 0
+        //     ldr  w8,[tp16+8]
+        //     cbnz w8, error        ; ★ 必须变回 0
+        // 也就是说，**SendSyncRequest 的实现必须把 [tp16+8] 清 0**
+        // （真机上这由内核在完成 IPC 时写回「无挂起中断」）。
+        // 我们以前只 return 0，[tp16+8] 永远是 1 ⇒ 必走 error ⇒ abort("stdio")。
+        // ⚠ 不能用 `mrs TPIDRRO_EL0` 探测：客机里 123 处 `mrs` 已全部改写成
+        //   `adrp` 指向我们的只读 TLS 页；真实 TPIDRRO_EL0 在这个进程里本来就是 0
+        //   （安卓 bionic 不设置它）⇒ 用 mrs 探到 0 是「探针错」而不是「客机错」。
+        //   要看客机看到的内容，必须读**我们自己那一页**。
+        unsigned long long ro = za_ro_tls_page;   // 由 za_sdk.c 在装载时填
+        unsigned int pre0 = 0, pre8 = 0, post8 = 0;
+        if (ro)
+        {
+            memcpy(&pre0, (void *)(uintptr_t)(ro + 0), 4);
+            memcpy(&pre8, (void *)(uintptr_t)(ro + 8), 4);
+            // 真机上 IPC 完成后内核会把这个「挂起」位置 0；我们替它清，
+            // 否则客机在 sdk+0x153f18 的 `cbnz w8` 必然走 abort("stdio")。
+            unsigned int zero = 0;
+            memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
+            memcpy(&post8, (void *)(uintptr_t)(ro + 8), 4);
+        }
+        // SDK bss 里的 sm 计数/会话句柄（反汇编 0x153e54 / 0x153efc 得来）
+        unsigned int sm_cnt = 0, sm_sess = 0;
+        if (za_sdk_base)
+        {
+            memcpy(&sm_cnt, (void *)(uintptr_t)(za_sdk_base + 0xb9c598), 4);
+            memcpy(&sm_sess, (void *)(uintptr_t)(za_sdk_base + 0xb9c59c), 4);
+        }
+        ZLOGI("svc#33 SendSyncRequest session=%#llx  ro=%p [ro+0]=%#x [ro+8] %#x->%#x  "
+              "sm.cnt=%u sm.sess=%u",
+              (unsigned long long)(unsigned int)a0, (void *)(uintptr_t)ro,
+              pre0, pre8, post8, sm_cnt, sm_sess);
+        // IPC 应答：sm 的 GetService 之类需要往缓冲区写回复。
+        // 目前最小实现：只保证结果码 0 + 清挂起位，让初始化流程能继续。
+        return 0;
+    }
     case 34: // SendSyncRequestWithUserBuffer(buf=x0, size=x1, session=x2)
     case 35: // SendAsyncRequestWithUserBuffer(out_handle=x0, buf=x1, size=x2, session=x3) → W1
         if (nr == 35)
