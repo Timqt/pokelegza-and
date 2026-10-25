@@ -105,7 +105,13 @@ def main():
         tmp = 17 if n == 17 else 16      # 临时寄存器（不用目标寄存器自己）
         stub_pc = STUB_OFF + len(blob)
         seq = []
+        # ★ 必须同时保存 x30：被替换的 mrs 站点可能是**叶子函数**，x30 就是
+        #   调用者的返回地址（没有 prologue 保护）。桩里的 blr 会覆盖 x30，
+        #   之后 `b 回原址` 落到函数末尾的 ret ⇒ ret 跳回桩里 ⇒ 桩↔ret 无限
+        #   乒乓（实测：pc 恒在 main+0x603447c 桩区、100% CPU 无 svc）。
+        #   x16 用红区 [sp-16]，x30 用 [sp-32]（同样是红区，安全）。
         seq.append(enc_stur(tmp, 31, -16))
+        seq.append(enc_stur(30, 31, -32))
         # 回调地址放在**整个桩区末尾之后**的一格（运行时装进去），
         # 用 adrp+ldr 取：adrp 给页基址，ldr 的 imm12 按 8 字节缩放给页内偏移。
         seq_adrp_pc = stub_pc + 4
@@ -113,6 +119,7 @@ def main():
         seq.append(0)                    # ldr
         seq.append(enc_blr(tmp))
         seq.append(enc_mov(n, 0))
+        seq.append(enc_ldur(30, 31, -32))
         seq.append(enc_ldur(tmp, 31, -16))
         # 回原位置的下一条
         seq.append(enc_b(stub_pc + len(seq) * 4, off + 4))
@@ -131,8 +138,10 @@ def main():
         assert 0 <= imm12 < 0x1000, "ldr imm12 越界"
         ldr = enc_ldr(16, 16, imm12)
         base_idx = (stub_pc - STUB_OFF) // 4
-        struct.pack_into("<I", blob, base_idx * 4 + 4, adrp)
-        struct.pack_into("<I", blob, base_idx * 4 + 8, ldr)
+        # 序列：stur x16 / stur x30 / adrp / ldr / blr / mov / ldur x30 / ldur x16 / b
+        #               [0]      [1]     [2]   [3]   [4]   [5]     [6]       [7]    [8]
+        struct.pack_into("<I", blob, (base_idx + 2) * 4, adrp)
+        struct.pack_into("<I", blob, (base_idx + 3) * 4, ldr)
 
     # 重新写 entries（此时 stub 地址不变）
     entries = [(off, orig, stub_pc) for off, orig, stub_pc, _, _ in entries]
