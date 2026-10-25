@@ -27,6 +27,7 @@
 
 // SDK 的「os 上下文」对象（za_sdk_load 里建，za_guest_boot 用）。
 void *za_sdk_ctx = NULL;
+static int za_vamm_bump_init_pending = 0;
 #include "za_mem.h"
 #include "za_guest_api.h"
 #include "za_os.h"
@@ -328,7 +329,39 @@ int za_sdk_load(za_mod_t *sdk,
         {
             stub[0] = 0x52800000u;      /* mov w0, #0 */
             stub[1] = 0xd65f03c0u;      /* ret */
-            mprotect(stub, 0x1000, PROT_READ | PROT_EXEC);
+
+            /* ★ VammManager::AllocateAddressRegion 宿主桩（stub+0x10 起）。
+             *   SDK 的 SystemResource 分配走 VammManager，其区域空闲链表由
+             *   SDK 侧初始化，实测只种了 ≈1GB 的 alias 区 ⇒ 12GB 的堆申请
+             *   永远失败 ⇒ CentralHeap::Init 返回错误 ⇒ nn::diag abort。
+             *   真机上这一块由 OS 预先建好；我们就是 OS —— 桩直接在声明区
+             *   （0x900000000 起，实际预留之外）步进分配，*out = 基址、返回 0，
+             *   调用方随后 svc#44 现场映射（已带 MAP_NORESERVE）。
+             *   步进指针槽放在我们自己的 ro2 页空闲区 base+0xF01E00
+             *   （SDK bss 的 0xb9b500 实测被 SDK 数据初始化占用，不能用）。 */
+            {
+                /* this=x0, out=x1, size=x2 → *out=基址, 返回 0 */
+                unsigned long long bump_slot = 0x200F01E00ull;   /* = base + 0xF01E00（我们自己的 ro2 页空闲区） */
+                unsigned int *s = stub + 4;
+                s[0] = 0xd2800000u | (unsigned int)((bump_slot & 0xffffu) << 5) | 3;  /* movz x3,#lo16 */
+                s[1] = 0xf2a00000u | (unsigned int)(((bump_slot >> 16) & 0xffffu) << 5) | 3; /* movk x3,#m16,lsl16 */
+                s[2] = 0xf2c00000u | (unsigned int)(((bump_slot >> 32) & 0xffffu) << 5) | 3; /* movk x3,#m32,lsl32 */
+                s[3] = 0xf9400064u;         /* ldr  x4, [x3]        ; bump */
+                s[4] = 0x8b020085u;         /* add  x5, x4, x2      ; end = bump+size */
+                s[5] = 0xf9000065u;         /* str  x5, [x3]        ; bump = end */
+                s[6] = 0xf9000024u;         /* str  x4, [x1]        ; *out = 基址 */
+                s[7] = 0x52800000u;         /* mov  w0, #0 */
+                s[8] = 0xd65f03c0u;         /* ret */
+
+                mprotect(stub, 0x1000, PROT_READ | PROT_EXEC);
+
+                /* 劫持 PLT：所有调用方都经 0x636eb0 → GOT 0xb7af08 */
+                *(unsigned long long *)(base + 0xb7af08) = (unsigned long long)(uintptr_t)s;
+                ZLOGI("VammAllocate 桩：GOT 0xb7af08 → %p", (void *)s);
+                /* 步进指针初值在下面第 6 步 memset **之后**写（槽在 ro2 页里，
+                 *   在 memset 前写会被抹掉 —— 实测桩返回 base=0 ⇒ abort）。 */
+                za_vamm_bump_init_pending = 1;
+            }
 
             /* 数据页：vtable + 对象（对象第 0 格放 vtable 指针） */
             unsigned long long *data = (unsigned long long *)mmap(NULL, 0x1000,
@@ -369,6 +402,16 @@ int za_sdk_load(za_mod_t *sdk,
         }
     }
 
+    // 5.7) SDK 的 abort 观察者链在我们环境里必然踩空：InvokeSdkAbortObserver
+    //      （SDK+0x9c630）遍历的观察者对象由 SDK 运行时注册，我们没有真的
+    //      diag/am 运行时 ⇒ 列表里是垃圾 ⇒ abort 一发生就在这里 SIGSEGV，
+    //      把真正的错误盖住（2026-10-25 实测：连续三轮「不同」的崩溃
+    //      0x349e64 / 0x349e6c / ret-to-0x206409e58 全是这一条链的次生崩溃，
+    //      链上真实的一环是 CriticalSection::Leave ⇒ AbortImpl）。
+    //      ⇒ 打成直接 ret，让 abort 流程走到 svc#38 Break（宿主已实现并打日志），
+    //        这样能看到真正的断言原因。
+    *(unsigned int *)(base + 0x9c630) = 0xd65f03c0u;   /* ret */
+
     // 6) 只读 TLS：客机 SDK 有 123 处 `mrs Xt,TPIDRRO_EL0`，
     //    而安卓/bionic **从不设置 TPIDRRO_EL0**（一直是 0）⇒ 客机读到空指针直接崩。
     //    做法：把 `mrs` 1:1 换成 `adrp Xt,<我们自备的只读 TLS 页>`（相对偏移全部不变），
@@ -390,6 +433,14 @@ int za_sdk_load(za_mod_t *sdk,
         unsigned char *ro2 = base + ZA_TLSRO2_OFF;
         memset(ro, 0, ZA_TLSRO_SIZE);
         memset(ro2, 0, ZA_TLSRO2_SIZE);
+        /* ★ VammAllocate 桩的步进指针初值（ro2 页刚被清零，现在写才留得住）：
+         *   声明区高位，实际预留 16GB 之外，与四块区域无重叠。 */
+        if (za_vamm_bump_init_pending)
+        {
+            *(unsigned long long *)(base + 0xF01E00) = 0x900000000ull;
+            za_vamm_bump_init_pending = 0;
+            ZLOGI("VammAllocate 步进指针初值 = 0x900000000（base+0xF01E00）");
+        }
         unsigned long long p2 = (unsigned long long)(uintptr_t)ro2;
         // 指针型槽都指向第二页（客机的「线程自己」结构）
         //
@@ -476,6 +527,12 @@ int za_sdk_load(za_mod_t *sdk,
     }
 
     // 7) 段权限收紧（门区要可执行）
+    // ★ 先做指令缓存维护：上面改写了 text（HLE 桩 / mrs→adrp / svc 门分支）。
+    //   ARM64 架构上「写了指令再执行」必须显式 IC 维护，否则 I-cache 可能
+    //   还是旧内容 ⇒ 补丁随机不生效（实测：同一份补丁一次崩一次不崩）。
+    __builtin___clear_cache((char *)base, (char *)base + ZA_SDK_RODATA_OFF);
+    __builtin___clear_cache((char *)base + ZA_SVC_GATE_BASE,
+                            (char *)base + ZA_SVC_GATE_BASE + ZA_SVC_GATE_SIZE);
     mprotect(base, ZA_SDK_RODATA_OFF, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_SVC_GATE_BASE, ZA_SVC_GATE_SIZE, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_SDK_RODATA_OFF, ZA_SDK_DATA_OFF - ZA_SDK_RODATA_OFF, PROT_READ);

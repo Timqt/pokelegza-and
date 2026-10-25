@@ -938,6 +938,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     case 1: // SetHeapSize(out_base=x0, size=x1) → W1 = 堆基址
     {
         unsigned char *b = za_mem_heap_ensure((size_t)a1);
+        ZLOGI("svc#1 SetHeapSize size=%#lx -> base=%p%s", a1, (void *)b,
+              b ? "" : "（失败！ CentralHeap::Init 会 abort）");
         if (!b) return 1;
         if (a0) *(unsigned long long *)(uintptr_t)a0 = (unsigned long long)(uintptr_t)b;
         za_horizon_regs[ZA_REG_X1] = (unsigned long)(uintptr_t)b;
@@ -1029,9 +1031,12 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         }
         if (nr == 44)
         {
-            /* 已映射就只改权限；没映射就真 mmap 到这个地址 */
+            /* 已映射就只改权限；没映射就真 mmap 到这个地址。
+             * ★ 12GB 的系统资源块会落在声明 ASLR 区里实际预留之外的地方，
+             *   mmap 必须带 MAP_NORESERVE（否则 12GB commit 直接 ENOMEM），
+             *   页面按需落地。 */
             void *p = mmap((void *)addr, size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
             if (p == MAP_FAILED)
             {
                 /* 已经有人占了这段地址（EEXIST）⇒ 只放开权限 */
@@ -1041,6 +1046,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                     return (long)0xD401;   /* 越界/失败码 */
                 }
             }
+            za_mem_note_mapping(addr, size, 1);
             ZLOGI("svc#44 MapPhysicalMemory %#lx+%#lx -> ok", addr, size);
         }
         else
@@ -1048,6 +1054,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             /* 只收回权限，不 munmap（这段可能与宿主其它映射共享） */
             if (mprotect((void *)addr, size, PROT_NONE) != 0)
                 ZLOGI("svc#45 解除权限 %#lx+%#lx 失败 errno=%d", addr, size, errno);
+            za_mem_note_mapping(addr, size, 0);
             ZLOGI("svc#45 UnmapPhysicalMemory %#lx+%#lx -> ok", addr, size);
         }
         return 0;
@@ -1508,6 +1515,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                   (oid && oid == tid) ? "YES" : "NO(以 [self+0x1b0] 为准)");
         }
         // 顺便把客机栈里的返回地址扫出来 ⇒ 能看出是哪条调用链走到这个断言
+        // 指针值若是 rodata 里的字符串（断言文本 file/func/expr），一并打出来
         {
             unsigned long sp = za_horizon_regs[ZA_REG_SP];
             unsigned long sb = za_sdk_base;
@@ -1516,7 +1524,22 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             {
                 unsigned long w = *(const unsigned long *)(uintptr_t)(sp + i * 8);
                 if (sb && w >= sb && w < sb + sz)
-                    ZLOGI("  客机栈[%d] = sdk+%#lx", i, w - sb);
+                {
+                    char buf[97];
+                    long n = 0;
+                    for (; n < 96; n++)
+                    {
+                        char c = *(const volatile char *)(uintptr_t)(w + n);
+                        if (c == 0) break;
+                        if (c < 0x20 || c > 0x7e) break;
+                        buf[n] = c;
+                    }
+                    buf[n] = 0;
+                    if (n >= 4)
+                        ZLOGI("  客机栈[%d] = sdk+%#lx 「%s」", i, w - sb, buf);
+                    else
+                        ZLOGI("  客机栈[%d] = sdk+%#lx", i, w - sb);
+                }
             }
         }
         // ★★ 断言调用者（决定性证据）★★
@@ -1548,6 +1571,72 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                     ZLOGI("  ★ frame[%d] ret=%s", i, za_h_addrstr(ret));
                     if (!nfp || (nfp & 0xF) || nfp <= fp) break;
                     fp = nfp;
+                }
+            }
+        }
+        // ★ 断言文本：VAbortImpl(file, func, ...) 的参数指针在被调寄存器里，
+        //   断言发生时（Break 现场）它们还没被覆盖 —— 当字符串打出来。
+        //   （nn::diag 的日志管理器此刻往往还没初始化 ⇒ OutputDebugString 走不到。）
+        {
+            unsigned long sb = za_sdk_base, sz = za_sdk_size;
+            unsigned long mb = 0x100000000ull;
+            for (int r = 19; r <= 28; r++)
+            {
+                unsigned long p = za_horizon_regs[ZA_REG_X0 + r];
+                if (!p) continue;
+                int in_sdk = sb && p >= sb && p < sb + sz;
+                int in_main = p >= mb && p < mb + 0x4000000ull;
+                if (!in_sdk && !in_main) continue;
+                char buf[121];
+                long n = 0;
+                for (; n < 120; n++)
+                {
+                    /* 指针已框进映像内，直接逐字节读是安全的 */
+                    char c = *(const volatile char *)(uintptr_t)(p + n);
+                    if (c == 0) break;
+                    if (c < 0x20 || c > 0x7e) { break; }
+                    buf[n] = c;
+                }
+                buf[n] = 0;
+                if (n >= 3)
+                    ZLOGI("  ★ 文本 x%d = %s「%s」", r, in_sdk ? "sdk" : "main", buf);
+            }
+        }
+        // ★ VammManager 现场：ctx+0x428 是 SystemResource 的内存管理器。
+        //   它的区域分配器 [mgr+0x40] 的空闲链表决定 12GB 能不能放下。
+        {
+            unsigned long sb = za_sdk_base;
+            if (sb)
+            {
+                unsigned long long ctx = 0, alloc = 0;
+                memcpy(&ctx, (void *)(uintptr_t)(sb + 0xb74078), 8);
+                /* VammAllocate 桩诊断：GOT 槽是否还指桩、步进指针是否动过 */
+                {
+                    unsigned long long got = 0, bump = 0;
+                    memcpy(&got, (void *)(uintptr_t)(sb + 0xb7af08), 8);
+                    memcpy(&bump, (void *)(uintptr_t)(sb + 0xF01E00), 8);
+                    ZLOGI("  Vamm: got(0xb7af08)=%#llx bump(0xF01E00)=%#llx", got, bump);
+                }
+                if (ctx)
+                {
+                    /* AllocateAddressRegion(this=ctx+0x428): x23 = [this+0x40] = [ctx+0x468] */
+                    memcpy(&alloc, (void *)(uintptr_t)(ctx + 0x468), 8);
+                    ZLOGI("  Vamm: ctx=%#llx alloc(ctx+0x468)=%#llx", ctx, alloc);
+                    if (alloc)
+                    {
+                        unsigned long long node = 0;
+                        memcpy(&node, (void *)(uintptr_t)(alloc + 0x10), 8);
+                        for (int i = 0; i < 24 && node; i++)
+                        {
+                            unsigned long long nx = 0, b = 0, s = 0;
+                            memcpy(&nx, (void *)(uintptr_t)(node + 0x00), 8);
+                            memcpy(&b, (void *)(uintptr_t)(node + 0x20), 8);
+                            memcpy(&s, (void *)(uintptr_t)(node + 0x28), 8);
+                            ZLOGI("  Vamm region[%d] @%#llx: base=%#llx size=%#llx", i, node, b, s);
+                            node = nx;
+                            if (nx == node) break;
+                        }
+                    }
                 }
             }
         }

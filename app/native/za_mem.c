@@ -49,14 +49,26 @@
 
 
 // 整块预留大小（PROT_NONE，只占地址空间不占内存）
-#define ZA_MEM_RESERVE (5ull << 30)
+// ★ 2026-10-25：5GB ⇒ 16GB。游戏的 nn::init::Start 要 0x300000000（12GB）的堆
+//   （main+0x19f84b4 硬编码），CentralHeap::Init(ptr=0) 会向地址空间分配器
+//   申请这么大一整块；5GB 的预留永远凑不出来 ⇒ 申请失败 ⇒ nn::diag abort
+//   （实测：StandardAllocator::Initialize 断言、Break 调用者 sdk+0x9ab48）。
+// ★ 必须带 MAP_NORESERVE：heap_ensure/svc#44 会把 12GB 转 RW，
+//   没有 NORESERVE 时内核要一次性预留 12GB commit ⇒ 8GB 设备直接 ENOMEM。
+#define ZA_MEM_RESERVE (16ull << 30)
+// ★ 报给客机的 ASLR 区大小（GetInfo 12/13、QueryMemory 的空闲上界）。
+//   真机 Switch 上这个值约 512GB；客机的地址空间分配器要在「四块区域之外的
+//   空闲」里放下一整个 12GB 的系统资源块，16GB 实际预留扣掉 alias/stack/heap
+//   后凑不出来。声明区可以远大于实际预留：超出部分 QueryMemory 照报空闲，
+//   客机真要用时 svc#44 会现场 mmap（也要 NORESERVE）。
+#define ZA_MEM_ASLR_DECL (64ull << 30)
 // 四块区域的划分（相对预留块基址），与 d2r-and 保持一致
 #define ZA_MEM_ALIAS_OFF 0x10000000ull
 #define ZA_MEM_ALIAS_CAP 0x20000000ull   // 512MB
 #define ZA_MEM_STACK_OFF 0x30000000ull
 #define ZA_MEM_STACK_CAP 0x10000000ull   // 256MB
 #define ZA_MEM_HEAP_OFF  0x40000000ull
-#define ZA_MEM_HEAP_CAP  0x100000000ull  // 4GB
+#define ZA_MEM_HEAP_CAP  0x300000000ull  // 12GB —— ≥ nn::init::Start 要的 0x300000000
 
 // 报给游戏的「应用内存池」：Switch 上是 3285MB，这里多给一点（d2r 加 512MB）
 #define ZA_MEM_APP_POOL (0xED500000ull)
@@ -107,13 +119,14 @@ void za_mem_init(void)
     if (!g_as)
     {
         void *p = mmap((void *)(uintptr_t)ZA_MEM_BASE_ADDR, (size_t)ZA_MEM_RESERVE,
-                       PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+                       PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
         if (p == MAP_FAILED)
         {
             ZLOGE("客机地址空间固定基址 %#lx 被占：%s", (unsigned long long)ZA_MEM_BASE_ADDR,
                   strerror(errno));
             p = mmap(NULL, (size_t)ZA_MEM_RESERVE, PROT_NONE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         }
         if (p == MAP_FAILED)
         {
@@ -255,7 +268,7 @@ unsigned long long za_mem_getinfo(long id)
     case 10: return 0;                                   // IdleTick
     case 11: return za_mem_random64();                   // RandomEntropy
     case 12: return (unsigned long long)(uintptr_t)g_as;      // AslrAddr
-    case 13: return ZA_MEM_RESERVE;                      // AslrSize
+    case 13: return ZA_MEM_ASLR_DECL;                         // AslrSize（声明值，见文件头注释）
     case 14: return (unsigned long long)(uintptr_t)g_stack;   // StackAddr
     case 15: return ZA_MEM_STACK_CAP;                    // StackSize
     case 16: return 0x2000000;                           // SysResTotal
@@ -336,18 +349,34 @@ int za_mem_map_shared(unsigned long long addr, unsigned long long size)
     if (!g_as) za_mem_init();
     if (!g_as || !addr || !size) return 0;
     size = (size + 0xFFF) & ~0xFFFull;
-    if (addr < (unsigned long long)(uintptr_t)g_as ||
-        addr + size > (unsigned long long)(uintptr_t)g_as + ZA_MEM_RESERVE)
+    unsigned long long lo = (unsigned long long)(uintptr_t)g_as;
+    // 越界判定按**声明区**（64GB）：QueryMemory 报给客机的空闲就是这么大，
+    // 客机分配器会把共享内存挑在实际预留之外的地方（实测 0x103866f000）。
+    if (addr < lo || addr + size > lo + ZA_MEM_ASLR_DECL)
     {
-        ZLOGE("MapSharedMemory：%#llx 不在客机地址空间内，拒绝", addr);
+        ZLOGE("MapSharedMemory：%#llx 不在客机声明地址空间内，拒绝", addr);
         return 0;
     }
-    if (za_mem_map_find(addr))
-        ZLOGI("MapSharedMemory：%#llx 已落在已登记区间内，仍按共享内存开口", addr);
-    if (mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_READ | PROT_WRITE) != 0)
+    if (addr < lo + ZA_MEM_RESERVE)
     {
-        ZLOGE("MapSharedMemory 开放失败（%#llx+%#llx）：%s", addr, size, strerror(errno));
-        return 0;
+        // 实际预留内：ASLR 区是整块 PROT_NONE，用 mprotect 开口子
+        if (mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_READ | PROT_WRITE) != 0)
+        {
+            ZLOGE("MapSharedMemory 开放失败（%#llx+%#llx）：%s", addr, size, strerror(errno));
+            return 0;
+        }
+    }
+    else
+    {
+        // 声明区内、实际预留外：现场映射（NORESERVE，页面按需落地）
+        void *p = mmap((void *)(uintptr_t)addr, (size_t)size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p == MAP_FAILED &&
+            mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_READ | PROT_WRITE) != 0)
+        {
+            ZLOGE("MapSharedMemory 现场映射失败（%#llx+%#llx）：%s", addr, size, strerror(errno));
+            return 0;
+        }
     }
     za_mem_map_add(addr, size, 0, 0x0B);
     return 1;
@@ -357,13 +386,28 @@ int za_mem_unmap_shared(unsigned long long addr, unsigned long long size)
 {
     if (!g_as || !addr || !size) return 0;
     size = (size + 0xFFF) & ~0xFFFull;
-    if (addr < (unsigned long long)(uintptr_t)g_as ||
-        addr + size > (unsigned long long)(uintptr_t)g_as + ZA_MEM_RESERVE)
+    unsigned long long lo = (unsigned long long)(uintptr_t)g_as;
+    if (addr < lo || addr + size > lo + ZA_MEM_ASLR_DECL)
         return 0;
-    // 收回成 PROT_NONE（ASLR 区本来就是预留的）
-    mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_NONE);
+    if (addr < lo + ZA_MEM_RESERVE)
+        mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_NONE);  // 收回成预留态
+    else
+        munmap((void *)(uintptr_t)addr, (size_t)size);               // 现场映射的直接摘除
     za_mem_map_add(addr, 0, 0, 0);      /* size=0 ⇒ za_mem_map_find 当成没占用 */
     return 1;
+}
+
+// svc#44/#45 的登记：让 QueryMemory 把这块报成已映射（0x0B），
+// 否则客机分配器可能把同一段地址再分给别人。
+void za_mem_note_mapping(unsigned long long addr, unsigned long long size, int on)
+{
+    if (!g_as || !addr || !size) return;
+    pthread_mutex_lock(&g_lock);
+    if (on)
+        za_mem_map_add(addr, size, 0, 0x0B);
+    else
+        za_mem_map_add(addr, 0, 0, 0);  /* size=0 ⇒ 当成没占用 */
+    pthread_mutex_unlock(&g_lock);
 }
 
 // MapMemory(dst, src, size)：把 src 的内容搬到 dst（src=0 就只是占位）。
@@ -465,11 +509,13 @@ unsigned long long za_mem_query_memory(unsigned long long addr, unsigned long lo
         perm = 3;
     }
     else if (g_as && addr >= (unsigned long long)(uintptr_t)g_as &&
-             addr < (unsigned long long)(uintptr_t)g_as + ZA_MEM_RESERVE)
+             addr < (unsigned long long)(uintptr_t)g_as + ZA_MEM_ASLR_DECL)
     {
-        // 空闲：报到「相邻映射/堆边界」为止
+        // 空闲：报到「相邻映射/堆边界」为止。上界用**声明区**（64GB）而不是
+        // 实际预留（16GB）—— 客机分配器要在四块区域之外放下 12GB 的系统资源，
+        // 超出实际预留的部分 svc#44 会现场 mmap。
         unsigned long long lo = (unsigned long long)(uintptr_t)g_as;
-        unsigned long long hi = (unsigned long long)(uintptr_t)g_as + ZA_MEM_RESERVE;
+        unsigned long long hi = (unsigned long long)(uintptr_t)g_as + ZA_MEM_ASLR_DECL;
         if (addr >= (unsigned long long)(uintptr_t)g_heap)
             lo = (unsigned long long)(uintptr_t)g_heap + g_heap_cur;
         else if (hi > (unsigned long long)(uintptr_t)g_heap)

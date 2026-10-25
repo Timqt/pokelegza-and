@@ -23,6 +23,8 @@ int za_mem_unmap_memory(unsigned long long dst, unsigned long long src, unsigned
 // 客机先在 ASLR 区内挑一块空位，再让内核把共享内存映射到那个地址上。
 int za_mem_map_shared(unsigned long long addr, unsigned long long size);
 int za_mem_unmap_shared(unsigned long long addr, unsigned long long size);
+// svc#44/#45 Map/UnmapPhysicalMemory 的登记：QueryMemory 据此把这块报成已映射/空闲。
+void za_mem_note_mapping(unsigned long long addr, unsigned long long size, int on);
 // QueryMemory：填 MemoryInfo（base/size/state/attr/perm 六个字段），返回页信息（W1）。
 unsigned long long za_mem_query_memory(unsigned long long addr, unsigned long long *mi);
 

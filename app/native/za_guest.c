@@ -799,6 +799,30 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             p = za_put_str(p, "\n");
             za_fatal_write(buf, (size_t)(p - buf));
         }
+        // ★ GetApplicationFunctions 补丁现场回读：pc 崩在 SDK+0x349e4x 一带时，
+        //   直接看补丁是否还活着（0x1c61c0 的 4 条指令 / GOT 槽 / 全局）。
+        {
+            extern volatile unsigned long za_sdk_base;
+            if (za_sdk_base)
+            {
+                unsigned long long b = za_sdk_base;
+                const unsigned int *fn = (const unsigned int *)(b + 0x1c61c0);
+                const unsigned long long *got = (const unsigned long long *)(b + 0xb7cb90);
+                const unsigned long long *g = (const unsigned long long *)(b + 0xbaca10);
+                char *p = buf;
+                p = za_put_str(p, "ZaGuest: AMFN fn=");
+                p = za_put_hex(p, fn[0]); p = za_put_str(p, " ");
+                p = za_put_hex(p, fn[1]); p = za_put_str(p, " ");
+                p = za_put_hex(p, fn[2]); p = za_put_str(p, " ");
+                p = za_put_hex(p, fn[3]);
+                p = za_put_str(p, " got=");
+                p = za_put_hex(p, *got);
+                p = za_put_str(p, " global=");
+                p = za_put_hex(p, *g);
+                p = za_put_str(p, "\n");
+                za_fatal_write(buf, (size_t)(p - buf));
+            }
+        }
         za_log_sdk_state((unsigned long)uc->uc_mcontext.regs[19],
                          (unsigned long)uc->uc_mcontext.regs[8]);
         // svc 轨迹：崩溃前最后几次 svc 的服务号 + 调用点 PC + 寄存器
@@ -1396,6 +1420,11 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         ZLOGI("TLS mrs 改写：%u / %u 条已替换（桩区 %#x..%#x）",
               patched, (unsigned)ZA_TLS_MRS_COUNT,
               (unsigned)ZA_TLS_STUB_OFF, (unsigned)(ZA_TLS_STUB_OFF + ZA_TLS_STUB_SIZE));
+        // ★ 指令缓存维护：ARM64 上「写了指令再执行」必须显式 IC 维护，
+        //   否则 I-cache 可能还是旧内容 ⇒ 补丁随机不生效（与 za_sdk.c 同理）。
+        __builtin___clear_cache((char *)base, (char *)base + ZA_TEXT_SIZE);
+        __builtin___clear_cache((char *)base + ZA_TLS_STUB_OFF,
+                                (char *)base + ZA_TLS_STUB_OFF + ZA_TLS_STUB_SIZE);
     }
 
     *out_base = base;
