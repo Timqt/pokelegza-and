@@ -782,6 +782,21 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             memcpy(&v, (const void *)(uintptr_t)a1, (size_t)a2);
         ZLOGI("Horizon: Break reason=%#lx info=%#lx size=%ld 值=%#llx",
               (unsigned long)a0, (unsigned long)a1, a2, v);
+        // ① info 附近原始字节：断言文本/结构体常紧邻它
+        if (a1)
+        {
+            unsigned long long w0v = 0, w1v = 0, w2v = 0;
+            memcpy(&w0v, (const void *)(uintptr_t)a1, 8);
+            memcpy(&w1v, (const void *)(uintptr_t)((unsigned long)a1 + 8), 8);
+            memcpy(&w2v, (const void *)(uintptr_t)((unsigned long)a1 + 16), 8);
+            ZLOGI("  info[0..0x18]=%016llx %016llx %016llx", w0v, w1v, w2v);
+        }
+        // ② GetInfo 关键 id 的当前值：0x148f80 的 bics 掩码校验依赖它
+        {
+            extern unsigned long long za_mem_getinfo(long id);
+            ZLOGI("  GetInfo: id0(CpuMask)=%#llx id23(IsApplication)=%#llx",
+                  za_mem_getinfo(0), za_mem_getinfo(23));
+        }
         // 顺便把客机栈里的返回地址扫出来 ⇒ 能看出是哪条调用链走到这个断言
         {
             unsigned long sp = za_horizon_regs[ZA_REG_SP];
