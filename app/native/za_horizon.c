@@ -836,6 +836,11 @@ long za_horizon_svc(long a0, long a1, long a2, long a3,
         }
     }
     long res = za_horizon_dispatch(a0, a1, a2, a3, a4, a5, a6, a7, nr);
+    // 返回值也记进轨迹：客机多数 svc 包装函数是
+    //   svc #N ; <收尾> ; ret     —— 返回值直接进 x0/w0
+    // 而 0x14457c 收尾前有 cbnz w0, <abort>；把 w0 记下来才能判定
+    // 崩点究竟是「走了 abort 分支」还是「ret 取到 0」。
+    za_svc_trace_ret(res);
     (void)a0; (void)a1; (void)a2; (void)a3;
     (void)a4; (void)a5; (void)a6; (void)a7;
     return res;

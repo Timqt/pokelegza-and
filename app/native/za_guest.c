@@ -653,6 +653,14 @@ unsigned long za_svc_trace_arg0[32];
 unsigned long za_svc_trace_arg2[32];
 unsigned long za_svc_trace_x19[32];
 unsigned long za_svc_trace_sp[32];
+unsigned long za_svc_trace_retv[32];
+// 回填最近一次 svc 的返回值（由 za_horizon.c 在分派返回后调用）
+void za_svc_trace_ret(long r)
+{
+    unsigned long pos = za_svc_trace_pos;
+    if (!pos) return;
+    za_svc_trace_retv[(pos - 1) % 32] = (unsigned long)r;
+}
 void za_svc_trace_rich(long nr, unsigned long pc,
                        unsigned long a0, unsigned long a2, unsigned long x19)
 {
@@ -699,6 +707,8 @@ void za_dump_svc_trace(void)
         p = za_put_hex(p, (unsigned long long)za_svc_trace_x19[i]);
         p = za_put_str(p, " sp=");
         p = za_put_hex(p, (unsigned long long)za_svc_trace_sp[i]);
+        p = za_put_str(p, " ret=");
+        p = za_put_hex(p, (unsigned long long)za_svc_trace_retv[i]);
         p = za_put_str(p, "\n");
         za_fatal_write(line, (size_t)(p - line));
     }

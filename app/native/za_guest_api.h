@@ -93,6 +93,9 @@ extern unsigned long za_svc_trace_arg0[32];
 extern unsigned long za_svc_trace_arg2[32];
 extern unsigned long za_svc_trace_x19[32];
 extern unsigned long za_svc_trace_sp[32];
+extern unsigned long za_svc_trace_retv[32];
+// 回填最近一次 svc 的返回值（客机 w0）
+void za_svc_trace_ret(long r);
 extern unsigned long za_svc_trace_pos;
 // 客机在 svc 那一刻的 sp（由 za_horizon.c 提供）
 unsigned long za_horizon_guest_sp(void);
