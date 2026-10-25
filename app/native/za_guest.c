@@ -642,7 +642,9 @@ static void za_dump_frame_snap(void)
 void za_dump_svc_trace(void);
 // 客机 PC 采样环形轨迹（定义在后面；fatal handler 在它之前）
 #define ZA_PC_RING 16
-extern volatile unsigned long za_pc_ring[ZA_PC_RING];
+volatile unsigned long za_disp_count;   // svc 派发计数（看门狗判卡死用）
+void za_disp_count_bump(void) { za_disp_count++; }
+volatile unsigned long za_pc_ring[ZA_PC_RING];
 extern volatile unsigned long za_pc_ring_pos;
 static void za_dump_pc_ring(void)
 {
@@ -1719,6 +1721,13 @@ volatile unsigned long za_pc_ring_pos;
 static void za_pc_sample_handler(int sig, siginfo_t *info, void *ctx)
 {
     (void)sig; (void)info;
+    static int probe;
+    if (probe < 3)
+    {
+        probe++;
+        unsigned long raw = ctx ? (unsigned long)((ucontext_t *)ctx)->uc_mcontext.pc : 0;
+        ZLOGI("采样探针 %d：ctx=%p pc=%#lx", probe, ctx, raw);
+    }
     if (!ctx) return;
     ucontext_t *uc = (ucontext_t *)ctx;
     unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
@@ -1753,13 +1762,46 @@ void za_reinstall_sampler_handler(void)
 static void *za_sampler_watchdog(void *arg)
 {
     (void)arg;
+    // ★ 卡死检测：同一 PC 连续 2 秒不变（且期间无新采样动作）⇒ 客机在原地
+    //   自旋。打印一次 PC + 所属模块偏移 —— 这是不杀进程就能拿到「卡在哪」
+    //   的唯一手段（2026-10-25：fsp-srv 后 100% CPU 自旋就是靠它定位的）。
+    unsigned long long stuck_pc = 0;
+    int stuck_n = 0;
     for (;;)
     {
-        struct timespec ts = { 0, 50 * 1000 * 1000 };   // 50ms
+        struct timespec ts = { 0, 50 * 100 * 1000 };   // 50ms
         nanosleep(&ts, NULL);
-        if (!(za_verbose_is_on())) continue;
+        /* 向客机线程投递采样信号（tgkill 按线程）：SIGEV_THREAD_ID 只能绑
+         * 装载线程，绑不到客机线程 ⇒ 环形轨迹一直为空的根因。 */
+        if (za_guest_tid > 0)
+        {
+            long r = syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, ZA_SAMPLER_SIG);
+            static long err_logged;
+            if (r != 0 && err_logged++ < 3)
+                ZLOGE("tgkill(%d, guest_tid=%ld, 63) = %ld errno=%d",
+                      (int)getpid(), (long)za_guest_tid, r, errno);
+        }
+        /* ★ 卡死判据改为「svc 派发停止推进」：SDK 在 svc 之间会重新屏蔽实时
+         *   信号 ⇒ 采样器送不进去（实测探针只在 boot 早期响过）⇒ 只能看
+         *   派发计数。10 秒无推进 = 自旋在客机代码里 ⇒ 发 SIGSEGV 让致命
+         *   处理器把当时的 PC/寄存器/栈整份倒出来（进程牺牲，答案到手）。 */
+        static unsigned long last_count;
+        static int no_progress;
+        unsigned long cnt = za_disp_count;
+        if (cnt == last_count)
+        {
+            if (++no_progress == 200)
+                ZLOGE("★ 客机 1 秒无 svc 推进（count=%lu）", cnt);
+            if (no_progress == 2000)
+            {
+                ZLOGE("★ 卡死 10 秒：向客机线程发 SIGSEGV 倒现场");
+                syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, 11);
+            }
+        }
+        else { last_count = cnt; no_progress = 0; }
         unsigned long long pc = za_guest_last_guest_pc;
-        if (pc) ZLOGI("客机 PC=%p 段=%s", (void *)(uintptr_t)pc, "");
+        if (pc && pc == stuck_pc) { if (++stuck_n == 40) ZLOGE("★ 客机 200ms 停在同一 PC=%#llx", pc); }
+        else { stuck_pc = pc; stuck_n = 0; }
     }
     return NULL;
 }

@@ -526,6 +526,9 @@ int za_sdk_load(za_mod_t *sdk,
                             (char *)base + ZA_SVC_GATE_BASE + ZA_SVC_GATE_SIZE);
     // ★ CNTPCT 替换桩 + hook 槽（0xc90000..0xc90700，见 5.8）：区域在门区之外，
     //   初始 mmap 是 RW ⇒ 不收紧就是 NX。mprotect 成 R+X。
+    //   ⚠ clear_cache 也必须做 —— 漏了就是「客机在桩区间弹跳」的实锤
+    //   （0xc9028c，看门狗 SIGSEGV 抓到的现行）。
+    __builtin___clear_cache((char *)base + 0xc90000, (char *)base + 0xc90700);
     mprotect(base + 0xc90000, 0x1000, PROT_READ | PROT_EXEC);
     mprotect(base, ZA_SDK_RODATA_OFF, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_SVC_GATE_BASE, ZA_SVC_GATE_SIZE, PROT_READ | PROT_EXEC);
