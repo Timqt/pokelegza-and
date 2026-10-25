@@ -31,6 +31,7 @@
 //   0x2F 以上（47/50/51/53/54/64/65/67/68/69/75/80/81/82/112/114）
 //   switchbrew 没列全，语义按「有出参就写 0，无出参就返回 0」处理。
 
+#define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -39,17 +40,21 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "za_common.h"
 #include "za_svc_patch.h"
 #include "za_guest_api.h"
+#include "za_guest_info.h"
 #include "za_mem.h"
 
 // SDK 映像基址/大小（定义在 za_guest.c）：崩溃与断言回溯时用来把地址换算成模块偏移
 extern volatile unsigned long za_sdk_base;
 extern volatile unsigned long za_sdk_size;
+// 主 NSO 映像基址（定义在 za_guest.c）
+extern unsigned char *za_guest_base;
 
 // trampoline 回写用的寄存器数组：index 0 = 结果(x0)，1..7 = x1..x7，
 // index 9 = 客机 sp，10 = 服务号，11 = 客机 x30（svc 调用点的返回地址，
@@ -340,6 +345,159 @@ static unsigned int za_current_owner_id(void)
     __builtin_memcpy(&oid, (void *)(self + 0x1b0), 4);
     return oid ? oid : fallback;
 }
+// ══════════════════════════════════════════════════════════════════
+//
+// 客机的 IPC 缓冲区就是它自己的**线程 IPC 缓冲**（TPIDRRO_EL0）。
+// 我们把客机里全部 123 处 `mrs Xt,TPIDRRO_EL0` 改写成 `adrp` 指向自建页
+// `za_ro_tls_page` ⇒ **这一页就是内核的应答缓冲区**，内核应答必须写回这里。
+//
+// 客机有两套 IPC 协议：
+//  ① 服务管理器 `sm:` / `sm:m` 走 **TIPC**（请求号在 Header0Tag 低 16 位）。
+//     实测反汇编（SDK text）：
+//       0x153ee0 nn::sm::Initialize  : TLS[0..8]=0x8000_0000_0000_0000,
+//                                     TLS[8]=1（SpecialHeader），svc#33 之后
+//                                     SDK 读 TLS[8] 要求 == 0（0x153f14/0x153f18）
+//       0x154014 nn::sm::GetServiceHandle: TLS[0..8]={0x11,0x02}，
+//                                     TLS[8..16]=服务名（8 字节小端打包），
+//                                     svc#33 之后 SDK 读
+//                                     TLS[0xc]=服务句柄、TLS[0x10]=返回码
+//                                     （0x154058 `ldp w8,w0,[x20,#0xc]`）
+//  ② 普通服务（fs/bsd/…）走 **CMIF**。请求头 "SFCI"(0x49434653) 写在 TLS+0
+//     （0x14eae4），应答头 "SFCO"(0x4F434653) 必须落在**某个 16 字节对齐的槽**
+//     上，且该槽 +0x8 的 u32 Result 必须为 0 —— 客机在 0x14eb60 校验：
+//         ldr w9,[x8] ; cmp w9,#0x4F434653 ; b.ne → 返回 0x1a80a
+//     不匹配 ⇒ 客机 nn::diag::detail::Abort(Result{0x1a80a}) ⇒ 崩溃。
+//
+//  ⚠ 槽位索引 idx 由客机自己从应答头解出来（0xc4b68 + 0x9a8f0），宿主无法
+//    静态预知 ⇒ 把同样的 16 字节 CmifOutHeader 模式填满前 0xf0 字节，
+//    无论客机挑哪个槽都能命中。0x1f8 是 SDK 的 `self` 槽，不能碰。
+
+#define ZA_FAKE_SVC_BASE 0x7000u   /* 我们伪造的服务句柄基址 */
+
+typedef struct
+{
+    const char *name;
+    int tipc;   /* 1 = 走 TIPC（sm:m），0 = 走 CMIF */
+} za_fake_svc_t;
+
+static const za_fake_svc_t g_fake_svcs[] = {
+    { "fs",      0 },
+    { "bsd",     0 },
+    { "sm:m",    1 },
+    { "nwm",     0 },
+    { "fssrv",   0 },
+    { "sfdnsres",0 },
+    { "diag",    0 },
+    { "pc",      0 },
+    { "wctl",    0 },
+    { "lm",      0 },
+};
+#define ZA_FAKE_SVC_N ((int)(sizeof(g_fake_svcs) / sizeof(g_fake_svcs[0])))
+
+// 名字 → 句柄；不认识的名字也返回一个「通用 CMIF 句柄」，
+// 免得 SDK 因为拿到 0 而直接失败。
+static unsigned int za_fake_svc_handle(const char *name)
+{
+    for (int i = 0; i < ZA_FAKE_SVC_N; i++)
+        if (strcmp(name, g_fake_svcs[i].name) == 0)
+            return ZA_FAKE_SVC_BASE + (unsigned int)i;
+    return ZA_FAKE_SVC_BASE + 0x100u;   /* 通用 CMIF */
+}
+
+// 句柄 → 是否 TIPC（-1 = 未知句柄）
+static int za_fake_svc_is_tipc(unsigned int h)
+{
+    if (h < ZA_FAKE_SVC_BASE) return -1;
+    unsigned int i = h - ZA_FAKE_SVC_BASE;
+    if (i == 0x100u) return 0;
+    if (i >= (unsigned int)ZA_FAKE_SVC_N) return -1;
+    return g_fake_svcs[i].tipc;
+}
+
+// 写 CMIF 应答。
+//
+// 实测（2026-10-25 真机）得到的客机请求布局（TLS 页，命令缓冲区）：
+//     +0x00 Header0Tag  {tag, 0,0,0,0}          例：0x00000007
+//     +0x04 Header1Tag  {RawCount, …, bit31=有 SpecialHeader}  例：0x00000008 / 0x8000000e
+//     +0x08 …            8 字节（SpecialHeader / ProcessId / 句柄）
+//     +0x10 CmifInHeader "SFCI"(0x49434653) / ver=1,resv=0 / MethodId / token
+//     +0x20 …            入参
+// ⇒ **应答的 CmifOutHeader 必须落在与请求 CmifInHeader 相同的偏移**（16 对齐），
+//   客机读应答时 x8 = align_down_16(TLS + idx*4)，idx 由应答头解出。
+//
+// ⚠ 不能把 "SFCO" 铺满整页：客机 0x14eb3c 有 `ldrh w8,[sp,#0xb2]; cmp w8,#0x41;
+//   b.hs trap` 的描述符合法性校验，头写错会直接 trap（第一版就是这么炸的）。
+//   所以这里：沿用请求的头，只把 "SFCI" 换成 "SFCO"。
+static void za_write_cmif_reply(unsigned long long ro, unsigned int hdr0, unsigned int hdr1)
+{
+    /* 取证：把请求的前 0x60 字节打出来 */
+    {
+        unsigned int w[12];
+        for (int i = 0; i < 12; i++)
+            memcpy(&w[i], (const void *)(uintptr_t)(ro + (unsigned long long)(i * 4)), 4);
+        ZLOGI("    req[0..0x30]=%08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+              w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+              w[8], w[9], w[10], w[11]);
+    }
+
+    /* 找 CMIF 请求头 "SFCI" 的位置 */
+    unsigned int cmif_off = 0;
+    for (unsigned int off = 0; off < 0x80; off += 4)
+    {
+        unsigned int w;
+        memcpy(&w, (const void *)(uintptr_t)(ro + (unsigned long long)off), 4);
+        if (w == 0x49434653u) { cmif_off = off; break; }
+    }
+    if (!cmif_off) cmif_off = 0x10;   /* 兜底 */
+
+    /* 应答头：沿用请求的头（Horizon 的应答头与请求头同形） */
+    memcpy((void *)(uintptr_t)(ro + 0), &hdr0, 4);
+    memcpy((void *)(uintptr_t)(ro + 4), &hdr1, 4);
+
+    /* CmifOutHeader：sig / version+reserved / Result=0 / InterfaceId=0 */
+    unsigned int cmif[4] = { 0x4F434653u, 0x00010000u, 0u, 0u };
+    memcpy((void *)(uintptr_t)(ro + cmif_off), cmif, sizeof cmif);
+    /* 返回值区：清零（fs 层结果 u16 = 0） */
+    memset((void *)(uintptr_t)(ro + cmif_off + 0x10), 0, 0x10);
+
+    ZLOGI("    CMIF in-header @TLS+%#x -> reply \"SFCO\" @TLS+%#x", cmif_off, cmif_off);
+}
+
+// 安全读一个客机地址（客机地址空间我们自己映射的，直接读也可能踩未映射页，
+// 所以走 process_vm_readv，失败就返回 0）
+static int za_h_read_word(unsigned long addr, unsigned long *out)
+{
+    struct iovec local, remote;
+    local.iov_base = out;
+    local.iov_len = sizeof *out;
+    remote.iov_base = (void *)(uintptr_t)addr;
+    remote.iov_len = sizeof *out;
+    ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    return n == (ssize_t)sizeof *out;
+}
+
+// 把客机地址换算成 "sdk+0x…" / "main+0x…"
+static const char *za_h_addrstr(unsigned long a)
+{
+    static char buf[4][64];
+    static int turn;
+    char *p = buf[turn = (turn + 1) & 3];
+    unsigned long sb = za_sdk_base, ss = za_sdk_size;
+    if (sb && a >= sb && a < sb + ss)
+    {
+        snprintf(p, 64, "sdk+%#lx", a - sb);
+        return p;
+    }
+    if (za_guest_base && a >= (unsigned long)za_guest_base &&
+        a < (unsigned long)za_guest_base + ZA_IMAGE_SIZE)
+    {
+        snprintf(p, 64, "main+%#lx", a - (unsigned long)za_guest_base);
+        return p;
+    }
+    snprintf(p, 64, "%#lx", a);
+    return p;
+}
+
 static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                                 long a4, long a5, long a6, long a7, long nr)
 {
@@ -460,7 +618,45 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     }
     case 44: // MapPhysicalMemory(addr=x0, size=x1)
     case 45: // UnmapPhysicalMemory(addr=x0, size=x1)
+    {
+        // ★ 必须真映射（2026-10-25 实测）：客机在 nn::os::detail::VammManager /
+        //   TransferMemoryImplByHorizon::MapImpl 里要 svc#44 把 0x410000000 这类
+        //   「alias 区」页面映射出来（调用点 SDK+0x14242c：`mov x0,x1; mov w1,#0x1000;
+        //   bl svc#44`），然后往里写图案（SDK+0x10ff78 `str x10,[x20]`）。
+        //   我们以前直接 return 0（假成功）⇒ 客机随后写未映射地址 ⇒ SIGSEGV。
+        //   参考成品 d2r-android 同样只允许 alias 区并真做 mprotect。
+        unsigned long addr = (unsigned long)a0;
+        unsigned long size = (unsigned long)a1;
+        if (!addr || !size)
+        {
+            ZLOGI("svc#%ld Map/Unmap 参数为空 addr=%#lx size=%#lx", nr, addr, size);
+            return 0;
+        }
+        if (nr == 44)
+        {
+            /* 已映射就只改权限；没映射就真 mmap 到这个地址 */
+            void *p = mmap((void *)addr, size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p == MAP_FAILED)
+            {
+                /* 已经有人占了这段地址（EEXIST）⇒ 只放开权限 */
+                if (mprotect((void *)addr, size, PROT_READ | PROT_WRITE) != 0)
+                {
+                    ZLOGI("svc#44 映射 %#lx+%#lx 失败 errno=%d", addr, size, errno);
+                    return (long)0xD401;   /* 越界/失败码 */
+                }
+            }
+            ZLOGI("svc#44 MapPhysicalMemory %#lx+%#lx -> ok", addr, size);
+        }
+        else
+        {
+            /* 只收回权限，不 munmap（这段可能与宿主其它映射共享） */
+            if (mprotect((void *)addr, size, PROT_NONE) != 0)
+                ZLOGI("svc#45 解除权限 %#lx+%#lx 失败 errno=%d", addr, size, errno);
+            ZLOGI("svc#45 UnmapPhysicalMemory %#lx+%#lx -> ok", addr, size);
+        }
         return 0;
+    }
     case 42: // FlushEntireDataCache
     case 43: // FlushDataCache(addr=x0, size=x1)
         return 0;
@@ -738,80 +934,85 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         return 0;
     }
 
-    // ── IPC（客机用不上真 IPC，给个空实现让它别崩）──
+// ══════════════════════════════════════════════════════════════════
+//  IPC（svc#33 SendSyncRequest）应答生成
+
+    // ── IPC（svc#33）：生成真正的应答 ──
     case 33: // SendSyncRequest(session=x0)
     {
-        // ★ 取证 + 关键修复（见本次补丁头部注释）
-        //
-        // 客机在 sdk+0x153edc 这样用 svc#33（反汇编实测）：
-        //     str  w8,[tp16+8]      ; = 1
-        //     ldr  w0,[0xb9c59c]    ; session
-        //     bl   svc#33
-        //     cbnz w0, error        ; 必须返回 0
-        //     ldr  w8,[tp16+8]
-        //     cbnz w8, error        ; ★ 必须变回 0
-        // 也就是说，**SendSyncRequest 的实现必须把 [tp16+8] 清 0**
-        // （真机上这由内核在完成 IPC 时写回「无挂起中断」）。
-        // 我们以前只 return 0，[tp16+8] 永远是 1 ⇒ 必走 error ⇒ abort("stdio")。
-        // ⚠ 不能用 `mrs TPIDRRO_EL0` 探测：客机里 123 处 `mrs` 已全部改写成
-        //   `adrp` 指向我们的只读 TLS 页；真实 TPIDRRO_EL0 在这个进程里本来就是 0
-        //   （安卓 bionic 不设置它）⇒ 用 mrs 探到 0 是「探针错」而不是「客机错」。
-        //   要看客机看到的内容，必须读**我们自己那一页**。
+        // ★ 见上面「IPC 应答生成」注释块：这一页（za_ro_tls_page）就是内核
+        //   的应答缓冲区，请求也在这里。
         unsigned long long ro = za_ro_tls_page;   // 由 za_sdk.c 在装载时填
-        unsigned int pre0 = 0, pre8 = 0, post8 = 0;
+        unsigned int hdr0 = 0, hdr1 = 0;
+        unsigned int sm_cnt = 0, sm_sess = 0;
         if (ro)
         {
-            memcpy(&pre0, (void *)(uintptr_t)(ro + 0), 4);
-            memcpy(&pre8, (void *)(uintptr_t)(ro + 8), 4);
-            // 真机上 IPC 完成后内核会把这个「挂起」位置 0；我们替它清，
-            // 否则客机在 sdk+0x153f18 的 `cbnz w8` 必然走 abort("stdio")。
-            unsigned int zero = 0;
-            memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
-            memcpy(&post8, (void *)(uintptr_t)(ro + 8), 4);
-
-            // ★ 命令缓冲区 = ro 页（x20 = TPIDRRO_EL0 已改写成 ro）。
-            //   sdk+0x154058 会 `ldp w8,w0,[x20,#0xc]` —— [ro+0xc] 必须是
-            //   IPC Result（0 = 成功），否则上层直接判失败。
-            memcpy((void *)(uintptr_t)(ro + 0xc), &zero, 4);
-
-            // ⚠ 曾在这里把 0x4F434653("SFCO") 写进 ro+0x10，实测**错位**：
-            //   Break 的值立刻从 0x1a80a 变成 0x4f434653 ⇒ 证明这块被客机
-            //   当成 **Result** 读走（0x154058 `ldp w8,w0,[x20,#0xc]`）。
-            //   所以这里只保证 Result=0，SFCO 要写在上层解析出的结构体里
-            //   （sdk+0x14eb60 的 x8 = [sp+0x90] + idx*4，对齐后读首字）。
+            memcpy(&hdr0, (void *)(uintptr_t)(ro + 0), 4);
+            memcpy(&hdr1, (void *)(uintptr_t)(ro + 4), 4);
         }
-        // SDK bss 里的 sm 计数/会话句柄（反汇编 0x153e54 / 0x153efc 得来）
-        unsigned int sm_cnt = 0, sm_sess = 0;
         if (za_sdk_base)
         {
             memcpy(&sm_cnt, (void *)(uintptr_t)(za_sdk_base + 0xb9c598), 4);
             memcpy(&sm_sess, (void *)(uintptr_t)(za_sdk_base + 0xb9c59c), 4);
         }
-        ZLOGI("svc#33 SendSyncRequest session=%#llx  ro=%p [ro+0]=%#x [ro+8] %#x->%#x  "
-              "sm.cnt=%u sm.sess=%u",
-              (unsigned long long)(unsigned int)a0, (void *)(uintptr_t)ro,
-              pre0, pre8, post8, sm_cnt, sm_sess);
-        // ★ 应答缓冲区定位探针
-        //   sdk+0x14eb60 用 `ldr w9,[x8]` 读应答首字并与 "SFCO"(0x4F434653) 比。
-        //   x8 = [sp+0x90] + idx*4，而 [sp+0x90] 在 sdk+0x14e92c 被 stp xzr,xzr 清零。
-        //   我们要写的就是那块。它落在客机栈上 —— 从 svc 时的 sp 往上/下扫，
-        //   找 0x120 字节全 0 的区域并打印候选，先看清楚再动手。
+        unsigned int sess = (unsigned int)a0;
+        unsigned int cmd = hdr0 & 0xffff;
+        unsigned int zero = 0;
+
+        if (ro && sm_sess && sess == sm_sess)
         {
-            unsigned long gsp = za_horizon_guest_sp();
-            static int n33;
-            if (n33 < 6 && gsp)
+            // ── TIPC：服务管理器 ──
+            if (cmd == 0x11)                                  // GetServiceHandle
             {
-                n33++;
-                ZLOGI("  resp-scan: guest sp=%p  head=%016llx %016llx %016llx %016llx",
-                      (void *)(uintptr_t)gsp,
-                      *(unsigned long long *)(uintptr_t)(gsp + 0x40),
-                      *(unsigned long long *)(uintptr_t)(gsp + 0x90),
-                      *(unsigned long long *)(uintptr_t)(gsp + 0xe0),
-                      *(unsigned long long *)(uintptr_t)(gsp + 0x130));
+                // ★ 必须**先读名字**再写结果：服务名就在 TLS+8（8 字节小端打包），
+                //   写结果会把同一个 4 字节覆盖掉（上一版就是在这儿把名字读成空的）。
+                char nm[9];
+                memset(nm, 0, sizeof nm);
+                memcpy(nm, (void *)(uintptr_t)(ro + 8), 8);
+                unsigned int h = za_fake_svc_handle(nm);
+                memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);      // result
+                memcpy((void *)(uintptr_t)(ro + 0xc), &h, 4);      // 服务句柄
+                memcpy((void *)(uintptr_t)(ro + 0x10), &zero, 4);   // 返回码
+                ZLOGI("  IPC TIPC GetServiceHandle(\"%s\") -> handle %#x", nm, h);
+            }
+            else
+            {
+                memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);   // result
+                memcpy((void *)(uintptr_t)(ro + 0xc), &zero, 4);
+                memcpy((void *)(uintptr_t)(ro + 0x10), &zero, 4);
+                ZLOGI("  IPC TIPC cmd=%#x hdr0=%#x hdr1=%#x -> ok", cmd, hdr0, hdr1);
             }
         }
-        // IPC 应答：sm 的 GetService 之类需要往缓冲区写回复。
-        // 目前最小实现：只保证结果码 0 + 清挂起位，让初始化流程能继续。
+        else if (ro && sess >= ZA_FAKE_SVC_BASE)
+        {
+            // ── CMIF：普通服务（fs 等）──
+            int tipc = za_fake_svc_is_tipc(sess);
+            if (tipc == 1)
+            {
+                // sm:m 也是 TIPC
+                memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
+                memcpy((void *)(uintptr_t)(ro + 0xc), &zero, 4);
+                memcpy((void *)(uintptr_t)(ro + 0x10), &zero, 4);
+                ZLOGI("  IPC TIPC(sm:m) cmd=%#x -> ok", cmd);
+            }
+            else
+            {
+                za_write_cmif_reply(ro, hdr0, hdr1);
+                ZLOGI("  IPC CMIF session=%#x hdr0=%#x hdr1=%#x -> reply written",
+                      sess, hdr0, hdr1);
+            }
+        }
+        else
+        {
+            // 未知会话：维持旧行为（清挂起位 + result 0）
+            if (ro)
+            {
+                memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
+                memcpy((void *)(uintptr_t)(ro + 0xc), &zero, 4);
+            }
+        }
+        ZLOGI("svc#33 SendSyncRequest session=%#x sm.cnt=%u sm.sess=%#x hdr0=%#x hdr1=%#x",
+              sess, sm_cnt, sm_sess, hdr0, hdr1);
         return 0;
     }
     case 34: // SendSyncRequestWithUserBuffer(buf=x0, size=x1, session=x2)
@@ -878,6 +1079,38 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 unsigned long w = *(const unsigned long *)(uintptr_t)(sp + i * 8);
                 if (sb && w >= sb && w < sb + sz)
                     ZLOGI("  客机栈[%d] = sdk+%#lx", i, w - sb);
+            }
+        }
+        // ★★ 断言调用者（决定性证据）★★
+        // 客机断言走 nn::diag::detail::Abort(const nn::Result*)，它的 prologue 是
+        //     0x9c560: stp x29, x30, [sp, #-0x10]!
+        //     0x9c564: mov x29, sp
+        //     0x9c568: mov x1, x0        ; info = &Result
+        //     0x9c56c: mov w0, wzr       ; reason = 0
+        //     0x9c570: mov w2, #4        ; size = 4
+        //     0x9c574: bl  0x17018c      ; svc #0x26 (Break)
+        // ⇒ Break 现场 sp 就是 Abort 的栈帧：
+        //     [sp+0] = Abort 保存的 x29（调用者的帧指针）
+        //     [sp+8] = Abort 的返回地址 = **调用 Abort 的那个 SDK 函数里的指令**
+        // 再从 x29 链往上走，就能拿到整条调用栈。
+        {
+            unsigned long sp = za_horizon_regs[ZA_REG_SP];
+            unsigned long caller_ret = 0, caller_fp = 0;
+            if (sp && za_h_read_word(sp + 8, &caller_ret))
+            {
+                ZLOGI("  ★ Abort 调用者 = %s", za_h_addrstr(caller_ret));
+            }
+            if (sp && za_h_read_word(sp, &caller_fp) && caller_fp)
+            {
+                unsigned long fp = caller_fp;
+                for (int i = 0; i < 12 && fp; i++)
+                {
+                    unsigned long nfp = 0, ret = 0;
+                    if (!za_h_read_word(fp, &nfp) || !za_h_read_word(fp + 8, &ret)) break;
+                    ZLOGI("  ★ frame[%d] ret=%s", i, za_h_addrstr(ret));
+                    if (!nfp || (nfp & 0xF) || nfp <= fp) break;
+                    fp = nfp;
+                }
             }
         }
         return 0;

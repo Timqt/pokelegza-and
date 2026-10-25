@@ -202,6 +202,205 @@ static void za_log_raw(int sig, unsigned long pc, unsigned long off, const char 
 // 客机栈回溯：把栈上所有落在 main/sdk 映像里的字找出来（= 返回地址）。
 // ⚠ 必须**分块读**（一次 64KB 往上扫，最多 8MB）：
 //   崩溃点离上个栈帧可能几 MB（中间是 SDK 的大局部数组），只扫 4KB 会看到一片假帧。
+// ── Break(svc#38) 现场取证 ─────────────────────────────────────────
+//
+// 客机 nn::diag::detail::Abort(const nn::Result*) 在 **SDK text+0x9c560**：
+//     0x9c560: stp x29,x30,[sp,#-0x10]!
+//     0x9c564: mov  x29,sp
+//     0x9c568: mov  x1,x0          ← x1 = Result*（断言结果）
+//     0x9c56c: mov  w0,wzr         ← x0 = reason = 0（AssertionFailed）
+//     0x9c570: mov  w2,#0x4        ← x2 = size = 4
+//     0x9c574: bl   0x17018c       ← 那里是**叶子**包装：svc #0x26 ; ret（无栈帧）
+//     0x9c578: nop
+//
+// ⇒ svc 现场（gate 入口）：
+//     x30 = 0x9c578            （在 Abort 内部，**不是** Abort 的调用者）
+//     sp  = Abort 的栈帧       （gate 改的是包装函数入口，客机 sp 不变）
+//     [sp+0] = Abort 保存的 x29 = **调用者的帧指针**
+//     [sp+8] = Abort 保存的 x30 = **调用 Abort 的那个函数的返回地址**
+//                （= 调用者里 bl 之后那条指令的地址 ⇒ 直接指出是哪个 assert）
+//
+// 之后按 x29 链往上走：fp=[fp], ret=[fp+8]。
+extern volatile unsigned long za_horizon_regs[32];
+
+static void za_dump_break_ctx(void)
+{
+    char line[256];
+    unsigned long sp = za_horizon_regs[9];    // 客机 sp（gate 入口处）
+    unsigned long x30 = za_horizon_regs[11];  // 客机 x30
+    unsigned long x29 = za_horizon_regs[17];  // 客机 x29
+    unsigned long info = za_horizon_regs[1];  // Break 的第 2 参 = nn::Result*
+    unsigned long size = za_horizon_regs[2];  // Break 的第 3 参 = 4
+
+    {
+        char *p = line;
+        p = za_put_str(p, "ZaGuest: break-ctx svc#38 sp=");
+        p = za_put_hex(p, sp);
+        p = za_put_str(p, " x30=");
+        p = za_put_addr(p, x30);
+        p = za_put_str(p, " x29=");
+        p = za_put_addr(p, x29);
+        p = za_put_str(p, " info=");
+        p = za_put_hex(p, info);
+        p = za_put_str(p, " size=");
+        p = za_put_dec(p, size);
+        p = za_put_str(p, "\n");
+        za_fatal_write(line, (size_t)(p - line));
+    }
+    if (!sp) return;
+
+    // sp 附近的原始字：sp+0 = Abort 的 x29，sp+8 = Abort 的 x30（= 调用者返回地址）
+    for (int i = 0; i <= 4; i++)
+    {
+        unsigned long w = 0;
+        if (!za_read_word(sp + (unsigned long)i * 8, &w)) break;
+        char *p = line;
+        p = za_put_str(p, "ZaGuest: break-ctx sp+");
+        p = za_put_hex(p, (unsigned long long)i * 8);
+        p = za_put_str(p, "=");
+        p = za_put_addr(p, w);
+        p = za_put_str(p, " raw=");
+        p = za_put_hex(p, w);
+        p = za_put_str(p, "\n");
+        za_fatal_write(line, (size_t)(p - line));
+    }
+
+    // frame[0] = Abort 的调用者返回地址（[sp+8]），frame 链从 Abort 保存的 x29（[sp+0]）起
+    {
+        unsigned long fp = 0, ret = 0;
+        if (za_read_word(sp + 0, &fp) && za_read_word(sp + 8, &ret))
+        {
+            char *p = line;
+            p = za_put_str(p, "ZaGuest: break-ctx frame[0] ret=");
+            p = za_put_addr(p, ret);
+            p = za_put_str(p, " fp=");
+            p = za_put_addr(p, fp);
+            p = za_put_str(p, "\n");
+            za_fatal_write(line, (size_t)(p - line));
+            // 往上 2~3 层
+            for (int i = 1; i <= 6 && fp; i++)
+            {
+                unsigned long nf = 0, nr = 0;
+                if (!za_read_word(fp, &nf)) break;
+                if (!za_read_word(fp + 8, &nr)) break;
+                p = line;
+                p = za_put_str(p, "ZaGuest: break-ctx frame[");
+                p = za_put_dec(p, (unsigned long long)i);
+                p = za_put_str(p, "] ret=");
+                p = za_put_addr(p, nr);
+                p = za_put_str(p, " fp=");
+                p = za_put_addr(p, nf);
+                p = za_put_str(p, "\n");
+                za_fatal_write(line, (size_t)(p - line));
+                if (!nf || nf <= fp) break;   // 链断
+                fp = nf;
+            }
+        }
+    }
+
+    // nn::Result 附近的原始字节（info 指向 4 字节 Result，前后各 32 字节）
+    if (info)
+    {
+        static unsigned char raw[64];
+        unsigned long base = info >= 32 ? info - 32 : 0;
+        if (za_read_bytes(base, raw, sizeof raw))
+        {
+            for (int r = 0; r < 4; r++)
+            {
+                char *p = line;
+                p = za_put_str(p, "ZaGuest: break-ctx raw[");
+                p = za_put_hex(p, (unsigned long long)(r * 16));
+                p = za_put_str(p, "]=");
+                for (int k = 0; k < 16; k++)
+                {
+                    static const char dg[] = "0123456789abcdef";
+                    *p++ = dg[raw[r * 16 + k] >> 4];
+                    *p++ = dg[raw[r * 16 + k] & 0xF];
+                }
+                p = za_put_str(p, "\n");
+                za_fatal_write(line, (size_t)(p - line));
+            }
+        }
+    }
+}
+
+// ── x29 帧链遍历（AAPCS64）──────────────────────────────────────────
+// 每个帧：[x29+0]=上一层的 x29，[x29+8]=上一层的 x30（返回地址）。
+// 沿链走就是精确调用序列 —— 这是唯一能区分「真返回地址」和「栈上垃圾」的办法。
+// 之前只做「sp 往上扫客机地址」，混进大量数据/局部变量，据此推理连错三轮。
+static void za_dump_fp_chain(unsigned long fp, unsigned long pc, unsigned long sp)
+{
+    char line[256];
+    {
+        char *p = line;
+        p = za_put_str(p, "ZaGuest: fp-chain enter fp=");
+        p = za_put_hex(p, (unsigned long long)fp);
+        p = za_put_str(p, " sp=");
+        p = za_put_hex(p, (unsigned long long)sp);
+        p = za_put_str(p, "\n");
+        za_fatal_write(line, (size_t)(p - line));
+    }
+    // 先报当前 PC（abort 现场本身）
+    {
+        char *p = line;
+        unsigned long bm = (unsigned long)za_guest_base, sm = za_sdk_base;
+        if (sm && pc >= sm && pc < sm + za_sdk_size)
+        {
+            p = za_put_str(p, "ZaGuest:   frame[00] pc sdk+");
+            p = za_put_hex(p, (unsigned long long)(pc - sm));
+        }
+        else if (bm && pc >= bm && pc < bm + ZA_IMAGE_SIZE)
+        {
+            p = za_put_str(p, "ZaGuest:   frame[00] pc main+");
+            p = za_put_hex(p, (unsigned long long)(pc - bm));
+        }
+        else
+        {
+            p = za_put_str(p, "ZaGuest:   frame[00] pc outside");
+            p = za_put_hex(p, (unsigned long long)pc);
+        }
+        p = za_put_str(p, "\n");
+        za_fatal_write(line, (size_t)(p - line));
+    }
+
+    unsigned long bm = (unsigned long)za_guest_base, sm = za_sdk_base;
+    for (int i = 1; i <= 24; i++)
+    {
+        // 帧指针必须 16 字节对齐、且在栈区里，否则视为链断
+        if (!fp || (fp & 0xF) || (sp && fp < sp - 0x10000)) break;
+        unsigned long next_fp = 0, ret = 0;
+        if (!za_read_word(fp, &next_fp)) break;
+        if (!za_read_word(fp + 8, &ret)) break;
+        // next_fp 必须递增且对齐，否则链坏
+        if (next_fp && (next_fp & 0xF)) break;
+        if (next_fp && next_fp <= fp) break;
+
+        char *p = line;
+        p = za_put_str(p, "ZaGuest:   frame[");
+        p = za_put_dec(p, (unsigned long long)i);
+        p = za_put_str(p, "] ret=");
+        if (sm && ret >= sm && ret < sm + za_sdk_size)
+        {
+            p = za_put_str(p, "sdk+");
+            p = za_put_hex(p, (unsigned long long)(ret - sm));
+        }
+        else if (bm && ret >= bm && ret < bm + ZA_IMAGE_SIZE)
+        {
+            p = za_put_str(p, "main+");
+            p = za_put_hex(p, (unsigned long long)(ret - bm));
+        }
+        else
+        {
+            p = za_put_hex(p, (unsigned long long)ret);
+        }
+        p = za_put_str(p, "  fp=");
+        p = za_put_hex(p, (unsigned long long)next_fp);
+        p = za_put_str(p, "\n");
+        za_fatal_write(line, (size_t)(p - line));
+        fp = next_fp;
+    }
+}
+
 static void za_log_guest_trace(unsigned long sp)
 {
     unsigned long bm = (unsigned long)za_guest_base, sm = za_sdk_base;
@@ -608,6 +807,10 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
         za_dump_pc_ring();
         // 帧快照：0x14457c 三条 svc 各自时刻的整帧
         za_dump_frame_snap();
+        // x29 帧链：精确调用序列（优先看这个，不要看下面 sp 扫描的混合值）
+        za_dump_fp_chain((unsigned long)uc->uc_mcontext.regs[29],
+                         (unsigned long)pc,
+                         (unsigned long)uc->uc_mcontext.sp);
         za_log_guest_trace((unsigned long)uc->uc_mcontext.sp);
         za_log_stack((unsigned long)uc->uc_mcontext.sp);
     }
@@ -666,6 +869,14 @@ static unsigned long za_svc41_counters[32];
 void za_svc_count(long nr)
 {
     if (nr >= 0 && nr < 256) __atomic_add_fetch(&za_svc_counters[nr], 1, __ATOMIC_RELAXED);
+    // ★ svc#38 = Horizon Break：客机断言（nn::diag::detail::Abort）走这条路。
+    //   每次 svc 都会经过这里（za_horizon.c 的分派体里），所以能拿到**第一现场**：
+    //   客机 sp / x30，以及 [sp+8] = 调用 Abort 的那个函数的返回地址。
+    if (nr == 38)
+    {
+        static int n = 0;
+        if (n < 3) { n++; za_dump_break_ctx(); }   // 客机可能反复 Abort，只打前 3 次
+    }
 }
 unsigned long za_svc_count_take(long nr)
 {
