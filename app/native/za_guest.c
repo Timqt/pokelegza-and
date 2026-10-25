@@ -1487,6 +1487,17 @@ unsigned long za_tls_mrs_hook(void)
     return za_os_guest_tls_area();
 }
 
+// fs 模块的宿主分配器（main 的 fs 分配器桩被劫持到这里）。
+// 客机与本进程同地址空间 ⇒ 宿主堆内存客机可直接读写。
+void *za_fs_alloc_host(unsigned long size)
+{
+    return malloc((size_t)size);
+}
+void za_fs_free_host(void *p)
+{
+    free(p);
+}
+
 // ── 基址重定位 ──────────────────────────────────────────────────
 // NSO 里**一条 RELATIVE 重定位都没有**：.data 里的模块内指针要自己加基址。
 // 判据：0x1000 <= v < 映像大小 ⇒ 视为模块内指针。
@@ -1556,11 +1567,38 @@ int za_guest_relocate(unsigned char *base, za_guest_t *out)
           (void *)base, (unsigned)ZA_IMAGE_SIZE, (unsigned)ZA_RELOC_COUNT,
           resolved, stubbed, missing);
 
+    // ★ fs 分配器桩劫持到宿主 malloc/free。
+    //   main 交给 nn::fs 的两个桩（main+0x19e8c68 alloc / +0x19e8c84 free）都
+    //   经过游戏自己的全局分配器对象（main+0x3de4b90）→ 表（main+0x3af0ac8）
+    //   → [表+0x10]/[表+0x18]。实测该两槽运行时是 0x20/0x98（**不是函数**，
+    //   且 main 的 1912 个静态构造器在我们的启动顺序里根本还没跑）⇒ alloc/free
+    //   双双 br 0x20 崩。fs 模块只用这块内存做路径/缓冲，宿主内存客机可直接
+    //   读写 ⇒ 直接换成 malloc/free，语义等价且绕开游戏分配器。
+    {
+        unsigned int *a = (unsigned int *)(base + 0x19e8c68);
+        unsigned int *f = (unsigned int *)(base + 0x19e8c84);
+        unsigned long long ap = (unsigned long long)(uintptr_t)&za_fs_alloc_host;
+        unsigned long long fp = (unsigned long long)(uintptr_t)&za_fs_free_host;
+        /* movz x16,#lo16 ; movk x16,#m16,lsl16 ; movk x16,#m32,lsl32 ; br x16 */
+        a[0] = 0xD2800000u | (unsigned int)((ap & 0xFFFFu) << 5) | 16u;
+        a[1] = 0xF2A00000u | (unsigned int)(((ap >> 16) & 0xFFFFu) << 5) | 16u;
+        a[2] = 0xF2C00000u | (unsigned int)(((ap >> 32) & 0xFFFFu) << 5) | 16u;
+        a[3] = 0xD61F0200u;                                  /* br x16 */
+        f[0] = 0xD2800000u | (unsigned int)((fp & 0xFFFFu) << 5) | 16u;
+        f[1] = 0xF2A00000u | (unsigned int)(((fp >> 16) & 0xFFFFu) << 5) | 16u;
+        f[2] = 0xF2C00000u | (unsigned int)(((fp >> 32) & 0xFFFFu) << 5) | 16u;
+        f[3] = 0xD61F0200u;
+        __builtin___clear_cache((char *)a, (char *)a + 16);
+        __builtin___clear_cache((char *)f, (char *)f + 16);
+        ZLOGI("fs 分配器桩 → 宿主：alloc=%p free=%p", (void *)za_fs_alloc_host,
+              (void *)za_fs_free_host);
+    }
     // 段权限收紧：text=RX / rodata=R / data=RW
     mprotect(base + ZA_TEXT_OFF, ZA_TEXT_SIZE, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_RODATA_OFF, ZA_DATA_OFF - ZA_RODATA_OFF, PROT_READ);
     mprotect(base + ZA_DATA_OFF, (ZA_DATA_SIZE + ZA_BSS_SIZE + 0xFFF) & ~0xFFFul,
              PROT_READ | PROT_WRITE);
+
     ZLOGI("段权限: text=RX rodata=R data=RW");
     return 0;
 }
