@@ -33,6 +33,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <linux/futex.h>
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -277,6 +278,9 @@ static const char *za_svc_name(long nr)
     case 44: return "MapPhysicalMemory";
     case 45: return "UnmapPhysicalMemory";
     case 47: return "GetSystemInfo-ish";
+    case 52: return "WaitForAddress";
+    case 53: return "SignalToAddress";
+    case 54: return "SyncToAddress";
     case 75: return "Unknown75";
     case 80: return "Unknown80";
     case 81: return "Unknown81";
@@ -1324,6 +1328,56 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     case 28: // WaitProcessWideKeyAtomic(addr=x0, key=x1, tag=w2, timeout=x3)
     case 29: // SignalProcessWideKey(key=x0, count=w1)
         return 0;
+
+    // ── 地址等待/唤醒（nn::os 的用户态 futex 算法）──────────────────
+    // 实测（SDK+0x13b2xx，nn::os 的 mutex/条件变量实现）：
+    //     13b2d4: ldar w8,[x21] ; cmp w8,#2 ; b.eq 重等      （2 = contended）
+    //     13b320: mov x0,x21 ; mov w1,#2 ; mov w2,#1 ; x3=-1 ; svc#52
+    //   ⇒ svc#52 = WaitForAddress(addr, type, value, timeout)。
+    //   type 语义（与内核一致）：仅当条件成立才阻塞，否则立刻返回 0xFA01(InvalidState)：
+    //     0 = Equal(==)  1 = LessThan(<)  2 = GreaterThan(>)  3 = NotEqual(!=)
+    //   实测 w1=2、w2=1、字值=2 ⇒ 等待 "word > 1"，与调用方的循环完全吻合。
+    //   svc#53 = SignalToAddress(addr, type, value)：唤醒该地址上的等待者。
+    case 52: // WaitForAddress(addr=x0, type=w1, value=w2, timeout=x3)
+    {
+        unsigned int *p = (unsigned int *)(uintptr_t)a0;
+        if (!p) return 0xFA01u;
+        int type = (int)a1;
+        unsigned int v = (unsigned int)a2;
+        long long ns = (long long)a3;      // 纳秒，< 0 = 无限
+        for (;;)
+        {
+            unsigned int cur = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+            int wait;
+            switch (type)
+            {
+                case 0: wait = (cur == v); break;   // Equal
+                case 1: wait = (cur <  v); break;   // LessThan
+                case 2: wait = (cur >  v); break;   // GreaterThan
+                default: wait = (cur != v); break;  // NotEqual
+            }
+            if (!wait) return 0xFA01u;              // InvalidState ⇒ 调用方用新值重试
+            struct timespec ts, *tsp = NULL;
+            if (ns >= 0)
+            {
+                ts.tv_sec = (time_t)(ns / 1000000000LL);
+                ts.tv_nsec = (long)(ns % 1000000000LL);
+                tsp = &ts;
+            }
+            int rc = (int)syscall(SYS_futex, (int *)p, FUTEX_WAIT_PRIVATE, (int)cur, tsp, NULL, 0);
+            if (rc == 0) return 0;                  // 被唤醒
+            if (errno == EAGAIN || errno == EINTR) continue;   // 值变了/被信号打断 ⇒ 重判
+            return 0xEA01u;                         // 超时等
+        }
+    }
+    case 53: // SignalToAddress(addr=x0, type=w1, value=w2)
+    {
+        // 唤醒该地址上的所有等待者；type/value 的过滤由等待者自己重判条件完成
+        // （内核按条件过滤，这里多唤醒是安全的：条件不成立的会立刻再睡）。
+        unsigned int *p = (unsigned int *)(uintptr_t)a0;
+        if (p) syscall(SYS_futex, (int *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
+        return 0;
+    }
 
     // ── 句柄 / 共享内存 ──
     case 19: // MapSharedMemory(handle=x0, addr=x1, size=x2, perm=w3)
