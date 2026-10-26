@@ -68,6 +68,22 @@ def pick_device():
     return cands[0][0] if cands else None
 
 
+# ---------------------------------------------------------------- fs 打开的文件
+# 客机静态构造函数会调 nn::fs::OpenFile。我们的 fs 垫片对每个路径都会打一行：
+#   ★ fs::OpenFile out=… path="…" mode=… ⇒ 内嵌文件（… 字节…）
+#   ★ fs::OpenFile out=… path="…" mode=… ⇒ 未知文件，返回空文件（假句柄 1）
+# 下一轮只要跑一次，就能从报告里看到它到底开了哪些文件、哪些命中了内嵌数据。
+FS_OPEN_RE = re.compile(r'★ fs::OpenFile.*?path="([^"]*)".*?⇒\s*(内嵌文件|未知文件)')
+
+
+def fs_open_summary(lg):
+    from collections import Counter
+    c = Counter()
+    for m in FS_OPEN_RE.finditer(lg or ""):
+        c[(m.group(1), m.group(2))] += 1
+    return c
+
+
 # ---------------------------------------------------------------- 检查清单
 # 每一项： (编号, 标题, 判定函数(logcat文本, 崩溃文本, 崩溃信息dict) -> bool, 说明)
 MILESTONES = [
@@ -278,6 +294,11 @@ def main():
     qm = re.findall(r"svc#6 QueryMemory addr=(\S+) -> base=(\S+) size=(\S+) state=(\S+)", lg)
     for q in qm[:4]:
         print(f"  QueryMemory addr={q[0]} base={q[1]} size={q[2]} state={q[3]}")
+    fs_sum = fs_open_summary(lg)
+    if fs_sum:
+        print("  fs 打开的文件：")
+        for (path, kind), n in fs_sum.most_common(12):
+            print(f"    [{kind}] {path} ×{n}")
     ret = re.findall(r"guest ret@\+(\S+) (\S+)", gcb)
     if ret:
         print("  客机调用链：" + " ← ".join(f"{m}+{o}" for o, m in ret))
@@ -306,6 +327,7 @@ def main():
             "c41_max": info.get("c41_max"),
             "stack_overflow": info.get("stack_overflow"),
             "tls_patched": info.get("tls_patched"),
+            "fs_open": [{"path": p, "kind": k, "n": n} for (p, k), n in fs_sum.most_common(20)],
             "milestones": {c: ok for c, t, k, ok, n in rows if c.startswith("M")},
             "health": {c: ok for c, t, k, ok, n in rows if c.startswith("H")},
             "report": os.path.relpath(md, ROOT).replace("\\", "/"),
