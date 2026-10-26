@@ -1384,6 +1384,15 @@ void za_os_install_tls_descriptor(void)
         *(unsigned int *)(ro2 + 0x1b0) = (unsigned int)syscall(SYS_gettid);
         st->ro = ro;
     }
+    // 自检：写进去的 [TP+0x40] 是否真的读得回来，以及 helper 公式算出的地址
+    {
+        unsigned long long rd = 0;
+        memcpy(&rd, (unsigned long long *)((unsigned long)b + 0x40), 8);
+        unsigned long long slot = 0;
+        if (rd) memcpy(&slot, (void *)(uintptr_t)(rd + 0x98), 8);
+        ZLOGI("客机 TLS 自检: [TP+0x40]=%#llx（应=%p） slot=%#llx ⇒ A=%#llx（应=%p）",
+              rd, (void *)hdr, slot, rd + slot * 8, (void *)area_p);
+    }
     ZLOGI("客机 TLS: tp=%p 变量区=%p RO页=%p", b, t, st->ro);
 
     // ── 探针：[tp+0x40] 能否当「每线程 TLS 基址指针」槽 ──────────────
