@@ -1794,9 +1794,14 @@ static void za_hid_noop(void) { }
 // 路径按「后缀」匹配，忽略 rom:/ 之类的挂载前缀。
 // ⚠ 其余路径仍然返回「空文件」；接真正的 romfs 后端后整块撤掉。
 typedef struct { const char *path; const unsigned char *data; unsigned long size; } za_embed_file_t;
+// 未知的 .json（存档/用户配置）返回合法的空对象 "{}"。
+// 空文件不是合法 JSON，解析器会直接失败；"{}" 至少能让它走默认值分支。
+static const unsigned char za_embed_empty_json[2] = { '{', '}' };
+
 static const za_embed_file_t za_embed_files[] = {
     { "system/config/data/trinity_config.trowc",
       za_romfs_trinity_config_trowc, ZA_ROMFS_TRINITY_CONFIG_SIZE },
+    { ".json", za_embed_empty_json, 2 },
 };
 #define ZA_EMBED_N ((int)(sizeof za_embed_files / sizeof za_embed_files[0]))
 #define ZA_EMBED_HANDLE_BIT 0x80000000u
