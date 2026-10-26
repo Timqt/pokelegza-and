@@ -1644,6 +1644,8 @@ static void za_load_host_libs(void)
 #define ZA_MPROBE_SLOT  0x6049000u
 static void za_hook_m_poolinit(unsigned long long *r);
 static void za_hook_m_poolloop(unsigned long long *r);
+static void za_hook_m_w2(unsigned long long *r);
+static void za_hook_m_w3(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
                                   void (*hook)(unsigned long long *));
@@ -1762,6 +1764,8 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
     {
         za_install_main_probe(base, 0x1653cc0, ZA_MPROBE_STUB,        ZA_MPROBE_SLOT,        za_hook_m_poolinit);
         za_install_main_probe(base, 0x1653d00, ZA_MPROBE_STUB + 0x80, ZA_MPROBE_SLOT + 0x08, za_hook_m_poolloop);
+        za_install_main_probe(base, 0x1a0a204, ZA_MPROBE_STUB + 0x100, ZA_MPROBE_SLOT + 0x10, za_hook_m_w2);
+        za_install_main_probe(base, 0x1bab754, ZA_MPROBE_STUB + 0x180, ZA_MPROBE_SLOT + 0x18, za_hook_m_w3);
         __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x100);
         mprotect(base + ZA_MPROBE_STUB, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
@@ -1899,6 +1903,21 @@ static void za_hook_m_poolinit(unsigned long long *r)
     if (n++ >= 6) return;
     ZLOGI("★ main 探针 pool-init: desc=%#llx stride=%#llx base=%#llx size=%#llx",
           r[0], r[1], r[2], r[3]);
+}
+// worker 线程实际执行的 main 函数（登录参数和调用者）
+static void za_hook_m_w2(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 8) return;
+    ZLOGI("★ main 探针 w2(0x1a0a204): x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx",
+          r[0], r[1], r[2], r[3], r[19]);
+}
+static void za_hook_m_w3(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 8) return;
+    ZLOGI("★ main 探针 w3(0x1bab754): x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx",
+          r[0], r[1], r[2], r[3], r[19]);
 }
 // 循环入口（main+0x1653d00）：x0=desc(+0x18 stride,+0x1c count), x2=base, x8=stride/8
 static void za_hook_m_poolloop(unsigned long long *r)
