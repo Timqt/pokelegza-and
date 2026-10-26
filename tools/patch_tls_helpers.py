@@ -96,10 +96,15 @@ def main():
         #   adrp dst2, <描述符区页>  ; nop
         # 原代码只允许 dst2 == src2 ⇒ and 形态（main 里那种）一处都匹配不到。
         off = i * 4
-        page_delta = TLS_DESC_OFF - (off & ~0xFFF)
-        # mrs 位置写 adrp dst2（把描述符区页地址直接放进 dst2），掩码位置写 nop；
-        # 这样无论原来是 ubfm 还是 and，dst2 都直接等于描述符区基址。
-        patches.append((off, adrp_x(dst2, page_delta), 0xD503201F))
+        # ★ 2026-10-26：改成**每线程**取基址。
+        #   mrs 保持原样（x_src = TPIDR_EL0），掩码位置改成
+        #       ldr  dst2, [src1, #0x40]
+        #   [TP+0x40] 是 bionic 8 个 TCB 槽之后的第一个空闲位（实测三个线程
+        #   都是已映射的 0），宿主在每线程 install 时写进该线程的「头页 D」。
+        #   后续原代码仍做 `ldr x9,[dst2,#0x98]` / `add dst2,dst2,x9,lsl#3`：
+        #   D+0x98 = (area-D)/8 ⇒ 结果正好是该线程的 TLS 变量区。
+        patches.append((off, 0xD53BD040 | src1,
+                        0xF9400000 | ((0x40 // 8) << 10) | (src1 << 5) | dst2))
 
     print("TLS helper 改写点：%d 处" % len(patches))
     with open(OUT_H, "w", encoding="utf-8", newline="\n") as o:

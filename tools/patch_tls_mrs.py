@@ -127,30 +127,29 @@ def main():
         sites.append((off, n, w))
     print("main 里 mrs Xt, TPIDR_EL0 共 %d 处" % len(sites))
 
-    # 生成替换序列：每条 = 5 条指令（固定步长），原位置写 b <桩>
-    STRIDE_INSNS = 5
-    V_ADDR = TLS_VAR_OFF            # 客机 TLS 变量区（与 helper 改写同一块）
+    # 生成替换序列：每条 = 7 条指令（固定步长），原位置写 b <桩>
+    #   stur x16,[sp,#-8] ; mrs x16,tpidr ; ldr x16,[x16,#0x40]
+    #   add x16,x16,#0x1000 ; mov Xt,x16 ; ldur x16,[sp,#-8] ; b site+4
+    # [tp+0x40] = 本线程头页 D，D+0x1000 = 本线程 TLS 变量区。
+    # ⚠ 只用红区 + 不调宿主函数 ⇒ x30 不会被破坏（mrs 只该写目标寄存器）。
+    STRIDE_INSNS = 7
     blob = bytearray()
     entries = []
     for off, n, orig in sites:
         stub_pc = STUB_OFF + len(blob)
-        seq = []
         if n == 16:
-            # 目标就是 x16：mrs 本来就会覆盖它，不必保存
-            seq += [NOP, 0, NOP, NOP]
+            # 目标就是 x16：mrs 本来就会覆盖，不需要保存
+            seq = [NOP, 0xD53BD050, 0xF9402210, 0x91400610, NOP, NOP, 0]
         else:
-            seq += [enc_stur(16, 31, -8), 0, enc_mov(n, 16), enc_ldur(16, 31, -8)]
-        seq.append(0)                    # b 回原址+4，下面统一回填
+            seq = [0xF81F83F0, 0xD53BD050, 0xF9402210, 0x91400610,
+                   enc_mov(n, 16), 0xF85F83F0, 0]
         assert len(seq) == STRIDE_INSNS
         entries.append([off, orig, stub_pc, seq])
         for w in seq:
             blob.extend(struct.pack("<I", w))
 
-    # 回填每条序列的 adrp + 末尾 b
     for off, orig, stub_pc, seq in entries:
         idx = (stub_pc - STUB_OFF) // 4
-        adrp = enc_adrp(16, stub_pc + 4, V_ADDR)
-        struct.pack_into("<I", blob, (idx + 1) * 4, adrp)
         b_insn = enc_b(stub_pc + (STRIDE_INSNS - 1) * 4, off + 4)
         struct.pack_into("<I", blob, (idx + STRIDE_INSNS - 1) * 4, b_insn)
 

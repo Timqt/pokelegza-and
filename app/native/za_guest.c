@@ -1290,7 +1290,9 @@ void za_os_install_tls_descriptor(void)
     // 客机算 `add x8, tp16, x9, lsl #3`，x9 是 **32 位有符号偏移**
     // ⇒ 变量区必须落在 tp16 + (int32 范围) 内，且越近越好；bionic 上方多半被占，
     //   所以逐页往上找空位（找不到就退回任意地址并明确报出来）。
-    size_t area = 4 * 1024 * 1024;
+    // ★ 每线程块 = [头页 D(4KB)] [TLS 变量区 A(4MB)] [RO 页 ...]
+    //   [TP+0x40] = D；D+0x98 = (A-D)/8 ⇒ helper 的 `ldr; add` 自然算出 A。
+    size_t area = 4 * 1024 * 1024 + 0x1000;
     void *t = MAP_FAILED;
     for (unsigned long k = 0x8000; k <= 0x400000; k += 0x4000)
     {
@@ -1309,7 +1311,23 @@ void za_os_install_tls_descriptor(void)
     za_tls_state_t *st = za_tls_cur();
     st->tp16 = (unsigned long)b16;      // 仅诊断：不要拿它去读写内存
     st->tp = b;
-    st->area = t;
+    unsigned char *hdr = (unsigned char *)t;          // 头页 D
+    unsigned char *area_p = hdr + 0x1000;             // TLS 变量区 A
+    st->area = area_p;
+    // D+0x98 = (A-D)/8 ⇒ 客机 helper 的 `ldr x9,[D,#0x98]; add D,x9,lsl#3` = A
+    *(unsigned long long *)(hdr + 0x98) = (unsigned long long)((area_p - hdr) / 8);
+    // 有些站点把「TPIDR & ~0x1FFF」当线程上下文对象用（ldr [ctx]; ldr [ctx+0x10]; blr）
+    // ⇒ D[0] 放一个最小 vtable（槽 2/3 = 宿主 Allocate/Free）。
+    {
+        unsigned long long *vt = (unsigned long long *)(hdr + 0x100);
+        vt[2] = (unsigned long long)(uintptr_t)&za_fs_vt_alloc;
+        vt[3] = (unsigned long long)(uintptr_t)&za_fs_vt_free;
+        *(unsigned long long *)(hdr) = (unsigned long long)(uintptr_t)vt;
+    }
+    // ★ 把本线程的头页指针写进 bionic TLS 的空闲槽 [TP+0x40]。
+    //   实测三个线程该位置都是已映射的 0（主程序静态 TLS 区为空）。
+    //   不写 TPIDR_EL0（EL0 不可写），也不需要任何宿主调用。
+    *(unsigned long long *)((unsigned long)b + 0x40) = (unsigned long long)(uintptr_t)hdr;
 
     // ── 每线程的只读 TLS 页（TPIDRRO 语义）────────────────────────────
     // 布局（从 SDK 的 123 处用法反推）：
@@ -1331,6 +1349,32 @@ void za_os_install_tls_descriptor(void)
         st->ro = ro;
     }
     ZLOGI("客机 TLS: tp=%p 变量区=%p RO页=%p", b, t, st->ro);
+
+    // ── 探针：[tp+0x40] 能否当「每线程 TLS 基址指针」槽 ──────────────
+    // bionic 的 TCB 槽是 [tp+0..0x38]（8 个槽），之后是主可执行文件的静态
+    // TLS 区。若它的 PT_TLS 很小/为 0，[tp+0x40..] 就是空闲且已映射的
+    // ⇒ 客机的 TLS 访问可以用 **2 条指令**（mrs tp ; ldr Xt,[tp,#0x40]）
+    //   拿到每线程基址，不用宿主调用。
+    // 用 process_vm_readv 安全探测（未映射不会崩）。
+    {
+        static int n;
+        if (n++ < 3)
+        {
+            unsigned long offs[] = { 0x40, 0x48, 0x80, 0xC0, 0x100, 0x200 };
+            char line[256];
+            char *p = line;
+            p += snprintf(p, sizeof line - (size_t)(p - line), "tp+off 探针 tid=%ld:", (long)syscall(SYS_gettid));
+            for (unsigned i = 0; i < sizeof offs / sizeof offs[0]; i++)
+            {
+                unsigned long q = 0;
+                struct iovec l = { &q, 8 }, r2 = { (void *)((unsigned long)b + offs[i]), 8 };
+                ssize_t got = process_vm_readv(getpid(), &l, 1, &r2, 1, 0);
+                p += snprintf(p, sizeof line - (size_t)(p - line), " +%#lx=%s%#lx",
+                              offs[i], got == 8 ? "" : "unmapped/", got == 8 ? q : 0ul);
+            }
+            ZLOGI("%s", line);
+        }
+    }
 }
 
 unsigned long za_os_guest_tls_area(void)
@@ -1623,6 +1667,17 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
             if (e->off + 4 > ZA_TEXT_SIZE) continue;
             unsigned int *at = (unsigned int *)(base + e->off);
             if (*at != e->orig) continue;                 // 只改原字节仍匹配的
+            // ★ 跳过已被 helper 补丁处理过的站点：那里 mrs 保持原样、下一条被换成
+            //   `ldr Xd,[Xsrc,#0x40]`。不跳过就会把 mrs 再改成 `b 桩` ⇒ 桩返回
+            //   area（不是 tp）⇒ `ldr [area+0x40]` 读到 0 ⇒ 崩在 +0x98。
+            {
+                unsigned int nxt = *(unsigned int *)(base + e->off + 4);
+                unsigned int rs = e->orig & 0x1F;
+                if ((nxt & 0xFFC00000u) == 0xF9400000u &&
+                    ((nxt >> 10) & 0xFFFu) == (0x40u >> 3) &&
+                    ((nxt >> 5) & 0x1Fu) == rs)
+                    continue;
+            }
             long long delta = (long long)e->stub - (long long)e->off;
             if (delta < -(1LL << 27) || delta >= (1LL << 27)) continue;
             *at = 0x14000000u | (unsigned int)((delta >> 2) & 0x3FFFFFF);
