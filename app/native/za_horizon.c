@@ -302,6 +302,19 @@ static void *za_thread_trampoline(void *p)
     // ★ 每个客机线程都要有自己的影子 TLS 描述符：mrs 桩内联读 [tp16+0x98]
     //   来算客机 TLS 区；不装的话读到的是 bionic 的 DTV 指针 ⇒ 野地址。
     za_os_install_tls_descriptor();
+    // ★★ 只读 TLS 页的 +0x1f0 在 Horizon 上是「本线程的 TPIDR」：
+    //   SDK 的线程入口 sdk+0x144a50 会 `ldr x8,[tpidrro+0x1f0] ; msr tpidr_el0,x8`。
+    //   我们的 RO 页是**全局一张**，启动时填的是启动线程的 bionic TP。
+    //   新线程若不动它 ⇒ 整个线程把自己的 TPIDR 改成别人的 bionic TLS
+    //   ⇒ 之后它调宿主代码（日志/分配器）全都在用别人的 TLS
+    //   ⇒ 实测新线程栈上出现格式化文本、ret 到 ASCII（pc=0x39323561336436）。
+    //   ⇒ 每线程启动时写回自己的 bionic TPIDR（保留 bionic 语义；客机 TLS
+    //     读取已经全部走 V 常数，不依赖 TPIDR）。
+    {
+        unsigned long tp = 0;
+        __asm__ __volatile__("mrs %0, TPIDR_EL0" : "=r"(tp));
+        za_sdk_set_ro_tls_tpidr(tp);
+    }
     za_thread_start_t *ts = (za_thread_start_t *)p;
     void (*entry)(void *) = ts->entry;
     void *arg = ts->arg;
@@ -1103,7 +1116,12 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         }
         if (a0) *(unsigned int *)(uintptr_t)a0 = (unsigned int)id;
         za_horizon_regs[ZA_REG_X1] = (unsigned long)(unsigned int)id;
-        ZLOGI("Horizon: CreateThread handle=%d entry=%#lx arg=%#lx（栈 %zu 字节）",
+        // ★ 不再在这里 pthread_create：Horizon 的 svcCreateThread 只创建、不启动，
+        //   SDK 的 nn::os::StartThread 之后才调 svcStartThread。
+        //   （以前在这里直接启动 ⇒ SDK 的 ThreadType 状态机没跑，看起来「能跑」，
+        //     但 SDK 自己的线程入口/临界区读到的 ThreadType 是未初始化的，
+        //     实测会在新线程里走 nn::diag abort（无消息）然后自旋。）
+        ZLOGI("Horizon: CreateThread handle=%d entry=%#lx arg=%#lx（栈 %zu 字节，待 StartThread）",
               id, (unsigned long)a1, (unsigned long)a2, ssz);
         return 0;
     }

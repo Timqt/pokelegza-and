@@ -1365,12 +1365,13 @@ static const za_host_sym_t za_host_syms[] = {
     { "_ZN2nn2os11YieldThreadEv", (void *)za_os_yield_thread },
 
     // 线程
+    // ★ 2026-10-26：**不再接管 CreateThread/StartThread/DestroyThread**。
+    //   接管掉它们等于跳过 SDK 的 ThreadType 状态机 ⇒ SDK 自己的线程入口/临界区
+    //   读到未初始化的 ThreadType，实测在新线程里触发 nn::diag abort（无消息）。
+    //   正确分层：SDK 实现 nn::os，我们只提供 svc#8/svc#9（CreateThread/StartThread）。
+    //   保留 GetCurrentThread / GetThreadId 的宿主实现（返回非空对象，成本低）。
     { "_ZN2nn2os16GetCurrentThreadEv", (void *)za_os_get_current_thread },
     { "_ZN2nn2os11GetThreadIdEPKNS_10ThreadTypeE", (void *)za_os_get_thread_id },
-    { "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mi", (void *)za_os_create_thread },
-    { "_ZN2nn2os12CreateThreadEPNS0_10ThreadTypeEPFvPvES3_S3_mii", (void *)za_os_create_thread },
-    { "_ZN2nn2os11StartThreadEPNS0_10ThreadTypeE", (void *)za_os_start_thread },
-    { "_ZN2nn2os13DestroyThreadEPNS0_10ThreadTypeE", (void *)za_os_destroy_thread },
 
     // 互斥锁
     { "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi", (void *)za_os_initialize_mutex },

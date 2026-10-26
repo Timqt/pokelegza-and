@@ -88,13 +88,24 @@ volatile unsigned long za_ro_tls_page = 0;
 // 桩：保存 x0–x17 → x0=&保存区 → blr hook → 恢复 → 执行原首指令 → 回 +4。
 // ⚠ 末尾必须是 **ldp x29,x30,[sp],#0x30（带写回）**：不带写回会让 sp 每次
 //   下移 0x30（原版 nvn 探针就踩过这个坑 —— 每次分配泄漏 48 字节栈）。
+// 每个探针各自限流（共用一个计数器会让先触发的探针把后面的全吃掉）
+static int *za_probe_budget(const char *name)
+{
+    static struct { const char *name; int used; } b[8];
+    static int nb;
+    for (int i = 0; i < nb; i++) if (b[i].name == name) return &b[i].used;
+    if (nb >= 8) return &b[0].used;
+    b[nb].name = name; b[nb].used = 0;
+    return &b[nb++].used;
+}
 static void za_probe_log(const char *name, const unsigned long long *r)
 {
-    static int n;
-    if (n >= 6) return;
-    n++;
-    ZLOGI("★ 探针 %s: x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x6=%#llx x7=%#llx",
-          name, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+    int *used = za_probe_budget(name);
+    if (*used >= 8) return;
+    (*used)++;
+    ZLOGI("★ 探针 %s: x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x6=%#llx x7=%#llx"
+          "  fp=%#llx lr=%#llx", name, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
+          r[18], r[19]);
     // 把「看起来是 SDK/main 映像内地址」的参数当 C 字符串打出来
     for (int i = 0; i < 6; i++)
     {
@@ -117,6 +128,37 @@ static void za_probe_log(const char *name, const unsigned long long *r)
 static void za_hook_assert_entry(unsigned long long *r) { za_probe_log("assert-entry", r); }
 static void za_hook_assert_wrap(unsigned long long *r)  { za_probe_log("assert-wrap", r); }
 static void za_hook_assert_var(unsigned long long *r)   { za_probe_log("assert-va", r); }
+static void za_hook_assert_onfail(unsigned long long *r) { za_probe_log("assert-onfail", r); }
+// Abort 入口：除了参数，还要把 **调用者帧链** 走出来 —— abort 本身没有消息，
+// 唯一能定位的就是「谁调了它」。fp 是 0x9aba0 的帧指针（x29），
+// [fp]=上一帧 fp，[fp+8]=返回地址。
+static void za_hook_abort_entry(unsigned long long *r)
+{
+    static int n;
+    za_probe_log("abort-entry", r);
+    if (n++ >= 3) return;
+    unsigned long long fp = r[18];
+    for (int i = 0; i < 14 && fp; i++)
+    {
+        int plausible = (fp >= 0x400000000ull && fp < 0x920000000ull) ||
+                        (fp >= 0x6d00000000ull && fp < 0x8000000000ull) ||
+                        (fp >= 0x100000000ull && fp < 0x300000000ull);
+        if (!plausible || (fp & 7)) break;
+        unsigned long long nfp = 0, ra = 0;
+        memcpy(&nfp, (const void *)(uintptr_t)fp, 8);
+        memcpy(&ra, (const void *)(uintptr_t)(fp + 8), 8);
+        if (ra >= za_sdk_base && ra < za_sdk_base + za_sdk_size)
+            ZLOGI("   abort fp[%d] ret=sdk+%#llx", i, ra - za_sdk_base);
+        else if (za_guest_base && ra >= (unsigned long long)(uintptr_t)za_guest_base &&
+                 ra < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE)
+            ZLOGI("   abort fp[%d] ret=main+%#llx", i,
+                  ra - (unsigned long long)(uintptr_t)za_guest_base);
+        else
+            ZLOGI("   abort fp[%d] ret=%#llx", i, ra);
+        if (nfp <= fp) break;
+        fp = nfp;
+    }
+}
 
 static void za_install_entry_probe(unsigned char *base, unsigned int func_off,
                                    unsigned int stub_off, unsigned int hook_off,
@@ -124,8 +166,13 @@ static void za_install_entry_probe(unsigned char *base, unsigned int func_off,
 {
     unsigned int *s = (unsigned int *)(base + stub_off);
     unsigned int orig = *(unsigned int *)(base + func_off);
-    static const unsigned int seq[26] = {
-        0xA9BD7BFD, 0xD10243FF,               /* stp x29,x30,[sp,#-0x30]! ; sub sp,sp,#0x90 */
+    /* 保存区布局（r[] 下标 = 字节偏移/8）：
+     *   [0..7]  x0..x7      [8..17] x8..x17
+     *   [18]    x29（调用者 fp）   [19]    x30（调用者返回地址）
+     * 有了 x30 就能直接知道「是谁调了这个函数」——断言/ABORT 定位的关键。 */
+    static const unsigned int seq[27] = {
+        0xA9BD7BFD, 0xD10283FF,               /* stp x29,x30,[sp,#-0x30]! ; sub sp,sp,#0xa0 */
+        0xA9097BFD,                           /* stp x29,x30,[sp,#0x90] */
         0xA90007E0, 0xA9010FE2, 0xA90217E4, 0xA9031FE6,
         0xA90427E8, 0xA9052FEA, 0xA90637EC, 0xA9073FEE, 0xA90847F0,
         0x910003E0,                           /* mov x0, sp  */
@@ -133,26 +180,26 @@ static void za_install_entry_probe(unsigned char *base, unsigned int func_off,
         0xD63F0200,                           /* blr x16 */
         0xA94007E0, 0xA9410FE2, 0xA94217E4, 0xA9431FE6,
         0xA94427E8, 0xA9452FEA, 0xA94637EC, 0xA9473FEE, 0xA94847F0,
-        0x910243FF,                           /* add sp,sp,#0x90 */
+        0x910283FF,                           /* add sp,sp,#0xa0 */
         0xA8C37BFD,                           /* ldp x29,x30,[sp],#0x30  ← 必须写回 */
     };
     memcpy(s, seq, sizeof seq);
     long long pg = ((long long)(hook_off & ~0xFFFull) -
                     (long long)(stub_off & ~0xFFFull)) >> 12;
-    s[12] = 0x90000000u | ((unsigned)(pg & 3) << 29) |
+    s[13] = 0x90000000u | ((unsigned)(pg & 3) << 29) |
             ((unsigned)((pg >> 2) & 0x7FFFF) << 5) | 16u;
-    s[13] = 0xF9400000u | (((hook_off & 0xFFFull) >> 3) << 10) | (16u << 5) | 16u;
-    s[26] = orig;                              /* 原函数首指令 */
+    s[14] = 0xF9400000u | (((hook_off & 0xFFFull) >> 3) << 10) | (16u << 5) | 16u;
+    s[27] = orig;                              /* 原函数首指令 */
     {   /* b 回原函数 +4 */
-        long long d = (long long)(func_off + 4) - (long long)(stub_off + 27 * 4);
-        s[27] = 0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
+        long long d = (long long)(func_off + 4) - (long long)(stub_off + 28 * 4);
+        s[28] = 0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
     }
     {   /* 原函数入口 → b 桩 */
         long long d = (long long)stub_off - (long long)func_off;
         *(unsigned int *)(base + func_off) = 0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
     }
     *(unsigned long long *)(base + hook_off) = (unsigned long long)(uintptr_t)hook;
-    __builtin___clear_cache((char *)base + stub_off, (char *)base + stub_off + 28 * 4);
+    __builtin___clear_cache((char *)base + stub_off, (char *)base + stub_off + 29 * 4);
     __builtin___clear_cache((char *)base + func_off, (char *)base + func_off + 4);
 }
 extern volatile unsigned long za_sdk_size;
@@ -602,7 +649,25 @@ int za_sdk_load(za_mod_t *sdk,
         za_install_entry_probe(base, 0x9b010, 0xc90580, 0xc90610, za_hook_assert_entry);
         za_install_entry_probe(base, 0x9acb0, 0xc90620, 0xc906a0, za_hook_assert_wrap);
         za_install_entry_probe(base, 0x9ac00, 0xc906b0, 0xc90730, za_hook_assert_var);
-        ZLOGI("断言探针已装：0x9b010 / 0x9acb0 / 0x9ac00");
+        // 0x9ad10 = 真正的断言处理器（GOT 0xb78e18 指向它）：
+        //   签名从反汇编看是 (w0=result, x1, x2, w4, x5, ...) 外加 q0-q7 变参，
+        //   内部会取 nn::diag 的断言信息结构 → 这里能拿到文件/行号/表达式。
+        za_install_entry_probe(base, 0x9ad10, 0xc90740, 0xc907c0, za_hook_assert_onfail);
+        // 0x9aa70 = ABORT 实现入口（0x632450 的 GOT 目标）；x30 = 谁调了 Abort。
+        za_install_entry_probe(base, 0x9aa70, 0xc907d0, 0xc90848, za_hook_abort_entry);
+        ZLOGI("断言探针已装：0x9b010 / 0x9acb0 / 0x9ac00 / 0x9ad10 / 0x9aa70");
+
+        // ★ 互斥 owner 检查旁路（临时，等 nn::os 同步家族整体改道后再撤）
+        //   SDK 的 WaitConditionVariable（SDK+0x1387f0）开头：
+        //       ldr x8,[mutex+0x10]          ; owner = 持锁线程对象
+        //       mrs x9,tpidrro_el0 ; ldr x9,[x9,#0x1f8]  ; 当前线程对象
+        //       cmp x8,x9 ; b.ne abort       ; 不持锁就 wait ⇒ 直接 abort
+        //   而游戏的 LockMutex 走的是我们的宿主实现（za_os_lock_mutex），
+        //   根本不写 SDK MutexType 的 owner 字段 ⇒ 必然不等 ⇒ abort。
+        //   这里先旁路这条检查（b.ne → nop），让 wait 继续走 SDK 自己的
+        //   「减递归计数 → svcWaitSynchronization」路径，观察后续。
+        *(unsigned int *)(base + 0x13880c) = 0xD503201Fu;   /* nop */
+        __builtin___clear_cache((char *)base + 0x13880c, (char *)base + 0x138810);
         za_cnctp_ready = 1;
     }
 
@@ -708,7 +773,7 @@ int za_sdk_load(za_mod_t *sdk,
     //   初始 mmap 是 RW ⇒ 不收紧就是 NX。mprotect 成 R+X。
     //   ⚠ clear_cache 也必须做 —— 漏了就是「客机在桩区间弹跳」的实锤
     //   （0xc9028c，看门狗 SIGSEGV 抓到的现行）。
-    __builtin___clear_cache((char *)base + 0xc90000, (char *)base + 0xc90800);
+    __builtin___clear_cache((char *)base + 0xc90000, (char *)base + 0xc91000);
     mprotect(base + 0xc90000, 0x1000, PROT_READ | PROT_EXEC);
     mprotect(base, ZA_SDK_RODATA_OFF, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_SVC_GATE_BASE, ZA_SVC_GATE_SIZE, PROT_READ | PROT_EXEC);
