@@ -1225,9 +1225,7 @@ typedef struct
     void *saved[ZA_TLS_STACK];
     void *tp;           // 本线程 bionic 的 TLS
     void *area;         // 本线程的客机 TLS 变量区
-    unsigned long long slot_orig;   // [tp16+0x98] 的 bionic 原值
-    unsigned long long slot_guest;  // 客机期望值（变量区相对 tp16 的偏移 / 8）
-    unsigned long tp16;
+    unsigned long tp16;             // 仅作诊断保留（不再读写 bionic TLS！）
     long tid;           // 归属线程（0 = 槽位空闲）
     void *ro;           // 本线程的只读 TLS 页（TPIDRRO 语义 + CMIF 应答缓冲）
 } za_tls_state_t;
@@ -1259,11 +1257,13 @@ static za_tls_state_t *za_tls_cur(void)
     return &za_tls_states[idx];   // 线程数超过槽位：退回取模槽（可能互相干扰）
 }
 
+// ★ 2026-10-26：不再碰 bionic TLS 的 [tp16+0x98]。
+//   客机的 TLS 基址已经全部走常数/每线程页，这一槽谁都不读了；
+//   而 `tp16 = TPIDR & ~0x1FFF` 对新线程可能落在**未映射**区
+//   （实测：新线程 install 里读 [b16+0x98] 直接 SIGSEGV，b16=0x70b147e000）。
 void za_tls_enter(void)
 {
     za_tls_state_t *st = za_tls_cur();
-    if (st->depth == 0 && st->tp16)
-        *(unsigned long long *)(st->tp16 + 0x98) = st->slot_orig;
     if (st->depth < ZA_TLS_STACK) st->saved[st->depth] = za_get_tls();
     st->depth++;
 }
@@ -1271,8 +1271,6 @@ void za_tls_leave(void)
 {
     za_tls_state_t *st = za_tls_cur();
     if (st->depth > 0) st->depth--;
-    if (st->depth == 0 && st->tp16)
-        *(unsigned long long *)(st->tp16 + 0x98) = st->slot_guest;
 }
 
 // 只读 TLS 页的绝对地址（za_horizon.c 的临界区按同一来源取 owner_id）
@@ -1282,7 +1280,7 @@ extern volatile unsigned long za_ro_tls_page;
 void za_os_install_tls_descriptor(void)
 {
     za_tls_state_t *st_chk = za_tls_cur();
-    if (st_chk->tp16) return;            // 本线程已装过（幂等）
+    if (st_chk->area) return;            // 本线程已装过（幂等）
     void *b = za_get_tls();
     if (!b) { ZLOGE("读不到 TPIDR_EL0"); return; }
     unsigned long b16 = (unsigned long)b & ~0x1FFFul;
@@ -1306,12 +1304,9 @@ void za_os_install_tls_descriptor(void)
     }
     memset(t, 0, area);
     za_tls_state_t *st = za_tls_cur();
-    st->tp16 = (unsigned long)b16;
+    st->tp16 = (unsigned long)b16;      // 仅诊断：不要拿它去读写内存
     st->tp = b;
     st->area = t;
-    st->slot_orig = *(unsigned long long *)(b16 + 0x98);
-    st->slot_guest = (unsigned long long)(((long long)((unsigned long)(uintptr_t)t - b16)) / 8);
-    *(unsigned long long *)(b16 + 0x98) = st->slot_guest;
 
     // ── 每线程的只读 TLS 页（TPIDRRO 语义）────────────────────────────
     // 布局（从 SDK 的 123 处用法反推）：
@@ -1332,8 +1327,7 @@ void za_os_install_tls_descriptor(void)
         *(unsigned int *)(ro2 + 0x1b0) = (unsigned int)syscall(SYS_gettid);
         st->ro = ro;
     }
-    ZLOGI("客机 TLS: [tp16+0x98] %#llx -> %#llx，tp=%p 变量区=%p RO页=%p",
-          st->slot_orig, st->slot_guest, b, t, st->ro);
+    ZLOGI("客机 TLS: tp=%p 变量区=%p RO页=%p", b, t, st->ro);
 }
 
 unsigned long za_os_guest_tls_area(void)
@@ -1658,13 +1652,62 @@ unsigned long za_tls_mrs_hook(void)
 
 // fs 模块的宿主分配器（main 的 fs 分配器桩被劫持到这里）。
 // 客机与本进程同地址空间 ⇒ 宿主堆内存客机可直接读写。
+//
+// ★ 2026-10-26：加「只释放自己分配过的指针」的登记表。
+//   游戏的 fs 分配器被我们整体换成宿主 malloc 后，客机里**别的**分配器
+//   （SDK 自己的堆 / 我们没接管的路径）分配出来的指针也可能流到我们的 Free。
+//   直接 free() 非本堆指针 ⇒ bionic 堆元数据被写坏 ⇒ 之后在 libc 里 abort
+//   （实测：pc=libc+0x9a688 ≈ longjmp 附近，多线程同时崩）。
+//   ⇒ 用开放寻址表登记；Free 时查不到就**跳过并报一次**。
+#define ZA_FS_SET_BITS 16
+#define ZA_FS_SET_SIZE (1u << ZA_FS_SET_BITS)
+static void *za_fs_set[ZA_FS_SET_SIZE];
+static pthread_mutex_t za_fs_set_mtx = PTHREAD_MUTEX_INITIALIZER;
+static int za_fs_set_full_logged;
+static unsigned za_fs_foreign_free;
+
+static void za_fs_set_add(void *p)
+{
+    unsigned h = (unsigned)(((uintptr_t)p >> 4) & (ZA_FS_SET_SIZE - 1));
+    pthread_mutex_lock(&za_fs_set_mtx);
+    for (unsigned i = 0; i < ZA_FS_SET_SIZE; i++)
+    {
+        unsigned k = (h + i) & (ZA_FS_SET_SIZE - 1);
+        if (za_fs_set[k] == NULL) { za_fs_set[k] = p; break; }
+    }
+    pthread_mutex_unlock(&za_fs_set_mtx);
+}
+static int za_fs_set_take(void *p)
+{
+    unsigned h = (unsigned)(((uintptr_t)p >> 4) & (ZA_FS_SET_SIZE - 1));
+    int found = 0;
+    pthread_mutex_lock(&za_fs_set_mtx);
+    for (unsigned i = 0; i < ZA_FS_SET_SIZE; i++)
+    {
+        unsigned k = (h + i) & (ZA_FS_SET_SIZE - 1);
+        if (za_fs_set[k] == p) { za_fs_set[k] = NULL; found = 1; break; }
+        if (za_fs_set[k] == NULL) break;
+    }
+    pthread_mutex_unlock(&za_fs_set_mtx);
+    return found;
+}
+static void za_fs_guard_free(void *p, const char *who)
+{
+    if (!p) return;
+    if (za_fs_set_take(p)) { free(p); return; }
+    if (za_fs_foreign_free++ < 6)
+        ZLOGE("fs %s：%p 不是宿主分配器给的 ⇒ 跳过 free（防止写坏宿主堆）", who, p);
+}
+
 void *za_fs_alloc_host(unsigned long size)
 {
-    return malloc((size_t)size);
+    void *p = malloc(size ? (size_t)size : 1);
+    if (p) za_fs_set_add(p);
+    return p;
 }
 void za_fs_free_host(void *p)
 {
-    free(p);
+    za_fs_guard_free(p, "free");
 }
 
 // 同一个分配器的 **vtable 版本**（首参是分配器对象）。
@@ -1679,12 +1722,13 @@ void *za_fs_vt_alloc(void *obj, unsigned long size, unsigned long align)
     if ((align & (align - 1)) != 0) align = 16;      // 非 2 的幂：退回 16
     void *p = NULL;
     if (posix_memalign(&p, (size_t)align, size ? (size_t)size : 1) != 0) return NULL;
+    za_fs_set_add(p);
     return p;
 }
 void za_fs_vt_free(void *obj, void *ptr, unsigned long size, unsigned long align)
 {
     (void)obj; (void)size; (void)align;
-    free(ptr);
+    za_fs_guard_free(ptr, "vt-free");
 }
 
 // ── 基址重定位 ──────────────────────────────────────────────────
