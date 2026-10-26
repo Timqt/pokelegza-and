@@ -1045,6 +1045,9 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     }
     case 44: // MapPhysicalMemory(addr=x0, size=x1)
     case 45: // UnmapPhysicalMemory(addr=x0, size=x1)
+        ZLOGI("svc#%ld MapPhys addr=%#lx size=%#lx (pc=sdk+%#lx)", nr,
+              (unsigned long)a0, (unsigned long)a1,
+              (unsigned long)(za_horizon_regs[ZA_REG_PC] - (unsigned long)za_sdk_base));
     {
         // ★ 必须真映射（2026-10-25 实测）：客机在 nn::os::detail::VammManager /
         //   TransferMemoryImplByHorizon::MapImpl 里要 svc#44 把 0x410000000 这类
@@ -1454,6 +1457,9 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     }
     case 20: // UnmapSharedMemory(handle=x0, addr=x1, size=x2)
     {
+        ZLOGI("svc#20 UnmapSharedMemory handle=%#lx addr=%#lx size=%#lx (pc=sdk+%#lx)",
+              (unsigned long)a0, (unsigned long)a1, (unsigned long)a2,
+              (unsigned long)(za_horizon_regs[ZA_REG_PC] - (unsigned long)za_sdk_base));
         za_mem_unmap_shared((unsigned long long)a1, (unsigned long long)a2);
         return 0;
     }
