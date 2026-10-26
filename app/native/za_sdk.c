@@ -160,6 +160,9 @@ static void za_hook_abort_entry(unsigned long long *r)
     }
 }
 
+static void za_hook_waitloop(unsigned long long *r)     { za_probe_log("svc52-loop", r); }
+static void za_hook_cswait(unsigned long long *r)       { za_probe_log("cs-wait", r); }
+
 static void za_install_entry_probe(unsigned char *base, unsigned int func_off,
                                    unsigned int stub_off, unsigned int hook_off,
                                    void (*hook)(unsigned long long *))
@@ -655,6 +658,10 @@ int za_sdk_load(za_mod_t *sdk,
         za_install_entry_probe(base, 0x9ad10, 0xc90740, 0xc907c0, za_hook_assert_onfail);
         // 0x9aa70 = ABORT 实现入口（0x632450 的 GOT 目标）；x30 = 谁调了 Abort。
         za_install_entry_probe(base, 0x9aa70, 0xc907d0, 0xc90848, za_hook_abort_entry);
+        // svc#52 的调用方循环（0x13b2e0 = 重新判定/等待入口）与它调的等待 helper
+        // （0x13b370）。当前 boot 线程在这里空转并最终跳到 pc=0x24，需要看入参。
+        za_install_entry_probe(base, 0x13b2e0, 0xc90860, 0xc908d8, za_hook_waitloop);
+        za_install_entry_probe(base, 0x13b370, 0xc908e0, 0xc90958, za_hook_cswait);
         ZLOGI("断言探针已装：0x9b010 / 0x9acb0 / 0x9ac00 / 0x9ad10 / 0x9aa70");
 
         // ★ 互斥 owner 检查旁路（临时，等 nn::os 同步家族整体改道后再撤）
