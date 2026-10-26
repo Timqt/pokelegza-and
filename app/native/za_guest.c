@@ -981,6 +981,17 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
             }
         }
+        // ★ 最近一次等待类 svc 的返回值
+        {
+            extern volatile long za_dbg_last_wait_nr, za_dbg_last_wait_ret;
+            char *q = buf;
+            q = za_put_str(q, "ZaGuest: LAST-WAIT nr=");
+            q = za_put_dec(q, (unsigned long long)za_dbg_last_wait_nr);
+            q = za_put_str(q, " ret=");
+            q = za_put_hex(q, (unsigned long long)za_dbg_last_wait_ret);
+            q[0] = 10; q++;
+            za_fatal_write(buf, (size_t)(q - buf));
+        }
         // ★ 最近一次 WaitForAddress 的锁字现场（活锁排查）
         {
             extern unsigned long long za_dbg_last_wait;

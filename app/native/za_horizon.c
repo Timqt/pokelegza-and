@@ -1403,10 +1403,15 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             int wait;
             switch (type)
             {
-                case 0: wait = (cur == v); break;   // Equal
-                case 1: wait = (cur <  v); break;   // LessThan
-                case 2: wait = (cur >  v); break;   // GreaterThan
-                default: wait = (cur != v); break;  // NotEqual
+                // ★ 语义是「等待直到条件变为真」，所以阻塞条件是**当前还没到**：
+                //   GreaterThan(value) ⇒ 值还没变大 ⇒ cur <= value 时阻塞。
+                // 实测：SDK 在 *addr==1 时调用 WaitForAddress(addr, 2, 1)，
+                //   期望是**阻塞**等别人把值改大；若按 cur > value 判定就会立刻
+                //   返回 0xFA01，SDK 随后直接 abort（LAST-WAIT nr=52 ret=0xfa01）。
+                case 0: wait = (cur == v); break;   // Equal：等到 != value
+                case 1: wait = (cur >= v); break;   // LessThan：等到 < value
+                case 2: wait = (cur <= v); break;   // GreaterThan：等到 > value
+                default: wait = (cur != v); break;  // NotEqual：等到 == value
             }
             if (!wait) return 0xFA01u;              // InvalidState ⇒ 调用方用新值重试
             struct timespec ts, *tsp = NULL;
@@ -1897,8 +1902,25 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
 //   1) 写的是 32 位 ⇒ 64 位的地址值（GetInfo 返回的就是地址）高位被截断；
 //   2) 会**覆盖我们自己在 C 里填的结构体**（#6 的 MemoryInfo 就被写成了 4 字节）。
 //   ⇒ 现在只负责把值放进 x1/x2，落地交给客机的包装函数。
+// ★ 最近一次「等待类」svc 的返回值（崩溃 dump 用）：
+//   SDK 的等待路径对非 0 返回值会直接 throw/abort，必须知道是哪一条返回了什么。
+volatile long za_dbg_last_wait_nr;
+volatile long za_dbg_last_wait_ret;
+static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
+                                long a4, long a5, long a6, long a7, long nr);
 long za_horizon_svc(long a0, long a1, long a2, long a3,
                     long a4, long a5, long a6, long a7, long nr)
+{
+    long r = za_horizon_svc_impl(a0, a1, a2, a3, a4, a5, a6, a7, nr);
+    if (nr == 24 || nr == 28 || nr == 52 || nr == 53 || nr == 54)
+    {
+        za_dbg_last_wait_nr = nr;
+        za_dbg_last_wait_ret = r;
+    }
+    return r;
+}
+static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
+                                long a4, long a5, long a6, long a7, long nr)
 {
     // 服务号只有 16 位有效（svc #N）。上位是防御性清零。
     nr &= 0xFFFF;
