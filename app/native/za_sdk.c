@@ -162,6 +162,23 @@ static void za_hook_abort_entry(unsigned long long *r)
 
 static void za_hook_waitloop(unsigned long long *r)     { za_probe_log("svc52-loop", r); }
 static void za_hook_cswait(unsigned long long *r)       { za_probe_log("cs-wait", r); }
+static void za_hook_workerblr(unsigned long long *r)
+{
+    // SDK 线程入口 0x144a50 在 0x144aa0 处 `blr x8` 调用户函数：
+    //   x19 = 线程对象；目标 = [x19+0x50] + [x19+0x58] - 0x20
+    // 这里 x8 就是目标。若它是 0x35/0x24 这种小值，就是我们要找的坏指针。
+    int *used = za_probe_budget("worker-blr");
+    if (*used >= 8) return;
+    (*used)++;
+    unsigned long long obj = r[0];          // x0（入口参数 = 线程对象）
+    unsigned long long tgt = r[8];          // x8 = 即将 blr 的目标
+    unsigned long long a = 0, b = 0;
+    if (obj && tgt) { memcpy(&a, (const void *)(uintptr_t)(obj + 0x50), 8);
+                      memcpy(&b, (const void *)(uintptr_t)(obj + 0x58), 8); }
+    ZLOGI("★ 探针 worker-blr: obj=%#llx [obj+0x50]=%#llx [obj+0x58]=%#llx ⇒ 目标=%#llx",
+          obj, a, b, tgt);
+}
+
 /* ⚠ za_install_entry_probe 只能探 **SDK** 里的地址（stub 也在 SDK 扩展区，
  *   跨模块的分支超出 ±128MB）。曾经误用它探 main+0x1653cc0/d00，
  *   结果把 b 写进了 SDK 的同偏移处、破坏了无关函数 —— 已移除。 */
@@ -681,6 +698,9 @@ int za_sdk_load(za_mod_t *sdk,
         // svc#52 的调用方循环（0x13b2e0 = 重新判定/等待入口）与它调的等待 helper
         // （0x13b370）。当前 boot 线程在这里空转并最终跳到 pc=0x24，需要看入参。
         za_install_entry_probe(base, 0x13b2e0, 0xc90860, 0xc908d8, za_hook_waitloop);
+        // 线程入口里真正调用用户函数的那条 blr（0x144aa0）——目标由线程对象算出，
+        // 正是当前「跳到 0x1c/0x24/0x35」的可疑来源。
+        za_install_entry_probe(base, 0x144aa0, 0xc909e0, 0xc90a58, za_hook_workerblr);
         za_install_entry_probe(base, 0x13b370, 0xc908e0, 0xc90958, za_hook_cswait);
         // 内存池初始化（main+0x1653cc0：x0=desc, x1=stride, x2=base, w3=size）。
         // PC 采样多次落在这个链表构建循环上；若 size/stride 不自洽会越界写。
