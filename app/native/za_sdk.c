@@ -29,6 +29,7 @@
 void *za_sdk_ctx = NULL;
 #include "za_mem.h"
 #include "za_guest_api.h"
+#include "za_guest_info.h"
 #include "za_os.h"
 #include "za_sdk.h"
 #include "za_svc_patch.h"
@@ -68,12 +69,92 @@ static const unsigned int za_nvn_probe_stub[27] = {
     0xA90427E8, 0xA9052FEA, 0xA90637EC, 0xA9073FEE, 0xA90847F0, 0xF94003E0,
     0x90000010, 0xF9430610, 0xD63F0200,
     0xA94007E0, 0xA9410FE2, 0xA94217E4, 0xA9431FE6, 0xA94427E8, 0xA9452FEA,
-    0xA94637EC, 0xA9473FEE, 0xA94847F0, 0x910243FF, 0xA9407BFD,
+    0xA94637EC, 0xA9473FEE, 0xA94847F0, 0x910243FF,
+    /* ⚠ 这里**不能带写回**：原函数首指令（stp x29,x30,[sp,#-0x30]!）已被本桩
+     *   1:1 模拟并**不会**再执行，所以恢复后 sp 必须停在 S-0x30，
+     *   让调用者自己的 epilogue（ldp ...,#0x30）回到 S。
+     *   带写回 ⇒ sp 比应有值高 0x30 ⇒ 第二次调用就把返回地址踩坏
+     *   （实测：pc=sdk+0xb9eb80，跳到数据段）。 */
+    0xA9407BFD,
     0x17DEFD23,
 };
 extern volatile unsigned long za_sdk_base;
+extern volatile unsigned long za_sdk_size;
+extern unsigned char *za_guest_base;      // main 映像基址（za_guest.c）
 // 只读 TLS 页的绝对地址（SDK 装载时填）。za_horizon.c 的临界区要按同一来源取 owner_id。
 volatile unsigned long za_ro_tls_page = 0;
+
+// ── 通用入口探针（用于把「SDK 里的断言/ABORT」打出人话）────────────────
+// 桩：保存 x0–x17 → x0=&保存区 → blr hook → 恢复 → 执行原首指令 → 回 +4。
+// ⚠ 末尾必须是 **ldp x29,x30,[sp],#0x30（带写回）**：不带写回会让 sp 每次
+//   下移 0x30（原版 nvn 探针就踩过这个坑 —— 每次分配泄漏 48 字节栈）。
+static void za_probe_log(const char *name, const unsigned long long *r)
+{
+    static int n;
+    if (n >= 6) return;
+    n++;
+    ZLOGI("★ 探针 %s: x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x6=%#llx x7=%#llx",
+          name, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+    // 把「看起来是 SDK/main 映像内地址」的参数当 C 字符串打出来
+    for (int i = 0; i < 6; i++)
+    {
+        unsigned long long v = r[i];
+        int in_sdk = (za_sdk_base && v >= za_sdk_base && v < za_sdk_base + za_sdk_size);
+        int in_main = (za_guest_base && v >= (unsigned long long)(uintptr_t)za_guest_base &&
+                       v < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE);
+        if (!in_sdk && !in_main) continue;
+        const unsigned char *p = (const unsigned char *)(uintptr_t)v;
+        int ok = 0;
+        for (int k = 0; k < 128; k++)
+        {
+            unsigned char c = p[k];
+            if (!c) { ok = 1; break; }
+            if (c < 0x20 && c != '\t' && c != '\n') break;
+        }
+        if (ok) ZLOGI("   %s arg%d = \"%s\"", name, i, (const char *)p);
+    }
+}
+static void za_hook_assert_entry(unsigned long long *r) { za_probe_log("assert-entry", r); }
+static void za_hook_assert_wrap(unsigned long long *r)  { za_probe_log("assert-wrap", r); }
+static void za_hook_assert_var(unsigned long long *r)   { za_probe_log("assert-va", r); }
+
+static void za_install_entry_probe(unsigned char *base, unsigned int func_off,
+                                   unsigned int stub_off, unsigned int hook_off,
+                                   void (*hook)(unsigned long long *))
+{
+    unsigned int *s = (unsigned int *)(base + stub_off);
+    unsigned int orig = *(unsigned int *)(base + func_off);
+    static const unsigned int seq[26] = {
+        0xA9BD7BFD, 0xD10243FF,               /* stp x29,x30,[sp,#-0x30]! ; sub sp,sp,#0x90 */
+        0xA90007E0, 0xA9010FE2, 0xA90217E4, 0xA9031FE6,
+        0xA90427E8, 0xA9052FEA, 0xA90637EC, 0xA9073FEE, 0xA90847F0,
+        0x910003E0,                           /* mov x0, sp  */
+        0x90000010, 0xF9400000,               /* adrp/ldr x16 → hook（下面回填） */
+        0xD63F0200,                           /* blr x16 */
+        0xA94007E0, 0xA9410FE2, 0xA94217E4, 0xA9431FE6,
+        0xA94427E8, 0xA9452FEA, 0xA94637EC, 0xA9473FEE, 0xA94847F0,
+        0x910243FF,                           /* add sp,sp,#0x90 */
+        0xA8C37BFD,                           /* ldp x29,x30,[sp],#0x30  ← 必须写回 */
+    };
+    memcpy(s, seq, sizeof seq);
+    long long pg = ((long long)(hook_off & ~0xFFFull) -
+                    (long long)(stub_off & ~0xFFFull)) >> 12;
+    s[12] = 0x90000000u | ((unsigned)(pg & 3) << 29) |
+            ((unsigned)((pg >> 2) & 0x7FFFF) << 5) | 16u;
+    s[13] = 0xF9400000u | (((hook_off & 0xFFFull) >> 3) << 10) | (16u << 5) | 16u;
+    s[26] = orig;                              /* 原函数首指令 */
+    {   /* b 回原函数 +4 */
+        long long d = (long long)(func_off + 4) - (long long)(stub_off + 27 * 4);
+        s[27] = 0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
+    }
+    {   /* 原函数入口 → b 桩 */
+        long long d = (long long)stub_off - (long long)func_off;
+        *(unsigned int *)(base + func_off) = 0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
+    }
+    *(unsigned long long *)(base + hook_off) = (unsigned long long)(uintptr_t)hook;
+    __builtin___clear_cache((char *)base + stub_off, (char *)base + stub_off + 28 * 4);
+    __builtin___clear_cache((char *)base + func_off, (char *)base + func_off + 4);
+}
 extern volatile unsigned long za_sdk_size;
 
 #define ZA_SDK_IMG_SIZE (ZA_SDK_DATA_OFF + ZA_SDK_DATA_SIZE + ZA_SDK_BSS_SIZE)
@@ -337,7 +418,14 @@ int za_sdk_load(za_mod_t *sdk,
          *   保留这张表：以后遇到「SDK 一进去就连某个我们没有的系统服务」的导出函数，
          *   就照 d2r-and 的 hle_sdkinit.c 那样按函数名接管。 */
         static const za_hle_stub_t g_hle[] = {
-            { 0, 0, { 0, 0 }, NULL },     /* 占位（name==NULL 表示不用） */
+            /* nn::oe::SetPerformanceModeChangedNotificationEnabled(bool)（SDK+0x3f7050）
+             *   → GetSelfController()（SDK+0x1c6670，读全局 SDK+0xbacbd0）
+             *   → 我们是宿主环境，没有 am applet 服务 ⇒ 全局恒 NULL
+             *   ⇒ SDK+0x3f7064 `ldr x8,[x0]` 崩（实测 addr=0x0，调用链
+             *      main+0x1a04ce0 ← main+0x19dc9e8 ← main+0xb10ddc ← …）。
+             *   「性能模式变更通知」在安卓上没有对等物，直接返回 0（成功）。 */
+            { 0x3f7050, 2, { 0x52800000u, 0xD65F03C0u },
+              "nn::oe::SetPerformanceModeChangedNotificationEnabled" },
         };
 
         for (unsigned i = 0; i < sizeof g_hle / sizeof g_hle[0]; i++)
@@ -505,6 +593,16 @@ int za_sdk_load(za_mod_t *sdk,
                 0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
         }
         ZLOGI("NvOsHeap 探针已装：入口 0x44f9f0 → 桩 0xc90500");
+
+        // ★ 断言路径探针：把 SDK 内部断言/ABORT 的表达式、函数名、文件名打出来。
+        //   实测崩溃链：某个 main 工作线程 → sdk+0x9ac00 一族（__assert_fail 形态）
+        //   → svc#38 Break(reason=0)。没有消息文本根本没法修。
+        //   0x9b010 = nndetailDiagOnAssertionFailure（对外入口）
+        //   0x9acb0 / 0x9ac00 = 内部 wrapper / 变参处理器
+        za_install_entry_probe(base, 0x9b010, 0xc90580, 0xc90610, za_hook_assert_entry);
+        za_install_entry_probe(base, 0x9acb0, 0xc90620, 0xc906a0, za_hook_assert_wrap);
+        za_install_entry_probe(base, 0x9ac00, 0xc906b0, 0xc90730, za_hook_assert_var);
+        ZLOGI("断言探针已装：0x9b010 / 0x9acb0 / 0x9ac00");
         za_cnctp_ready = 1;
     }
 
@@ -610,7 +708,7 @@ int za_sdk_load(za_mod_t *sdk,
     //   初始 mmap 是 RW ⇒ 不收紧就是 NX。mprotect 成 R+X。
     //   ⚠ clear_cache 也必须做 —— 漏了就是「客机在桩区间弹跳」的实锤
     //   （0xc9028c，看门狗 SIGSEGV 抓到的现行）。
-    __builtin___clear_cache((char *)base + 0xc90000, (char *)base + 0xc90700);
+    __builtin___clear_cache((char *)base + 0xc90000, (char *)base + 0xc90800);
     mprotect(base + 0xc90000, 0x1000, PROT_READ | PROT_EXEC);
     mprotect(base, ZA_SDK_RODATA_OFF, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_SVC_GATE_BASE, ZA_SVC_GATE_SIZE, PROT_READ | PROT_EXEC);

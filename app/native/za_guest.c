@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -714,8 +715,22 @@ void za_install_altstack(void)
 // 否则 debuggerd 出不了 tombstone；以前用 abort() 会因 SIGABRT 被自己接住而无限递归）。
 //
 // ⚠ 最后那个 _exit(99) 是「信号在处理器内仍被屏蔽、raise 不生效」时的后备。
+// dump 里会解引用寄存器里的值（fp、x0 对象…）。栈被破坏时这些值是垃圾，
+// dump 自己就会二次 fault —— 以前实测：SIGBUS 现场 fp/ x29 是 ASCII 文本，
+// 打 FRAME0 时再次 SIGSEGV，日志戛然而止，后面的 svc 轨迹全丢。
+// ⇒ 用 siglongjmp 兜住：嵌套 fault 时放弃剩余 dump，继续走原信号收尾。
+static sigjmp_buf za_fatal_jmp;
+static volatile sig_atomic_t za_fatal_dumping;
+
+// 「像不像一个用户态地址」：dump 前的廉价检查（8 对齐 + 47 位内）
+static int za_va_plausible(unsigned long v)
+{
+    return (v & 7) == 0 && v >= 0x10000ul && v < 0x800000000000ul;
+}
+
 static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
 {
+    if (za_fatal_dumping) siglongjmp(za_fatal_jmp, 1);   // dump 中二次 fault
     unsigned long pc = 0;
     if (ctx) { ucontext_t *uc = (ucontext_t *)ctx; pc = (unsigned long)uc->uc_mcontext.pc; }
     {
@@ -828,9 +843,20 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 za_fatal_write(buf, (size_t)(p - buf));
             }
         }
+        // 从这里开始全是「解引用寄存器」的危险 dump：二次 fault 就放弃剩余部分。
+        za_fatal_dumping = 1;
+        if (sigsetjmp(za_fatal_jmp, 1) != 0)
+        {
+            static const char ab[] = "ZaGuest: (dump aborted: nested fault)\n";
+            za_fatal_write(ab, sizeof ab - 1);
+            za_fatal_dumping = 0;
+        }
+        else
+        {
         // ★ 帧内保存的寄存器：fp 往前 0x40 字节（读函数入参/局部）
         {
             unsigned long long fp = (unsigned long long)uc->uc_mcontext.regs[29];
+            if (!za_va_plausible(fp)) fp = 0;      // 栈被破坏时 fp 常是 ASCII 文本
             for (int f = 0; f < 2 && fp; f++)
             {
                 char *q = buf;
@@ -919,6 +945,8 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                          (unsigned long)uc->uc_mcontext.sp);
         za_log_guest_trace((unsigned long)uc->uc_mcontext.sp);
         za_log_stack((unsigned long)uc->uc_mcontext.sp);
+        za_fatal_dumping = 0;
+        }
     }
 
     // 恢复默认动作重新 raise ⇒ 内核按默认动作终止，debuggerd 拿到原始信号与故障地址
