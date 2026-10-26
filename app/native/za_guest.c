@@ -795,6 +795,35 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             p = za_put_str(p, "\n");
             za_fatal_write(buf, (size_t)(p - buf));
         }
+        // ★ 崩在**宿主**代码里时，pc 不在 main/sdk 映像里 —— 用 dladdr 把
+        //   函数名解出来（否则只会看到一个 0x6d… 的裸地址）。信号安全上
+        //   dladdr 不是严格 AS-safe，但实测可用，而且是纯诊断用途。
+        {
+            int in_guest = 0;
+            extern unsigned char *za_guest_base;
+            extern volatile unsigned long za_sdk_base, za_sdk_size;
+            if (za_guest_base && pc >= (unsigned long)za_guest_base &&
+                pc < (unsigned long)za_guest_base + ZA_IMAGE_SIZE) in_guest = 1;
+            if (za_sdk_base && pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) in_guest = 1;
+            if (!in_guest)
+            {
+                Dl_info di;
+                memset(&di, 0, sizeof di);
+                if (dladdr((void *)pc, &di))
+                {
+                    unsigned long off = di.dli_saddr ? (unsigned long)(pc - (unsigned long)di.dli_saddr)
+                                                     : (unsigned long)(pc - (unsigned long)di.dli_fbase);
+                    ZLOGE("ZaGuest: 宿主崩溃 pc=%p = %s+%#lx（模块 %s，模块内偏移 %#lx）",
+                          (void *)pc, di.dli_sname ? di.dli_sname : "?", off,
+                          di.dli_fname ? di.dli_fname : "?", 
+                          (unsigned long)(pc - (unsigned long)di.dli_fbase));
+                }
+                else
+                {
+                    ZLOGE("ZaGuest: 宿主崩溃 pc=%p（dladdr 无符号）", (void *)pc);
+                }
+            }
+        }
         {
             char *p = buf;
             p = za_put_str(p, "ZaGuest: sp=");
