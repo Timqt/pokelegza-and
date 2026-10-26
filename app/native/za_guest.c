@@ -1639,6 +1639,15 @@ static void za_load_host_libs(void)
 //   · mrs TPIDR_EL0 的替换桩区（见 za_tls_mrs_blob.h）
 //
 // ⚠ 整块先按可读写映射（GOT 在 .data 里、装载时要写），text/rodata 的只读权限等重定位做完再收紧。
+// main 模块探针（定义在后面）
+#define ZA_MPROBE_STUB  0x6048000u
+#define ZA_MPROBE_SLOT  0x6049000u
+static void za_hook_m_poolinit(unsigned long long *r);
+static void za_hook_m_poolloop(unsigned long long *r);
+static void za_install_main_probe(unsigned char *base, unsigned int func_off,
+                                  unsigned int stub_off, unsigned int hook_off,
+                                  void (*hook)(unsigned long long *));
+
 int za_guest_map(const unsigned char *text, const unsigned char *rodata,
                  const unsigned char *data_seg, size_t bss, unsigned char **out_base)
 {
@@ -1747,6 +1756,16 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         __builtin___clear_cache((char *)base, (char *)base + ZA_TEXT_SIZE);
         __builtin___clear_cache((char *)base + ZA_TLS_STUB_OFF,
                                 (char *)base + ZA_TLS_STUB_OFF + ZA_TLS_STUB_SIZE);
+    }
+
+    // ★ main 模块入口探针：桩放 0x6048000（随后 RX），hook 槽放 0x6049000（保持 RW）
+    {
+        za_install_main_probe(base, 0x1653cc0, ZA_MPROBE_STUB,        ZA_MPROBE_SLOT,        za_hook_m_poolinit);
+        za_install_main_probe(base, 0x1653d00, ZA_MPROBE_STUB + 0x80, ZA_MPROBE_SLOT + 0x08, za_hook_m_poolloop);
+        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x100);
+        mprotect(base + ZA_MPROBE_STUB, 0x1000, PROT_READ | PROT_EXEC);
+        ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
+              (unsigned)ZA_MPROBE_STUB, (unsigned)ZA_MPROBE_SLOT);
     }
 
     *out_base = base;
@@ -1867,6 +1886,65 @@ static unsigned long long za_relocate_base(unsigned char *base)
 // 导入解析 + 重定位表应用。za_relocs[] 由 tools/gen_guest_headers.py 从 .dynamic 生成：
 //   kind 0 = 写宿主解析出的符号地址（host_index 指向 za_imports[]）
 //   kind 1 = 写「基址 + 符号值」   kind 2 = 写「基址 + addend」
+
+// ════════════════════════════════════════════════════════════════
+//  main 模块的入口探针（桩必须在 main 的扩展区，分支才在 ±128MB 内）
+// ════════════════════════════════════════════════════════════════
+/* ZA_MPROBE_STUB / ZA_MPROBE_SLOT 见前面的声明区 */
+
+// 空闲链表池初始化（main+0x1653cc0）：x0=desc, x1=stride, x2=base, w3=size
+static void za_hook_m_poolinit(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 6) return;
+    ZLOGI("★ main 探针 pool-init: desc=%#llx stride=%#llx base=%#llx size=%#llx",
+          r[0], r[1], r[2], r[3]);
+}
+// 循环入口（main+0x1653d00）：x0=desc(+0x18 stride,+0x1c count), x2=base, x8=stride/8
+static void za_hook_m_poolloop(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 6) return;
+    unsigned long long desc = r[0], base = r[2], stride = r[8] << 3;
+    unsigned int count = 0;
+    if (desc) memcpy(&count, (const void *)(uintptr_t)(desc + 0x1c), 4);
+    ZLOGI("★ main 探针 pool-loop: desc=%#llx base=%#llx stride=%#llx count=%u ⇒ 跨度=%#llx",
+          desc, base, stride, count, stride * (unsigned long long)count);
+}
+
+static void za_install_main_probe(unsigned char *base, unsigned int func_off,
+                                  unsigned int stub_off, unsigned int hook_off,
+                                  void (*hook)(unsigned long long *))
+{
+    unsigned int *s = (unsigned int *)(base + stub_off);
+    unsigned int orig = *(unsigned int *)(base + func_off);
+    static const unsigned int seq[27] = {
+        0xA9BD7BFD, 0xD10283FF, 0xA9097BFD,
+        0xA90007E0, 0xA9010FE2, 0xA90217E4, 0xA9031FE6,
+        0xA90427E8, 0xA9052FEA, 0xA90637EC, 0xA9073FEE, 0xA90847F0,
+        0x910003E0, 0x90000010, 0xF9400000, 0xD63F0200,
+        0xA94007E0, 0xA9410FE2, 0xA94217E4, 0xA9431FE6,
+        0xA94427E8, 0xA9452FEA, 0xA94637EC, 0xA9473FEE, 0xA94847F0,
+        0x910283FF, 0xA8C37BFD,
+    };
+    memcpy(s, seq, sizeof seq);
+    long long pg = ((long long)(hook_off & ~0xFFFull) - (long long)(stub_off & ~0xFFFull)) >> 12;
+    s[13] = 0x90000000u | ((unsigned)(pg & 3) << 29) | ((unsigned)((pg >> 2) & 0x7FFFF) << 5) | 16u;
+    s[14] = 0xF9400000u | (((hook_off & 0xFFFull) >> 3) << 10) | (16u << 5) | 16u;
+    s[27] = orig;
+    {
+        long long d = (long long)(func_off + 4) - (long long)(stub_off + 28 * 4);
+        s[28] = 0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
+    }
+    {
+        long long d = (long long)stub_off - (long long)func_off;
+        *(unsigned int *)(base + func_off) = 0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
+    }
+    *(unsigned long long *)(base + hook_off) = (unsigned long long)(uintptr_t)hook;
+    __builtin___clear_cache((char *)base + stub_off, (char *)base + stub_off + 29 * 4);
+    __builtin___clear_cache((char *)base + func_off, (char *)base + func_off + 4);
+}
+
 int za_guest_relocate(unsigned char *base, za_guest_t *out)
 {
     if (!base || !out) return -1;
