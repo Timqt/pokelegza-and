@@ -825,6 +825,24 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 za_fatal_write(buf, (size_t)(p - buf));
             }
         }
+        // ★ 通用：x0 指向 SDK bss 时 dump 该对象（nvn 堆结构等就在这里）。
+        {
+            unsigned long long x0v = (unsigned long long)uc->uc_mcontext.regs[0];
+            if (za_sdk_base && x0v >= za_sdk_base && x0v < za_sdk_base + za_sdk_size)
+            {
+                for (int i = 0; i < 32; i++)
+                {
+                    char *q = buf;
+                    q = za_put_str(q, "ZaGuest: X0OBJ[+");
+                    q = za_put_hex(q, (unsigned long long)(i * 8));
+                    q = za_put_str(q, "]=");
+                    q = za_put_hex(q, *(unsigned long long *)(uintptr_t)(x0v + i * 8));
+                    q = za_put_str(q, "\n");
+                    za_fatal_write(buf, (size_t)(q - buf));
+                }
+                ZLOGI("  (x0 对象偏移 = sdk+%#llx)", x0v - za_sdk_base);
+            }
+        }
         // ★ main 的 fs 分配器对象现场（0x3de4b90）+ 它的 vtable（0x3af0ac8）。
         //   实测崩溃：vtable+0x10 = 0x20 ⇒ br 0x20。看运行时表里到底是什么。
         {
