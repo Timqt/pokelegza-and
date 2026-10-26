@@ -38,6 +38,39 @@ extern long za_horizon_svc(long a0, long a1, long a2, long a3, long a4, long a5,
 extern volatile unsigned long za_horizon_regs[16];
 // 崩溃现场要用它把地址换算成「sdk+偏移」（定义在 za_guest.c）
 volatile int za_cnctp_ready;   /* CNTPCT 桩/hook 槽已装好（看门狗门控用） */
+
+// ── NvOsHeapAllocatorAlloc 入口探针 ──────────────────────────────────
+// SDK+0x44f9f0 的首指令被换成 b <探针桩>；桩保留全部调用者寄存器，
+// 回调这里打一次日志，然后跳回 0x44f9f4 继续原函数。
+// 目的：一次运行就能拿到 nvn 堆对象的 arena 字段（+0x38 基址 / +0x40 大小）
+// 到底是什么值、以及分配发生前它有没有被正确初始化。
+static void za_nvn_probe_hook(unsigned long long heap)
+{
+    static int once;
+    if (once) return;
+    once = 1;
+    unsigned long long b = 0, s = 0;
+    memcpy(&b, (const void *)(uintptr_t)(heap + 0x38), 8);
+    memcpy(&s, (const void *)(uintptr_t)(heap + 0x40), 8);
+    ZLOGI("★ NvOsHeap probe: heap=%#llx  [heap+0x38]=%#llx  [heap+0x40]=%#llx",
+          heap, b, s);
+}
+
+// 探针桩（27 条指令，objdump 验证过）：
+//   stp x29,x30,[sp,#-0x30]!        ← 原文首指令 1:1
+//   sub sp,sp,#0x90
+//   stp/ldp x0..x17                  ← 保存/恢复全部调用者寄存器
+//   ldr x0,[sp]                      ← heap 参数
+//   adrp/ldr/blr x16                 ← hook 槽 (base+0xc90608)
+//   add sp,sp,#0x90 ; ldp x29,x30,[sp] ; b 0x44f9f4
+static const unsigned int za_nvn_probe_stub[27] = {
+    0xA9BD7BFD, 0xD10243FF, 0xA90007E0, 0xA9010FE2, 0xA90217E4, 0xA9031FE6,
+    0xA90427E8, 0xA9052FEA, 0xA90637EC, 0xA9073FEE, 0xA90847F0, 0xF94003E0,
+    0x90000010, 0xF9430610, 0xD63F0200,
+    0xA94007E0, 0xA9410FE2, 0xA94217E4, 0xA9431FE6, 0xA94427E8, 0xA9452FEA,
+    0xA94637EC, 0xA9473FEE, 0xA94847F0, 0x910243FF, 0xA9407BFD,
+    0x17DEFD23,
+};
 extern volatile unsigned long za_sdk_base;
 // 只读 TLS 页的绝对地址（SDK 装载时填）。za_horizon.c 的临界区要按同一来源取 owner_id。
 volatile unsigned long za_ro_tls_page = 0;
@@ -446,6 +479,19 @@ int za_sdk_load(za_mod_t *sdk,
             patched++;
         }
         ZLOGI("CNTPCT 替换：%u 处 → 门区桩（hook @base+0xc90600）", patched);
+
+        // ★ NvOsHeapAllocatorAlloc 探针：桩 @0xc90500，hook 槽 @0xc90608，
+        //   原函数入口 0x44f9f0 换成 b <桩>。见 za_nvn_probe_stub 的注释。
+        memcpy((void *)(uintptr_t)(base + 0xc90500), za_nvn_probe_stub,
+               sizeof za_nvn_probe_stub);
+        *(unsigned long long *)(base + 0xc90608) =
+            (unsigned long long)(uintptr_t)za_nvn_probe_hook;
+        {
+            long long d = 0xc90500 - 0x44f9f0;
+            *(unsigned int *)(base + 0x44f9f0) =
+                0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
+        }
+        ZLOGI("NvOsHeap 探针已装：入口 0x44f9f0 → 桩 0xc90500");
         za_cnctp_ready = 1;
     }
 
