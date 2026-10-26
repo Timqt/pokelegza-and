@@ -162,6 +162,18 @@ static void za_hook_abort_entry(unsigned long long *r)
 
 static void za_hook_waitloop(unsigned long long *r)     { za_probe_log("svc52-loop", r); }
 static void za_hook_cswait(unsigned long long *r)       { za_probe_log("cs-wait", r); }
+// 等待原语返回后的判错点（sdk+0x145934 = `cbnz w0, abort`）：
+// 只在 w0 != 0 时打日志 —— 直接告诉我们哪条等待返回了什么错误码。
+static void za_hook_waiterr(unsigned long long *r)
+{
+    unsigned int w0 = (unsigned int)r[0];
+    if (w0 == 0) return;                      // 正常（0）不打
+    static int n;
+    if (n++ >= 8) return;
+    ZLOGE("★ 等待返回非 0: w0=%#x（Result） lr=%#llx x1=%#llx x2=%#llx",
+          w0, r[19], r[1], r[2]);
+}
+
 static void za_hook_workerblr(unsigned long long *r)
 {
     // SDK 线程入口 0x144a50 在 0x144aa0 处 `blr x8` 调用户函数：
@@ -701,6 +713,8 @@ int za_sdk_load(za_mod_t *sdk,
         // 线程入口里真正调用用户函数的那条 blr（0x144aa0）——目标由线程对象算出，
         // 正是当前「跳到 0x1c/0x24/0x35」的可疑来源。
         za_install_entry_probe(base, 0x144aa0, 0xc909e0, 0xc90a58, za_hook_workerblr);
+        // abort 前的判错点：哪条等待返回了非 0
+        za_install_entry_probe(base, 0x145934, 0xc90a60, 0xc90ad8, za_hook_waiterr);
         za_install_entry_probe(base, 0x13b370, 0xc908e0, 0xc90958, za_hook_cswait);
         // 内存池初始化（main+0x1653cc0：x0=desc, x1=stride, x2=base, w3=size）。
         // PC 采样多次落在这个链表构建循环上；若 size/stride 不自洽会越界写。
