@@ -517,7 +517,7 @@ static void za_log_sdk_state(unsigned long x19, unsigned long x8)
 
     // ① self 结构里的 owner_id（临界区真正读的地方）
     {
-        unsigned long long ro = sdk + ZA_TLSRO_OFF, self = 0;
+        unsigned long long ro = (unsigned long long)za_os_tls_ro_area(), self = 0;
         if (za_read_bytes(ro + 0x1f8, &self, 8) && self)
         {
             unsigned long long oid = 0;
@@ -563,7 +563,7 @@ static void za_log_sdk_state(unsigned long x19, unsigned long x8)
 
     // ③ 只读 TLS 页的关键槽
     {
-        unsigned long long ro = sdk + ZA_TLSRO_OFF;
+        unsigned long long ro = (unsigned long long)za_os_tls_ro_area();
         static const unsigned offs[] = { 0x00, 0x20, 0x70, 0x78, 0x80, 0x1e0, 0x1f0, 0x1f8 };
         for (unsigned i = 0; i < sizeof offs / sizeof offs[0]; i++)
         {
@@ -1200,6 +1200,7 @@ typedef struct
     unsigned long long slot_guest;  // 客机期望值（变量区相对 tp16 的偏移 / 8）
     unsigned long tp16;
     long tid;           // 归属线程（0 = 槽位空闲）
+    void *ro;           // 本线程的只读 TLS 页（TPIDRRO 语义 + CMIF 应答缓冲）
 } za_tls_state_t;
 static za_tls_state_t za_tls_states[ZA_TLS_SLOTS];
 
@@ -1282,13 +1283,39 @@ void za_os_install_tls_descriptor(void)
     st->slot_orig = *(unsigned long long *)(b16 + 0x98);
     st->slot_guest = (unsigned long long)(((long long)((unsigned long)(uintptr_t)t - b16)) / 8);
     *(unsigned long long *)(b16 + 0x98) = st->slot_guest;
-    ZLOGI("客机 TLS: [tp16+0x98] %#llx -> %#llx，tp=%p 变量区=%p",
-          st->slot_orig, st->slot_guest, b, t);
+
+    // ── 每线程的只读 TLS 页（TPIDRRO 语义）────────────────────────────
+    // 布局（从 SDK 的 123 处用法反推）：
+    //   +0x100/+0x102/+0x104 = 本线程 busy 标记（CriticalSection 忙等协议）
+    //   +0x1e0 / +0x20 / +0x70… = 指向「本线程结构」的指针
+    //   +0x1f0 = 本线程 TPIDR_EL0（SDK 线程入口会 `msr tpidr_el0, [ro+0x1f0]`）
+    //   +0x1f8 = 本线程对象（SDK 线程入口写入 ThreadType*）
+    // ★ 这一页同时是 **CMIF IPC 的应答缓冲**（内核写 [ro+槽位]）⇒ 必须每线程一份。
+    {
+        unsigned char *ro  = (unsigned char *)t + 0x300000;
+        unsigned char *ro2 = (unsigned char *)t + 0x301000;
+        unsigned long long p2 = (unsigned long long)(uintptr_t)ro2;
+        static const int ptr_slots[] = { 0x00, 0x20, 0x70, 0x78, 0x80, 0x1e0, 0x1f8 };
+        for (unsigned i = 0; i < sizeof ptr_slots / sizeof ptr_slots[0]; i++)
+            *(unsigned long long *)(ro + ptr_slots[i]) = p2;
+        *(unsigned long long *)(ro + 0x1f0) = (unsigned long long)(uintptr_t)b;
+        // owner_id 必须非 0，且要和 svc#37 GetThreadId 同源（用宿主 tid 目前自洽）
+        *(unsigned int *)(ro2 + 0x1b0) = (unsigned int)syscall(SYS_gettid);
+        st->ro = ro;
+    }
+    ZLOGI("客机 TLS: [tp16+0x98] %#llx -> %#llx，tp=%p 变量区=%p RO页=%p",
+          st->slot_orig, st->slot_guest, b, t, st->ro);
 }
 
 unsigned long za_os_guest_tls_area(void)
 {
     return (unsigned long)(uintptr_t)za_tls_cur()->area;
+}
+
+// TPIDRRO_EL0 的每线程替代：SDK 的 123 处站点经桩调到这里。
+unsigned long za_os_tls_ro_area(void)
+{
+    return (unsigned long)(uintptr_t)za_tls_cur()->ro;
 }
 
 // 客机 GetCurrentThread 要非空指针：给每线程一个假对象
@@ -1374,9 +1401,12 @@ static const za_host_sym_t za_host_syms[] = {
     { "_ZN2nn2os11GetThreadIdEPKNS_10ThreadTypeE", (void *)za_os_get_thread_id },
 
     // 互斥锁
-    { "_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi", (void *)za_os_initialize_mutex },
-    { "_ZN2nn2os9LockMutexEPNS0_9MutexTypeE", (void *)za_os_lock_mutex },
-    { "_ZN2nn2os11UnlockMutexEPNS0_9MutexTypeE", (void *)za_os_unlock_mutex },
+    // ★ 2026-10-26：**不再接管** mutex。SDK 的 mutex 是纯用户态实现
+    //   （InitializeMutex 只初始化结构体；Lock/Unlock 走 SDK 自己的临界区，
+    //    争用才用 svc#26/27 + svc#52/53 —— 这几个我们已经实现）。
+    //   接管掉 LockMutex 会让 SDK 的 MutexType 状态对不上，随后 SDK 的
+    //   WaitConditionVariable 里 `mutex->owner == [tpidrro+0x1f8]` 必然失败 ⇒ abort。
+    //   （实测 abort 链：main+0x1bab754 → sdk+0x1387f0 WaitConditionVariable → assert）
 
     // 信号量
     { "_ZN2nn2os19InitializeSemaphoreEPNS0_13SemaphoreTypeEii", (void *)za_os_initialize_semaphore },
@@ -1803,6 +1833,9 @@ int za_guest_boot(za_guest_t *g)
     if (!g || !g->base) return -1;
     za_guest_start_sampler();
     za_os_install_tls_descriptor();
+    // 实测（2026-10-26，平板）：`msr TPIDRRO_EL0, x` 在 EL0 直接 SIGILL
+    // —— 这个寄存器对 EL0 是只读的，所以 123 处 `mrs tpidrro_el0` 只能
+    // 靠代码改写；「每线程的只读 TLS」也必须靠别的手段实现。
     za_guest_tid = syscall(SYS_gettid);
 
     {

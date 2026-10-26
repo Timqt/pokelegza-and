@@ -361,7 +361,7 @@ long za_horizon_svc(long a0, long a1, long a2, long a3,
 extern volatile unsigned long za_ro_tls_page;
 static unsigned int za_current_owner_id(void)
 {
-    unsigned long ro = (unsigned long)za_ro_tls_page;
+    unsigned long ro = za_os_tls_ro_area();   // ★ 每线程页（不是全局页）
     // 兜底也必须是「真实 tid」：owner_id 的唯一权威来源就是 svc#37 GetThreadId，
     // 客机加锁时把它的返回值写进锁字，解锁时用 [self+0x1b0] 比。
     unsigned int fallback = (unsigned int)syscall(SYS_gettid);
@@ -1451,7 +1451,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
               (unsigned long)a4, (unsigned long)a5, (unsigned long)a6, (unsigned long)a7);
         // ★ 见上面「IPC 应答生成」注释块：这一页（za_ro_tls_page）就是内核
         //   的应答缓冲区，请求也在这里。
-        unsigned long long ro = za_ro_tls_page;   // 由 za_sdk.c 在装载时填
+        unsigned long long ro = za_os_tls_ro_area();   // ★ 本线程的只读 TLS 页
         unsigned int hdr0 = 0, hdr1 = 0;
         unsigned int sm_cnt = 0, sm_sess = 0;
         if (ro)
@@ -1583,7 +1583,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         //   ⚠ 不要读 Break 的 a0 当锁字 —— a0 是 reason（恒为 0），
         //     上一版据此报「lockword=0 match=NO」是自己造的假结论。
         {
-            unsigned long ro = (unsigned long)za_ro_tls_page;
+            unsigned long ro = za_os_tls_ro_area();
             unsigned long self = 0;
             if (ro)
                 memcpy(&self, (void *)(uintptr_t)(ro + 0x1f8), 8);

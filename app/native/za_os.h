@@ -7,6 +7,9 @@
 // 每个客机线程都要装一次「影子 TLS 描述符」（见 za_guest.c 里的说明）。
 void za_os_install_tls_descriptor(void);
 
+// 本线程的只读 TLS 页（TPIDRRO_EL0 的替代；同时也是 CMIF 应答缓冲）。
+unsigned long za_os_tls_ro_area(void);
+
 // 当前线程对应的「客机 ThreadType 对象」—— GetCurrentThread 要返回非空合法指针。
 void *za_os_current_thread_obj(void);
 

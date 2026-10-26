@@ -1,17 +1,29 @@
 #!/usr/bin/env python3
-"""生成 SDK 里 `mrs Xt,TPIDRRO_EL0` 的改写补丁。
+"""生成 SDK 里 123 处 `mrs Xt,TPIDRRO_EL0` 的改写补丁（**每线程**只读 TLS）。
 
-背景（2026-10-25 实测）：
-  客机 SDK 有 123 处直接读「只读 TLS 寄存器」TPIDRRO_EL0（main NSO 里 0 处）。
-  安卓/bionic **从不设置 TPIDRRO_EL0** ⇒ 它一直是 0 ⇒
-  `mrs x8,TPIDRRO_EL0 ; ldr x8,[x8,#0x1f8]` 读到地址 0x1f8 ⇒ pc=0 崩溃。
+背景（2026-10-26 实测）：
+  * 安卓/bionic 从不设置 TPIDRRO_EL0（一直是 0），而 SDK 拿它当 Horizon 的
+    线程只读区（ThreadLocalRegion）：
+        +0x100/+0x102/+0x104  本线程 busy 标记（InternalCriticalSection 忙等）
+        +0x1e0/+0x20/+0x70…   指向本线程结构的指针
+        +0x1f0                本线程 TPIDR_EL0（SDK 线程入口会 msr tpidr_el0,[ro+0x1f0]）
+        +0x1f8                本线程对象（SDK 线程入口写 ThreadType*）
+    这一页还是 **CMIF IPC 的应答缓冲区**（内核应答写回 [ro+槽位]）。
+  * 以前用**一张全局页** + `adrp Xt,<全局页>` 代替 ⇒ 多线程互相踩
+    （彼此看到对方的 busy 标记 ⇒ 活锁；IPC 缓冲互相覆盖）。
+  * TPIDRRO_EL0 在 EL0 **不可写**（实测 `msr` 直接 SIGILL），所以只能改代码。
 
-做法（和已有的 TPIDR_EL0 改写同一思路）：
-  `mrs Xt, TPIDRRO_EL0`  →  `adrp Xt, <我们自备的只读 TLS 页>`
-  —— **1 条换 1 条**，后面的指令与偏移全部保持不变，
-  于是「相对偏移」语义完全一致；那一页的内容由我们填。
+做法（每站点一个桩，因为原 mrs 后面紧跟的是真代码，不能占用 2 条槽位）：
+    mrs Xt, TPIDRRO_EL0   →   b <站点桩>
+  桩（28 条指令）：
+    sub sp,sp,#0xa0 ; stp x0..x17 ; str x30
+    adrp/ldr x16,<全局 hook 槽> ; blr x16        ← 宿主 za_os_tls_ro_area()
+    str x0,[sp,#0x98]
+    ldp x0..x17 ; ldr x30
+    ldr Xt,[sp,#0x98]                            ← 本线程 RO 页写回原寄存器
+    add sp,sp,#0xa0 ; b site+4
 
-只读 TLS 页放在 SDK 映像末尾的扩展区（RW），偏移见输出。
+输出：app/native/za_tlsro_patch.h（补丁表 + 桩机器码）
 """
 import os
 import struct
@@ -20,79 +32,89 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SDK_TEXT = os.path.join(ROOT, "work", "nso_32848007", "text.bin")
 OUT_H = os.path.join(ROOT, "app", "native", "za_tlsro_patch.h")
 
-# SDK 映像末尾扩展区（必须 > 映像大小 0xC5E000，且在门区之外）
-RO_TLS_OFF = 0xF00000        # 只读 TLS 页（RW，客机会往里写）
-RO_TLS_SIZE = 0x1000
-RO_TLS2_OFF = 0xF01000        # 只读 TLS 里那些指针指向的「小结构体」页
-RO_TLS2_SIZE = 0x1000
+STUB_BASE = 0xC92000      # 每站点桩区（SDK 映像内偏移，扩展区）
+STUB_STRIDE = 0x70        # 28 条指令 = 112 字节
+HOOK_SLOT = 0xC96000      # 全局 hook 槽（运行时填 &za_os_tls_ro_area）
+STUB_INSNS = 28
 
-MRS_TPIDRRO = 0xD53BD060     # mrs Xt, TPIDRRO_EL0
+MRS_TPIDRRO = 0xD53BD060
 
 
-def adrp_x(rd, page_delta):
-    """编码 adrp Xd, <page>：imm21 = (目标页 - 本指令所在页) >> 12。
+def enc_b(frm, to):
+    off = to - frm
+    assert -(1 << 27) <= off < (1 << 27) and off % 4 == 0, "b 越界 %#x -> %#x" % (frm, to)
+    return 0x14000000 | ((off >> 2) & 0x3FFFFFF)
 
-    ADRP 的立即数布局：immlo 在 bit30:29，immhi 在 bit23:5，21 位整体算出来后
-    左移 12 位当页偏移 —— 不能简单地把 imm 塞进 bit23:5（会放大 4 倍）。
-    """
-    imm = page_delta >> 12
-    if imm < 0:
-        imm += (1 << 21)
-    if not (0 <= imm <= 0x1FFFFF):
-        raise ValueError("adrp 立即数越界: %d" % imm)
-    immlo = imm & 3
-    immhi = (imm >> 2) & 0x7FFFF
-    return 0x90000000 | (immlo << 29) | (immhi << 5) | rd
+
+def enc_adrp(rd, pc, target):
+    imm = ((target & ~0xFFF) - (pc & ~0xFFF)) >> 12
+    assert -(1 << 20) <= imm < (1 << 20), "adrp 越界"
+    return 0x90000000 | ((imm & 3) << 29) | (((imm >> 2) & 0x7FFFF) << 5) | rd
+
+
+def enc_ldr(rt, rn, imm12):
+    return 0xF9400000 | (imm12 << 10) | (rn << 5) | rt
+
+
+def build_stub(site, stub_off, rt):
+    s = [0xD10283FF]                                    # sub sp,sp,#0xa0
+    s += [0xA90007E0, 0xA9010FE2, 0xA90217E4, 0xA9031FE6,
+          0xA90427E8, 0xA9052FEA, 0xA90637EC, 0xA9073FEE, 0xA90847F0]   # stp x0..x17
+    s.append(0xF9004BFE)                                # str x30,[sp,#0x90]
+    s.append(enc_adrp(16, stub_off + len(s) * 4, HOOK_SLOT))
+    s.append(enc_ldr(16, 16, (HOOK_SLOT & 0xFFF) // 8))
+    s.append(0xD63F0200)                                # blr x16
+    s.append(0xF9004FE0)                                # str x0,[sp,#0x98]
+    s += [0xA94007E0, 0xA9410FE2, 0xA94217E4, 0xA9431FE6,
+          0xA94427E8, 0xA9452FEA, 0xA94637EC, 0xA9473FEE, 0xA94847F0]   # ldp x0..x17
+    s.append(0xF9404BFE)                                # ldr x30,[sp,#0x90]
+    s.append(enc_ldr(rt, 31, 0x98 // 8))                # ldr Xt,[sp,#0x98]
+    s.append(0x910283FF)                                # add sp,sp,#0xa0
+    s.append(enc_b(stub_off + len(s) * 4, site + 4))    # b site+4
+    return s
 
 
 def main():
     d = open(SDK_TEXT, "rb").read()
     n = len(d) // 4
     words = list(struct.unpack_from("<%dI" % n, d, 0))
+    sites = [(i * 4, words[i] & 31) for i in range(n)
+             if (words[i] & 0xFFFFFFE0) == MRS_TPIDRRO]
+    print("TPIDRRO_EL0 站点：%d 处" % len(sites))
 
     patches = []
-    usage = {}
-    for i in range(n):
-        w = words[i]
-        if (w & 0xFFFFFFE0) != MRS_TPIDRRO:
-            continue
-        rt = w & 31
-        off = i * 4
-        page_delta = RO_TLS_OFF - (off & ~0xFFF)
-        patches.append((off, adrp_x(rt, page_delta)))
-        # 统计后续对这个寄存器的用法（粗略：看后 4 条指令里有没有以它为基址的访存）
-        for j in range(i + 1, min(i + 5, n)):
-            w2 = words[j]
-            # LDR/STR (unsigned imm) 且基址是该寄存器
-            if (w2 & 0x3B200000) == 0x39000000 and ((w2 >> 5) & 31) == rt:
-                size = (w2 >> 30) & 3
-                imm = ((w2 >> 10) & 0xFFF) << size
-                key = (imm, size)
-                usage[key] = usage.get(key, 0) + 1
-
-    print("TPIDRRO_EL0 改写点：%d 处" % len(patches))
-    print("以该寄存器为基址的访存（偏移, 宽度）分布：")
-    for k in sorted(usage):
-        kind = {0: "字节", 1: "半字", 2: "字", 3: "双字"}[k[1]]
-        print("    +%#x (%s) : %d 处" % (k[0], kind, usage[k]))
+    for k, (off, rt) in enumerate(sites):
+        stub = STUB_BASE + k * STUB_STRIDE
+        seq = build_stub(off, stub, rt)
+        assert len(seq) == STUB_INSNS
+        patches.append((off, stub, seq))
 
     with open(OUT_H, "w", encoding="utf-8", newline="\n") as o:
         o.write("// 自动生成：tools/patch_tls_ro.py —— 别手改\n")
-        o.write("// 把 SDK 里 `mrs Xt,TPIDRRO_EL0` 换成 `adrp Xt,<我们自备的只读 TLS 页>`。\n")
-        o.write("// 安卓/bionic 从不设置 TPIDRRO_EL0（一直是 0），客机读它就会取到空指针。\n")
-        o.write("// 1 条换 1 条，后面的指令与相对偏移全部不变 ⇒ 语义等价。\n")
+        o.write("// SDK 的 123 处 `mrs Xt,TPIDRRO_EL0` → `b <每站点桩>`；\n")
+        o.write("// 桩调用宿主取**本线程**的只读 TLS 页（TPIDRRO 语义 + CMIF 应答缓冲）。\n")
         o.write("#ifndef ZA_TLSRO_PATCH_H\n#define ZA_TLSRO_PATCH_H\n\n")
-        o.write("#define ZA_TLSRO_OFF      0x%xul   /* 只读 TLS 页（基址 + 该偏移） */\n" % RO_TLS_OFF)
-        o.write("#define ZA_TLSRO_SIZE    0x%xul\n" % RO_TLS_SIZE)
-        o.write("#define ZA_TLSRO2_OFF    0x%xul   /* 那些指针指向的小结构体页 */\n" % RO_TLS2_OFF)
-        o.write("#define ZA_TLSRO2_SIZE  0x%xul\n" % RO_TLS2_SIZE)
+        o.write("#define ZA_TLSRO_STUB_BASE  0x%xul\n" % STUB_BASE)
+        o.write("#define ZA_TLSRO_HOOK_SLOT  0x%xul\n" % HOOK_SLOT)
+        o.write("/* 旧全局页常量：现在只用于诊断（页本身已被每线程页取代） */\n")
+        o.write("#define ZA_TLSRO_OFF      0xf00000ul\n")
+        o.write("#define ZA_TLSRO_SIZE     0x1000ul\n")
+        o.write("#define ZA_TLSRO2_OFF     0xf01000ul\n")
+        o.write("#define ZA_TLSRO2_SIZE    0x1000ul\n")
         o.write("#define ZA_TLSRO_PATCH_COUNT %d\n\n" % len(patches))
-        o.write("typedef struct { unsigned int off; unsigned int w; } za_tlsro_patch_t;\n\n")
+        o.write("typedef struct { unsigned int off; unsigned int stub; const unsigned int *seq; }"
+                " za_tlsro_patch_t;\n\n")
+        o.write("static const unsigned int za_tlsro_stubs[%d][%d] = {\n"
+                % (len(patches), STUB_INSNS))
+        for off, stub, seq in patches:
+            o.write("  { /* site %#x */ %s },\n"
+                    % (off, ", ".join("0x%08xu" % w for w in seq)))
+        o.write("};\n\n")
         o.write("static const za_tlsro_patch_t za_tlsro_patches[] = {\n")
-        for off, w in patches:
-            o.write("    {0x%xu, 0x%08xu},\n" % (off, w))
+        for i, (off, stub, seq) in enumerate(patches):
+            o.write("  {0x%xu, 0x%xu, za_tlsro_stubs[%d]},\n" % (off, stub, i))
         o.write("};\n\n#endif\n")
-    print("补丁表 -> %s" % OUT_H)
+    print("补丁表 -> %s（%d 个站点桩）" % (OUT_H, len(patches)))
 
 
 if __name__ == "__main__":

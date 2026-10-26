@@ -682,39 +682,28 @@ int za_sdk_load(za_mod_t *sdk,
     //      +0x1b0 = 32 位「代数」
     //    +0x1f8 是「当前线程自己」的指针（会与对象里存的指针比较），
     //    客机还会往 +0x1f0 写 ⇒ 这一页必须可写（它落在映像末尾扩展区，默认 RW）。
+    //
+    // ★★ 2026-10-26 重做：只读 TLS 必须**每线程一份**。
+    //   证据：SDK 的 123 处访问里，+0x100/+0x102/+0x104 是**本线程**的 busy 标记
+    //   （InternalCriticalSection 的忙等协议），+0x1f0 是本线程 TPIDR，
+    //   +0x1f8 是本线程对象；而且这一页还是 **CMIF IPC 的应答缓冲**
+    //   （内核把应答写回 [TPIDRRO+槽位]）。全局一张页会让线程互相踩 ⇒ 活锁。
+    //   实测 TPIDRRO_EL0 在 EL0 **不可写**（msr 直接 SIGILL），所以只能改代码。
+    //   做法：把 `mrs Xt,TPIDRRO_EL0`（1 条）换成 `b <每站点桩>`，
+    //   桩保存 x0–x17/x30 → 调宿主 za_os_tls_ro_area() 取**本线程**的页 →
+    //   `ldr Xt,[sp,#0x98]` 写回原寄存器 → 跳回 site+4。
     for (unsigned i = 0; i < ZA_TLSRO_PATCH_COUNT; i++)
     {
-        unsigned int *slot = (unsigned int *)(base + za_tlsro_patches[i].off);
-        *slot = za_tlsro_patches[i].w;
+        const za_tlsro_patch_t *p = &za_tlsro_patches[i];
+        memcpy((void *)(uintptr_t)(base + p->stub), p->seq, 28 * 4);
+        long long d = (long long)p->stub - (long long)p->off;
+        *(unsigned int *)(base + p->off) =
+            0x14000000u | (unsigned)((d >> 2) & 0x3FFFFFFu);
     }
-    {
-        unsigned char *ro = base + ZA_TLSRO_OFF;
-        unsigned char *ro2 = base + ZA_TLSRO2_OFF;
-        memset(ro, 0, ZA_TLSRO_SIZE);
-        memset(ro2, 0, ZA_TLSRO2_SIZE);
-        unsigned long long p2 = (unsigned long long)(uintptr_t)ro2;
-        // 指针型槽都指向第二页（客机的「线程自己」结构）
-        const int ptr_slots[] = { 0x00, 0x20, 0x70, 0x78, 0x80, 0x1e0, 0x1f8 };
-        for (unsigned i = 0; i < sizeof ptr_slots / sizeof ptr_slots[0]; i++)
-            *(unsigned long long *)(ro + ptr_slots[i]) = p2;
-        // ★ [self+0x1b0] = 「当前线程 owner id」。
-        //   nn::os::detail::InternalCriticalSectionImplByHorizon::IsLockedByCurrentThread()
-        //   是这样判的： (锁字 & 0xbfffffff) == owner_id ⇒ 「锁被当前线程持有」。
-        //   空闲锁的锁字是 0 ⇒ **owner id 绝不能是 0**，否则一进临界区就断言
-        //   （实测就是这里 AbortImpl 崩的：nn::os 的 CriticalSection::Enter）。
-        //   客机加锁时把锁字写成 owner_id（见 SDK 0x145fb8: stxr w9,w8,[x0]），
-        //   所以两边用同一个值即可自洽。bit29 必须为 0（比较前会被掩掉）。
-        // ★ owner_id 必须等于 svc#37 GetThreadId 返回的 tid。
-        //   客机加锁时把 GetThreadId 的值写进锁字（sdk+0x144600），解锁时
-        //   （sdk+0x14604c）拿 [self+0x1b0] 去比；两边不同源 => 永远不相等
-        //   => 判「锁不属于当前线程」=> abort（实测 error 0x1a80a）。
-        //   以前这里写死 1u，是这一整串崩溃的直接原因。
-        *(unsigned int *)(ro2 + 0x1b0) = (unsigned int)syscall(SYS_gettid);
-        za_ro_tls_page = (unsigned long)(uintptr_t)ro;      // 供 za_horizon.c 取 owner_id
-        ZLOGI("只读 TLS：改写 %u 处 TPIDRRO_EL0，页=%p（self=%p，owner_id=%u=本线程 tid）",
-              ZA_TLSRO_PATCH_COUNT, (void *)ro, (void *)ro2,
-              (unsigned)syscall(SYS_gettid));
-    }
+    *(unsigned long long *)(base + ZA_TLSRO_HOOK_SLOT) =
+        (unsigned long long)(uintptr_t)&za_os_tls_ro_area;
+    ZLOGI("只读 TLS：%u 处 TPIDRRO_EL0 → 每站点桩（%#x..），每线程页由宿主提供",
+          ZA_TLSRO_PATCH_COUNT, (unsigned)ZA_TLSRO_STUB_BASE);
 
     // 8) 客机不许动 bionic 的 TLS 指针
     //    客机（SDK）里有 `msr TPIDR_EL0, xN`（写 TPIDR_EL0）—— 那在安卓上就是
@@ -773,8 +762,8 @@ int za_sdk_load(za_mod_t *sdk,
     //   初始 mmap 是 RW ⇒ 不收紧就是 NX。mprotect 成 R+X。
     //   ⚠ clear_cache 也必须做 —— 漏了就是「客机在桩区间弹跳」的实锤
     //   （0xc9028c，看门狗 SIGSEGV 抓到的现行）。
-    __builtin___clear_cache((char *)base + 0xc90000, (char *)base + 0xc91000);
-    mprotect(base + 0xc90000, 0x1000, PROT_READ | PROT_EXEC);
+    __builtin___clear_cache((char *)base + 0xc90000, (char *)base + 0xc97000);
+    mprotect(base + 0xc90000, 0x7000, PROT_READ | PROT_EXEC);
     mprotect(base, ZA_SDK_RODATA_OFF, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_SVC_GATE_BASE, ZA_SVC_GATE_SIZE, PROT_READ | PROT_EXEC);
     mprotect(base + ZA_SDK_RODATA_OFF, ZA_SDK_DATA_OFF - ZA_SDK_RODATA_OFF, PROT_READ);
@@ -919,15 +908,18 @@ int za_sdk_run_init(za_mod_t *sdk)
 // SDK 在 sdk+0x13edb4 处 `str x20,[x8,#0x1f8]`（x20 = 线程对象+8）把它写成当前线程，
 // 之后又从这个槽取回来当对象用。它必须落在**可写**的客机 TLS 区里（不能指我们自造的 ro2，
 // 否则 SDK 写进去的是「指向 ro2 的指针」，取回来当对象访问 ⇒ 字段错位 ⇒ 读到 0 ⇒ blr 0）。
+// ★ 只读 TLS 现在是**每线程**一份（za_os_tls_ro_area()），这里写当前线程的页。
 void za_sdk_set_ro_tls_self(unsigned long self)
 {
-    if (!za_sdk_base) return;
-    *(unsigned long long *)(za_sdk_base + ZA_TLSRO_OFF + 0x1f8) = (unsigned long long)self;
+    unsigned long ro = za_os_tls_ro_area();
+    if (!ro) return;
+    *(unsigned long long *)(ro + 0x1f8) = (unsigned long long)self;
 }
 void za_sdk_set_ro_tls_tpidr(unsigned long tp)
 {
-    if (!za_sdk_base) return;
-    *(unsigned long long *)(za_sdk_base + ZA_TLSRO_OFF + 0x1f0) = (unsigned long long)tp;
+    unsigned long ro = za_os_tls_ro_area();
+    if (!ro) return;
+    *(unsigned long long *)(ro + 0x1f0) = (unsigned long long)tp;
 }
 // ── 模块链表登记（扮演 nnrtld）────────────────────────────────────
 //
