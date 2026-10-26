@@ -825,6 +825,27 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 za_fatal_write(buf, (size_t)(p - buf));
             }
         }
+        // ★ 帧内保存的寄存器：fp 往前 0x40 字节（读函数入参/局部）
+        {
+            unsigned long long fp = (unsigned long long)uc->uc_mcontext.regs[29];
+            for (int f = 0; f < 2 && fp; f++)
+            {
+                char *q = buf;
+                q = za_put_str(q, "ZaGuest: FRAME");
+                q = za_put_dec(q, f);
+                q = za_put_str(q, "=");
+                for (int i = 0; i < 8; i++)
+                {
+                    q = za_put_str(q, " ");
+                    q = za_put_hex(q, *(unsigned long long *)(uintptr_t)(fp + i * 8));
+                }
+                q = za_put_str(q, "\n");
+                za_fatal_write(buf, (size_t)(q - buf));
+                unsigned long long nfp = *(unsigned long long *)(uintptr_t)fp;
+                if (nfp <= fp) break;
+                fp = nfp;
+            }
+        }
         // ★ 通用：x0 指向 SDK bss 时 dump 该对象（nvn 堆结构等就在这里）。
         {
             unsigned long long x0v = (unsigned long long)uc->uc_mcontext.regs[0];
