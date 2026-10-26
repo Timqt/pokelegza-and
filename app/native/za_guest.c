@@ -1784,6 +1784,45 @@ static unsigned int za_hid_init_ok(void) { return 0; }
 // 现阶段直接吞掉，避免它们把未初始化的服务错误当成致命错误 Abort。
 static void za_hid_noop(void) { }
 
+// ── 最小 fs 垫片（读路径）────────────────────────────────────────
+// 静态构造函数里是 OpenFile → GetFileSize → (ReadFile) → CloseFile。
+// 只接管 OpenFile 的话，GetFileSize 仍会走 CMIF 返回 0x177a02 ⇒ 重试 16 次后
+// Abort。这里把读路径整条接管成「空文件」：大小 0、读到 0 字节。
+// ⚠ 临时方案：接真正的 romfs/save 后端后要撤掉。
+static unsigned int za_fs_getfilesize(long long *out, unsigned int h)
+{
+    (void)h;
+    if (out) *out = 0;
+    return 0;
+}
+static unsigned int za_fs_readfile_cnt(unsigned long *out_read, unsigned int h,
+                                       long long off, void *buf, unsigned long size)
+{
+    (void)h; (void)off;
+    if (out_read) *out_read = 0;
+    if (buf && size && size <= (4u << 20)) memset(buf, 0, (size_t)size);
+    return 0;
+}
+static unsigned int za_fs_readfile(unsigned int h, long long off, void *buf, unsigned long size)
+{
+    (void)h; (void)off;
+    if (buf && size && size <= (4u << 20)) memset(buf, 0, (size_t)size);
+    return 0;
+}
+static unsigned int za_fs_closefile(unsigned int h) { (void)h; return 0; }
+static unsigned int za_fs_flushfile(unsigned int h) { (void)h; return 0; }
+static unsigned int za_fs_setfilesize(unsigned int h, long long sz) { (void)h; (void)sz; return 0; }
+static unsigned int za_fs_createfile(const char *p, int mode) { (void)p; (void)mode; return 0; }
+static unsigned int za_fs_deletefile(const char *p) { (void)p; return 0; }
+static unsigned int za_fs_createdir(const char *p) { (void)p; return 0; }
+// DirectoryEntryType: 0=Directory, 1=File（这里一律当文件）
+static unsigned int za_fs_getentrytype(unsigned int *out, const char *p)
+{
+    (void)p;
+    if (out) *out = 1;
+    return 0;
+}
+
 // nn::fs::OpenFile(FileHandle* out, const char* path, int mode)
 // main 的静态构造函数里会开一个文件并用 16 次重试等它出现；失败就 Abort。
 // 我们的 fs 服务还没有实现「指针缓冲」那一层（路径字符串走 PointerAndSize
@@ -1825,6 +1864,16 @@ static const za_host_sym_t za_host_syms[] = {
     { "_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", (void *)za_hid_init_ok },
     { "_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", (void *)za_hid_noop },
     { "_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", (void *)za_fs_openfile },
+    { "_ZN2nn2fs11GetFileSizeEPlNS0_10FileHandleE", (void *)za_fs_getfilesize },
+    { "_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", (void *)za_fs_readfile_cnt },
+    { "_ZN2nn2fs8ReadFileENS0_10FileHandleElPvm", (void *)za_fs_readfile },
+    { "_ZN2nn2fs9CloseFileENS0_10FileHandleE", (void *)za_fs_closefile },
+    { "_ZN2nn2fs9FlushFileENS0_10FileHandleE", (void *)za_fs_flushfile },
+    { "_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl", (void *)za_fs_setfilesize },
+    { "_ZN2nn2fs10CreateFileEPKcl", (void *)za_fs_createfile },
+    { "_ZN2nn2fs10DeleteFileEPKc", (void *)za_fs_deletefile },
+    { "_ZN2nn2fs15CreateDirectoryEPKc", (void *)za_fs_createdir },
+    { "_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", (void *)za_fs_getentrytype },
     { "_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", (void *)za_hid_noop },
     { "_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", (void *)za_hid_noop },
 
