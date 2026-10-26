@@ -362,6 +362,7 @@ long za_horizon_svc(long a0, long a1, long a2, long a3,
 extern volatile unsigned long za_ro_tls_page;
 unsigned long long za_dbg_last_wait;   // 最近一次 WaitForAddress 的地址
 unsigned long long za_dbg_last_phys_addr, za_dbg_last_phys_size;
+unsigned long long za_dbg_last_break_info, za_dbg_last_break_size;
 static unsigned int za_current_owner_id(void)
 {
     unsigned long ro = za_os_tls_ro_area();   // ★ 每线程页（不是全局页）
@@ -1646,6 +1647,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     // ── 调试 ──
     case 38: // Break(reason=x0, info=x1, size=x2)
     {
+        za_dbg_last_break_info = (unsigned long long)a1;
+        za_dbg_last_break_size = (unsigned long long)a2;
         // 客机的断言/致命错误：reason 是 BreakReason，info 指向一个 size 字节的值。
         // 把这个值读出来 —— 它能直接指出是哪个断言（模块号/行号）。
         unsigned long long v = 0;

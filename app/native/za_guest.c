@@ -981,6 +981,38 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
             }
         }
+        // ★ 最近一次 Break 的 info 块（前 0x40 字节 + 其中的字符串指针）
+        {
+            extern unsigned long long za_dbg_last_break_info, za_dbg_last_break_size;
+            unsigned long long a = za_dbg_last_break_info;
+            if (a && za_va_plausible(a))
+            {
+                ZLOGI("ZaGuest: BREAK-INFO @%#llx size=%llu", a, za_dbg_last_break_size);
+                for (int i = 0; i < 0x40; i += 8)
+                {
+                    unsigned long long v = 0;
+                    memcpy(&v, (const void *)(uintptr_t)(a + i), 8);
+                    ZLOGI("  +%#02x: %016llx", i, v);
+                    // 若像映像内地址，按 C 字符串打出来
+                    extern unsigned char *za_guest_base;
+                    if (za_sdk_base && v >= za_sdk_base && v < za_sdk_base + za_sdk_size)
+                    {
+                        const char *str = (const char *)(uintptr_t)v;
+                        int ok = 0;
+                        for (int k = 0; k < 96; k++) { if (!str[k]) { ok = 1; break; } if ((unsigned char)str[k] < 0x20) break; }
+                        if (ok) ZLOGI("      ^ sdk 字符串: \"%s\"", str);
+                    }
+                    else if (za_guest_base && v >= (unsigned long long)(uintptr_t)za_guest_base &&
+                             v < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE)
+                    {
+                        const char *str = (const char *)(uintptr_t)v;
+                        int ok = 0;
+                        for (int k = 0; k < 96; k++) { if (!str[k]) { ok = 1; break; } if ((unsigned char)str[k] < 0x20) break; }
+                        if (ok) ZLOGI("      ^ main 字符串: \"%s\"", str);
+                    }
+                }
+            }
+        }
         // ★ 最近一次 svc#44 映射的物理区（前 0x200 字节）
         {
             extern unsigned long long za_dbg_last_phys_addr, za_dbg_last_phys_size;
