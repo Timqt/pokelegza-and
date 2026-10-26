@@ -163,6 +163,23 @@ static void za_hook_abort_entry(unsigned long long *r)
 static void za_hook_waitloop(unsigned long long *r)     { za_probe_log("svc52-loop", r); }
 static void za_hook_cswait(unsigned long long *r)       { za_probe_log("cs-wait", r); }
 static void za_hook_poolinit(unsigned long long *r)     { za_probe_log("pool-init", r); }
+// 空闲链表构建循环入口（main+0x1653d00）：
+//   x0 = 池描述符（+0x18 stride, +0x1c count），x2 = 池基址，x8 = stride/8。
+// 直接读 count 和 stride，算出链表末尾，判断是否越过池的映射范围。
+static void za_hook_poolloop(unsigned long long *r)
+{
+    int *used = za_probe_budget("pool-loop");
+    if (*used >= 8) return;
+    (*used)++;
+    unsigned long long desc = r[0], base = r[2], stride = r[8] << 3;
+    unsigned int count = 0;
+    if (desc) memcpy(&count, (const void *)(uintptr_t)(desc + 0x1c), 4);
+    unsigned long long end = base + stride * (unsigned long long)count;
+    ZLOGI("★ 探针 pool-loop: desc=%#llx base=%#llx stride=%#llx count=%u ⇒ 末尾=%#llx（跨度 %#llx）",
+          desc, base, stride, count, end, stride * (unsigned long long)count);
+    if (count && (stride * (unsigned long long)count) > (256ull << 20))
+        ZLOGE("   ↑ count*stride 超过 256MB，极可能越界写");
+}
 
 static void za_install_entry_probe(unsigned char *base, unsigned int func_off,
                                    unsigned int stub_off, unsigned int hook_off,
@@ -666,6 +683,7 @@ int za_sdk_load(za_mod_t *sdk,
         // 内存池初始化（main+0x1653cc0：x0=desc, x1=stride, x2=base, w3=size）。
         // PC 采样多次落在这个链表构建循环上；若 size/stride 不自洽会越界写。
         za_install_entry_probe(base, 0x1653cc0, 0xc90960, 0xc909d8, za_hook_poolinit);
+        za_install_entry_probe(base, 0x1653d00, 0xc909e0, 0xc90a58, za_hook_poolloop);
         ZLOGI("断言探针已装：0x9b010 / 0x9acb0 / 0x9ac00 / 0x9ad10 / 0x9aa70");
 
         // ★ 互斥 owner 检查旁路（临时，等 nn::os 同步家族整体改道后再撤）

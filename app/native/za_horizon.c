@@ -1582,7 +1582,9 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         }
         else
         {
-            // 未知会话：维持旧行为（清挂起位 + result 0）
+            // 未知会话：维持旧行为（清挂起位 + result 0）。
+            // ⚠ 实验过「这里也写完整 SFCO 应答」，结果连 M4 都到不了 ——
+            //   说明这条分支里混着 **TIPC** 会话（sm: 系），它们的应答布局不能带 SFCO。
             if (ro)
             {
                 memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
