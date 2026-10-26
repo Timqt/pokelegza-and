@@ -162,7 +162,9 @@ static void za_hook_abort_entry(unsigned long long *r)
 
 static void za_hook_waitloop(unsigned long long *r)     { za_probe_log("svc52-loop", r); }
 static void za_hook_cswait(unsigned long long *r)       { za_probe_log("cs-wait", r); }
-static void za_hook_poolinit(unsigned long long *r)     { za_probe_log("pool-init", r); }
+/* ⚠ za_install_entry_probe 只能探 **SDK** 里的地址（stub 也在 SDK 扩展区，
+ *   跨模块的分支超出 ±128MB）。曾经误用它探 main+0x1653cc0/d00，
+ *   结果把 b 写进了 SDK 的同偏移处、破坏了无关函数 —— 已移除。 */
 // 空闲链表构建循环入口（main+0x1653d00）：
 //   x0 = 池描述符（+0x18 stride, +0x1c count），x2 = 池基址，x8 = stride/8。
 // 直接读 count 和 stride，算出链表末尾，判断是否越过池的映射范围。
@@ -682,8 +684,6 @@ int za_sdk_load(za_mod_t *sdk,
         za_install_entry_probe(base, 0x13b370, 0xc908e0, 0xc90958, za_hook_cswait);
         // 内存池初始化（main+0x1653cc0：x0=desc, x1=stride, x2=base, w3=size）。
         // PC 采样多次落在这个链表构建循环上；若 size/stride 不自洽会越界写。
-        za_install_entry_probe(base, 0x1653cc0, 0xc90960, 0xc909d8, za_hook_poolinit);
-        za_install_entry_probe(base, 0x1653d00, 0xc909e0, 0xc90a58, za_hook_poolloop);
         ZLOGI("断言探针已装：0x9b010 / 0x9acb0 / 0x9ac00 / 0x9ad10 / 0x9aa70");
 
         // ★ 互斥 owner 检查旁路（临时，等 nn::os 同步家族整体改道后再撤）

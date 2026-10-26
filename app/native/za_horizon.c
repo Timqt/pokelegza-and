@@ -1337,7 +1337,11 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         unsigned int *key = (unsigned int *)(uintptr_t)a1;
         unsigned int tag = (unsigned int)a2;
         long long ns = (long long)a3;
-        if (!p || !key) return 0xFA01u;
+        // ⚠ 实测：SDK 的 InternalConditionVariable 在这条 svc 后面是
+        //   `cbnz w0 → throw/abort`（sdk+0x145934 → 0x14594c）。
+        //   我们之前对「参数异常」返回 0xFA01，一试就直接把游戏 abort 掉。
+        //   ⇒ 除真正的超时外，一律返回 0（让调用方按自己的循环重判）。
+        if (!p || !key) return 0;
         unsigned int expect = tag;
         unsigned int kval = __atomic_load_n(key, __ATOMIC_ACQUIRE);
         if (!__atomic_compare_exchange_n(p, &expect, kval, 0,
@@ -1356,8 +1360,9 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             rc = (int)syscall(SYS_futex, (int *)key, FUTEX_WAIT_PRIVATE,
                               (int)kval, tsp, NULL, 0);
         } while (rc == -1 && errno == EINTR);
+        int timedout = (rc == -1 && errno == ETIMEDOUT);
         __atomic_store_n(p, tag, __ATOMIC_RELEASE);   // 唤醒后恢复 tag
-        return rc == 0 ? 0 : 0xEA01u;
+        return timedout ? 0xEA01u : 0;
     }
     case 29: // SignalProcessWideKey(key=x0, count=w1)
     {
@@ -1575,6 +1580,22 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             }
             else
             {
+                // 取证：hid 的请求/应答布局（每个 hid 调用前 8 次）
+                if (strcmp(za_fake_svc_name(sess), "hid") == 0)
+                {
+                    static int hid_dumps;
+                    if (hid_dumps++ < 8)
+                    {
+                        unsigned int w[20];
+                        for (int i = 0; i < 20; i++)
+                            memcpy(&w[i], (void *)(uintptr_t)(ro + (unsigned long long)(i * 4)), 4);
+                        ZLOGI("  HID req[0..0x50]=%08x %08x %08x %08x | %08x %08x %08x %08x | "
+                              "%08x %08x %08x %08x | %08x %08x %08x %08x | %08x %08x %08x %08x",
+                              w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
+                              w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15],
+                              w[16], w[17], w[18], w[19]);
+                    }
+                }
                 za_write_cmif_reply(ro, (unsigned long long)a2, (unsigned long long)a4, hdr0, hdr1);
                 ZLOGI("  IPC CMIF 服务=\"%s\" session=%#x cmd=%#x hdr0=%#x hdr1=%#x -> reply written",
                       za_fake_svc_name(sess), sess, cmd, hdr0, hdr1);
