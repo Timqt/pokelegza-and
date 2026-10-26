@@ -429,15 +429,21 @@ void za_os_free_thread_local(void *p, unsigned long size)
 // 客机自己的 TLS 变量（编译期 __thread）走影子描述符；这里是运行期分配的槽。
 #define ZA_OS_TLS_SLOTS 16
 static void *za_os_tls_values[ZA_OS_TLS_SLOTS];
+static unsigned char za_os_tls_used[ZA_OS_TLS_SLOTS];
 
 unsigned int za_os_allocate_tls_slot(void *slot_obj, void *destructor)
 {
     (void)destructor;
     for (int i = 0; i < ZA_OS_TLS_SLOTS; i++)
     {
-        if (za_os_tls_values[i] == NULL)
+        if (!za_os_tls_used[i])
         {
-            za_os_tls_values[i] = (void *)1;   // 占位（非 NULL）
+            // ★ 不能再用「值 = 1」当占用标记：GetTlsValue 会把 1 当成真实值
+            //   返回。main 的单例 getter（main+0x1a0a6b0 → GetTlsValue(槽1)）
+            //   把返回值当对象指针解引用 ⇒ SIGSEGV addr=0xa9（实测）。
+            //   「已分配但未设置」必须返回 0，让 getter 走创建分支。
+            za_os_tls_used[i] = 1;
+            za_os_tls_values[i] = NULL;
             if (slot_obj) *(unsigned long long *)slot_obj = (unsigned long long)i;
             return 0;
         }
@@ -447,16 +453,25 @@ unsigned int za_os_allocate_tls_slot(void *slot_obj, void *destructor)
 
 void za_os_set_tls_value(unsigned long long slot, unsigned long long value)
 {
-    if (slot < ZA_OS_TLS_SLOTS) za_os_tls_values[slot] = (void *)(uintptr_t)value;
+    if (slot < ZA_OS_TLS_SLOTS)
+    {
+        za_os_tls_used[slot] = 1;
+        za_os_tls_values[slot] = (void *)(uintptr_t)value;
+    }
 }
 
 unsigned long long za_os_get_tls_value(unsigned long long slot)
 {
-    if (slot < ZA_OS_TLS_SLOTS) return (unsigned long long)(uintptr_t)za_os_tls_values[slot];
+    if (slot < ZA_OS_TLS_SLOTS && za_os_tls_used[slot])
+        return (unsigned long long)(uintptr_t)za_os_tls_values[slot];
     return 0;
 }
 
 void za_os_free_tls_slot(unsigned long long slot)
 {
-    if (slot < ZA_OS_TLS_SLOTS) za_os_tls_values[slot] = NULL;
+    if (slot < ZA_OS_TLS_SLOTS)
+    {
+        za_os_tls_used[slot] = 0;
+        za_os_tls_values[slot] = NULL;
+    }
 }
