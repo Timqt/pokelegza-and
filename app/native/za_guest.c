@@ -722,8 +722,18 @@ void za_install_altstack(void)
 // ★ 必须**每线程**一份：SDK 有多个 worker 线程，会同时崩；共用一份时
 //   A 线程 sigsetjmp、B 线程 siglongjmp ⇒ libc 报 "setjmp cookie mismatch"
 //   并在 longjmp 里 abort（实测调用链正好落在 libc 的 setjmp/longjmp 实现）。
-static __thread sigjmp_buf za_fatal_jmp;
-static __thread volatile sig_atomic_t za_fatal_dumping;
+// ⚠ 不用 __thread：本工程 .so 的 __thread 走 emutls（__emutls_get_address）。
+//   实测有客机地址被喂进 emutls 控制块 ⇒ 它在内部 undef 指令上 SIGILL
+//   （pc=libzaandroid.so+0xd6c98，x0=0xb400006f… 客机堆指针）。
+//   ⇒ 改成按 tid 索引的静态池，彻底不依赖宿主 TLS。
+#define ZA_FATAL_POOL 64
+static sigjmp_buf za_fatal_jmp_pool[ZA_FATAL_POOL];
+static volatile sig_atomic_t za_fatal_dump_pool[ZA_FATAL_POOL];
+static int za_fatal_idx(void)
+{
+    long t = syscall(SYS_gettid);
+    return (int)(((unsigned)t) % ZA_FATAL_POOL);
+}
 
 // 「像不像一个用户态地址」：dump 前的廉价检查（8 对齐 + 47 位内）
 static int za_va_plausible(unsigned long v)
@@ -733,7 +743,8 @@ static int za_va_plausible(unsigned long v)
 
 static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
 {
-    if (za_fatal_dumping) siglongjmp(za_fatal_jmp, 1);   // dump 中二次 fault
+    int zi = za_fatal_idx();
+    if (za_fatal_dump_pool[zi]) siglongjmp(za_fatal_jmp_pool[zi], 1);   // dump 中二次 fault
     unsigned long pc = 0;
     if (ctx) { ucontext_t *uc = (ucontext_t *)ctx; pc = (unsigned long)uc->uc_mcontext.pc; }
     {
@@ -876,12 +887,12 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             }
         }
         // 从这里开始全是「解引用寄存器」的危险 dump：二次 fault 就放弃剩余部分。
-        za_fatal_dumping = 1;
-        if (sigsetjmp(za_fatal_jmp, 1) != 0)
+        za_fatal_dump_pool[zi] = 1;
+        if (sigsetjmp(za_fatal_jmp_pool[zi], 1) != 0)
         {
             static const char ab[] = "ZaGuest: (dump aborted: nested fault)\n";
             za_fatal_write(ab, sizeof ab - 1);
-            za_fatal_dumping = 0;
+            za_fatal_dump_pool[zi] = 0;
         }
         else
         {
@@ -977,7 +988,7 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                          (unsigned long)uc->uc_mcontext.sp);
         za_log_guest_trace((unsigned long)uc->uc_mcontext.sp);
         za_log_stack((unsigned long)uc->uc_mcontext.sp);
-        za_fatal_dumping = 0;
+        za_fatal_dump_pool[zi] = 0;
         }
     }
 
