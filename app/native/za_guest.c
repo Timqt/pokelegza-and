@@ -40,6 +40,7 @@
 #include "za_common.h"
 #include "za_guest_info.h"
 #include "za_imports.h"
+#include "za_romfs_embed.h"
 #include "za_relocs.h"
 #include "za_stub.h"
 #include "za_tls_patch.h"
@@ -1784,30 +1785,80 @@ static unsigned int za_hid_init_ok(void) { return 0; }
 // 现阶段直接吞掉，避免它们把未初始化的服务错误当成致命错误 Abort。
 static void za_hid_noop(void) { }
 
-// ── 最小 fs 垫片（读路径）────────────────────────────────────────
+// ── 最小 fs 垫片（读路径）+ 内嵌 romfs 文件 ────────────────────────
 // 静态构造函数里是 OpenFile → GetFileSize → (ReadFile) → CloseFile。
-// 只接管 OpenFile 的话，GetFileSize 仍会走 CMIF 返回 0x177a02 ⇒ 重试 16 次后
-// Abort。这里把读路径整条接管成「空文件」：大小 0、读到 0 字节。
-// ⚠ 临时方案：接真正的 romfs/save 后端后要撤掉。
+// 只接管 OpenFile 的话，GetFileSize 仍会走 CMIF 返回 0x177a02 ⇒ 重试后 Abort。
+//
+// 客机要读的默认配置 system/config/data/trinity_config.trowc 在 romfs 里
+// 确实存在（729 字节），已经把它内嵌进 .so（za_romfs_embed.h）。
+// 路径按「后缀」匹配，忽略 rom:/ 之类的挂载前缀。
+// ⚠ 其余路径仍然返回「空文件」；接真正的 romfs 后端后整块撤掉。
+typedef struct { const char *path; const unsigned char *data; unsigned long size; } za_embed_file_t;
+static const za_embed_file_t za_embed_files[] = {
+    { "system/config/data/trinity_config.trowc",
+      za_romfs_trinity_config_trowc, ZA_ROMFS_TRINITY_CONFIG_SIZE },
+};
+#define ZA_EMBED_N ((int)(sizeof za_embed_files / sizeof za_embed_files[0]))
+#define ZA_EMBED_HANDLE_BIT 0x80000000u
+
+static unsigned long za_guest_strnlen(const char *p, unsigned long max)
+{
+    unsigned long n = 0;
+    if (!p) return 0;
+    while (n < max && p[n]) n++;
+    return n;
+}
+static int za_embed_lookup(const char *path)
+{
+    unsigned long pl = za_guest_strnlen(path, 512);
+    if (!pl) return -1;
+    for (int i = 0; i < ZA_EMBED_N; i++)
+    {
+        const char *suf = za_embed_files[i].path;
+        unsigned long n = za_guest_strnlen(suf, 512);
+        if (pl < n) continue;
+        if (memcmp(path + (pl - n), suf, (size_t)n) == 0) return i;
+    }
+    return -1;
+}
+static const unsigned char *za_embed_by_handle(unsigned int h, unsigned long *size)
+{
+    if (size) *size = 0;
+    if ((h & ZA_EMBED_HANDLE_BIT) == 0) return NULL;
+    unsigned i = h & ~ZA_EMBED_HANDLE_BIT;
+    if (i >= (unsigned)ZA_EMBED_N) return NULL;
+    if (size) *size = za_embed_files[i].size;
+    return za_embed_files[i].data;
+}
 static unsigned int za_fs_getfilesize(long long *out, unsigned int h)
 {
-    (void)h;
-    if (out) *out = 0;
+    unsigned long sz = 0;
+    za_embed_by_handle(h, &sz);
+    if (out) *out = (long long)sz;
     return 0;
 }
 static unsigned int za_fs_readfile_cnt(unsigned long *out_read, unsigned int h,
                                        long long off, void *buf, unsigned long size)
 {
-    (void)h; (void)off;
+    unsigned long total = 0;
+    const unsigned char *d = za_embed_by_handle(h, &total);
     if (out_read) *out_read = 0;
-    if (buf && size && size <= (4u << 20)) memset(buf, 0, (size_t)size);
+    if (!d)
+    {
+        if (buf && size && size <= (4u << 20)) memset(buf, 0, (size_t)size);
+        return 0;
+    }
+    if (off < 0) off = 0;
+    if (!buf || (unsigned long long)off >= total) return 0;
+    unsigned long n = (unsigned long)(total - (unsigned long long)off);
+    if (n > size) n = size;
+    memcpy(buf, d + (unsigned long)off, (size_t)n);
+    if (out_read) *out_read = n;
     return 0;
 }
 static unsigned int za_fs_readfile(unsigned int h, long long off, void *buf, unsigned long size)
 {
-    (void)h; (void)off;
-    if (buf && size && size <= (4u << 20)) memset(buf, 0, (size_t)size);
-    return 0;
+    return za_fs_readfile_cnt(NULL, h, off, buf, size);
 }
 static unsigned int za_fs_closefile(unsigned int h) { (void)h; return 0; }
 static unsigned int za_fs_flushfile(unsigned int h) { (void)h; return 0; }
@@ -1842,7 +1893,16 @@ static unsigned int za_fs_openfile(void *out, const char *path, int mode)
         }
     }
     tmp[i] = 0;
-    ZLOGE("★ fs::OpenFile out=%p path=\"%s\" mode=%d ⇒ 先返回成功（假句柄 1）",
+    int idx = za_embed_lookup(path);
+    if (idx >= 0)
+    {
+        unsigned int h = ZA_EMBED_HANDLE_BIT | (unsigned)idx;
+        ZLOGE("★ fs::OpenFile out=%p path=\"%s\" mode=%d ⇒ 内嵌文件（%lu 字节，句柄 %#x）",
+              out, tmp, mode, za_embed_files[idx].size, h);
+        if (out) *(unsigned int *)out = h;
+        return 0;
+    }
+    ZLOGE("★ fs::OpenFile out=%p path=\"%s\" mode=%d ⇒ 未知文件，返回空文件（假句柄 1）",
           out, tmp, mode);
     if (out) *(unsigned int *)out = 1;
     return 0;
