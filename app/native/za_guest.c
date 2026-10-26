@@ -727,6 +727,7 @@ void za_install_altstack(void)
 //   （pc=libzaandroid.so+0xd6c98，x0=0xb400006f… 客机堆指针）。
 //   ⇒ 改成按 tid 索引的静态池，彻底不依赖宿主 TLS。
 #define ZA_FATAL_POOL 64
+static volatile int za_fatal_owner;      // 0 = 没有线程在报告，1 = 已有
 static sigjmp_buf za_fatal_jmp_pool[ZA_FATAL_POOL];
 static volatile sig_atomic_t za_fatal_dump_pool[ZA_FATAL_POOL];
 static int za_fatal_idx(void)
@@ -745,6 +746,12 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
 {
     int zi = za_fatal_idx();
     if (za_fatal_dump_pool[zi]) siglongjmp(za_fatal_jmp_pool[zi], 1);   // dump 中二次 fault
+    // ★★ 串行化：多线程同时崩时，只让**一个**线程做 dump + raise。
+    //   否则多个线程同时进 libsigchain（sigprocmask/raise），实测会把
+    //   libsigchain 自己搞崩（pc=sigprocmask+0x84，参数是客机堆指针）。
+    //   其它线程直接 _exit（async-signal-safe），进程照样终止、日志不打架。
+    if (__atomic_exchange_n(&za_fatal_owner, 1, __ATOMIC_ACQ_REL) != 0)
+        _exit(99);
     unsigned long pc = 0;
     if (ctx) { ucontext_t *uc = (ucontext_t *)ctx; pc = (unsigned long)uc->uc_mcontext.pc; }
     {
