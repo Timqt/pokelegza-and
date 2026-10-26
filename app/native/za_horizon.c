@@ -62,7 +62,36 @@ extern unsigned char *za_guest_base;
 // trampoline 回写用的寄存器数组：index 0 = 结果(x0)，1..7 = x1..x7，
 // index 9 = 客机 sp，10 = 服务号，11 = 客机 x30（svc 调用点的返回地址，
 // 日志里用来定位是哪个函数调的服务）。
-__attribute__((visibility("default"))) volatile unsigned long za_horizon_regs[32];
+//
+// ★★★ 2026-10-26：必须**每线程一份**。
+//   以前是全局数组，trampoline 把服务号写进 regs[10] 再读回来当第 9 个 C 参数，
+//   x1..x7 也从这张表回写 —— 两个线程同时进 svc 时：
+//     · A 的 nr 被 B 覆盖（实测：svc#28 被记成 svc#44，参数却是 Wait 的 cs/cv）；
+//     · A 的 x1..x7 被写成 B 留下的陈旧值（Horizon 约定 svc 只改 x0，SDK 依赖这点）
+//   ⇒ 客机随机跳野地址（实测 pc=0x7fffffff00000000）。
+//   现在 regs 放在**每线程描述符页**里（hdr+0x200），描述符 +0xa0 存它的地址；
+//   trampoline 用 `mrs TPIDR_EL0 → [tp+0x40] → [+0xa0]` 现取，不再共享。
+#define ZA_REGS_MAGIC 0x5a5a524547535f31ull   /* "ZA_REGS_1" */
+static unsigned long long za_regs_fallback[32];
+unsigned long long *za_regs_get(void)
+{
+    unsigned long tp = 0;
+    __asm__ __volatile__("mrs %0, TPIDR_EL0" : "=r"(tp));
+    if (tp)
+    {
+        unsigned long long hdr = 0;
+        __builtin_memcpy(&hdr, (const void *)(uintptr_t)(tp + 0x40), 8);
+        if (hdr)
+        {
+            unsigned long long p = 0;
+            __builtin_memcpy(&p, (const void *)(uintptr_t)(hdr + 0xA0), 8);
+            if (p && *(unsigned long long *)(uintptr_t)(p + 31 * 8) == ZA_REGS_MAGIC)
+                return (unsigned long long *)(uintptr_t)p;
+        }
+    }
+    return za_regs_fallback;   // 非客机线程（诊断路径）兜底
+}
+#define za_horizon_regs za_regs_get()
 
 // ── 帧快照探针（2026-10-25 夜）──────────────────────────────────────
 // 目的：把 0x14457c 的 x30 槽「何时变 0」一刀切开。
@@ -1934,23 +1963,55 @@ volatile long za_dbg_last_wait_nr;
 volatile long za_dbg_last_wait_ret;
 static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
                                 long a4, long a5, long a6, long a7, long nr);
-// ★ 最近若干次 svc 的「服务号 + 返回值 + 调用点 PC + a0」环形记录。
-//   崩溃时打印出来，就能同时看到「最后几个 svc 返回了什么」。
-#define ZA_RETRING 16
-static volatile long za_ret_nr[ZA_RETRING];
-static volatile long za_ret_val[ZA_RETRING];
-static volatile unsigned long long za_ret_pc[ZA_RETRING];
-static volatile unsigned long long za_ret_a0[ZA_RETRING];
-static volatile int za_ret_head;
+// ★ 每线程的 svc 环形记录（服务号 + 返回值 + 参数 + 调用点 PC）。
+//   之前是全局一份：多线程并发写会互相覆盖，dump 出来的「最后几条 svc」
+//   来自不同线程，据此推断谁返回了非 0 会漂移。
+//   现在每个 tid 独占一个槽（CAS 认领），槽内字段不会被别的线程混写。
+#define ZA_RR 24
+#define ZA_RR_SLOTS 256
+typedef struct {
+    long nr, ret;
+    unsigned long long a0, a1, a2, a3, pc;
+} za_rr_t;
+typedef struct {
+    int tid;
+    unsigned head;
+    za_rr_t e[ZA_RR];
+} za_rr_slot_t;
+static za_rr_slot_t za_rr_slots[ZA_RR_SLOTS];
+static za_rr_slot_t *za_rr_cur(void)
+{
+    int t = (int)syscall(SYS_gettid);
+    unsigned h = (unsigned)t;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
+    for (unsigned k = 0; k < ZA_RR_SLOTS; k++)
+    {
+        za_rr_slot_t *s = &za_rr_slots[(h + k) & (ZA_RR_SLOTS - 1)];
+        int cur = __atomic_load_n(&s->tid, __ATOMIC_ACQUIRE);
+        if (cur == t) return s;
+        if (cur == 0)
+        {
+            int expect = 0;
+            if (__atomic_compare_exchange_n(&s->tid, &expect, t, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return s;
+            if (expect == t) return s;
+        }
+    }
+    return &za_rr_slots[h & (ZA_RR_SLOTS - 1)];   // 表满：退化（诊断用，可接受）
+}
 void za_dump_ret_ring(void)
 {
-    int h = za_ret_head;
-    for (int k = 0; k < ZA_RETRING; k++)
+    za_rr_slot_t *s = za_rr_cur();
+    unsigned h = __atomic_load_n(&s->head, __ATOMIC_RELAXED);
+    ZLOGI("  ret-ring（本线程 tid=%d，最近 %d 条）", s->tid, ZA_RR);
+    for (int k = 0; k < ZA_RR; k++)
     {
-        int i = (h - 1 - k + ZA_RETRING * 2) % ZA_RETRING;
-        if (za_ret_nr[i] == 0 && za_ret_val[i] == 0 && za_ret_pc[i] == 0) continue;
-        ZLOGI("  ret-ring[%d] svc#%ld ret=%#lx a0=%#llx pc=%#llx", k,
-              za_ret_nr[i], (unsigned long)za_ret_val[i], za_ret_a0[i], za_ret_pc[i]);
+        int i = (int)((h - 1 - k + ZA_RR * 2) % ZA_RR);
+        za_rr_t *e = &s->e[i];
+        if (!e->pc) continue;
+        ZLOGI("  ret-ring[%d] svc#%ld ret=%#lx a0=%#llx a1=%#llx a2=%#llx pc=%#llx", k,
+              e->nr, (unsigned long)e->ret, e->a0, e->a1, e->a2, e->pc);
     }
 }
 long za_horizon_svc(long a0, long a1, long a2, long a3,
@@ -1958,11 +2019,15 @@ long za_horizon_svc(long a0, long a1, long a2, long a3,
 {
     long r = za_horizon_svc_impl(a0, a1, a2, a3, a4, a5, a6, a7, nr);
     {
-        int i = __atomic_fetch_add(&za_ret_head, 1, __ATOMIC_RELAXED) % ZA_RETRING;
-        za_ret_nr[i] = nr;
-        za_ret_val[i] = r;
-        za_ret_pc[i] = (unsigned long long)za_horizon_regs[ZA_REG_PC];
-        za_ret_a0[i] = (unsigned long long)a0;
+        za_rr_slot_t *s = za_rr_cur();
+        int i = (int)(__atomic_fetch_add(&s->head, 1, __ATOMIC_RELAXED) % ZA_RR);
+        s->e[i].nr  = nr;
+        s->e[i].ret = r;
+        s->e[i].a0  = (unsigned long long)a0;
+        s->e[i].a1  = (unsigned long long)a1;
+        s->e[i].a2  = (unsigned long long)a2;
+        s->e[i].a3  = (unsigned long long)a3;
+        s->e[i].pc  = (unsigned long long)za_horizon_regs[ZA_REG_PC];
     }
     if (nr == 24 || nr == 28 || nr == 52 || nr == 53 || nr == 54)
     {

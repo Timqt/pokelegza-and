@@ -225,7 +225,10 @@ static void za_log_raw(int sig, unsigned long pc, unsigned long off, const char 
 //                （= 调用者里 bl 之后那条指令的地址 ⇒ 直接指出是哪个 assert）
 //
 // 之后按 x29 链往上走：fp=[fp], ret=[fp+8]。
-extern volatile unsigned long za_horizon_regs[32];
+// svc 寄存器槽现在是每线程的（定义在 za_horizon.c）：
+// 不能再声明成全局数组，否则会链接到另一个符号/读错线程。
+extern unsigned long long *za_regs_get(void);
+#define za_horizon_regs za_regs_get()
 
 static void za_dump_break_ctx(void)
 {
@@ -742,16 +745,86 @@ static int za_va_plausible(unsigned long v)
     return (v & 7) == 0 && v >= 0x10000ul && v < 0x800000000000ul;
 }
 
+// 本 .so 的映射范围与「被顶掉的别人的处理器」（定义在下面的信号安装处）
+static unsigned long za_self_base, za_self_end;
+static struct sigaction za_fatal_prev[64];
+static volatile int za_fatal_prev_ok[64];
+static void za_segv_handler(int sig, siginfo_t *info, void *ctx);
+
+// 本线程是不是「客机线程」：看 [TP+0x40] → 描述符页 → [+0xA0] 的魔数。
+// 客机线程上，宿主 libc 里的故障（abort/assert/memcpy…）也是我们的责任；
+// ART/JNI 线程没有这个描述符 ⇒ 交回原处理器。
+static int za_is_guest_thread(void)
+{
+    unsigned long tp = 0;
+    __asm__ __volatile__("mrs %0, TPIDR_EL0" : "=r"(tp));
+    if (!tp || tp < 0x10000ul) return 0;
+    unsigned long long hdr = 0;
+    memcpy(&hdr, (const void *)(uintptr_t)(tp + 0x40), 8);
+    if (!hdr || hdr < 0x10000ull || (hdr & 0xfffull)) return 0;
+    unsigned long long p = 0;
+    memcpy(&p, (const void *)(uintptr_t)(hdr + 0xA0), 8);
+    if (!p || p < 0x10000ull) return 0;
+    unsigned long long magic = 0;
+    memcpy(&magic, (const void *)(uintptr_t)(p + 31 * 8), 8);
+    return magic == 0x5a5a524547535f31ull;
+}
+
 static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
 {
     int zi = za_fatal_idx();
     if (za_fatal_dump_pool[zi]) siglongjmp(za_fatal_jmp_pool[zi], 1);   // dump 中二次 fault
-    // ★★ 串行化：多线程同时崩时，只让**一个**线程做 dump + raise。
-    //   否则多个线程同时进 libsigchain（sigprocmask/raise），实测会把
-    //   libsigchain 自己搞崩（pc=sigprocmask+0x84，参数是客机堆指针）。
-    //   其它线程直接 _exit（async-signal-safe），进程照样终止、日志不打架。
+    // ★★ 先判断这个故障是不是我们该管的：只有 **客机映像 / SDK 映像 / 本 .so**
+    //   里的 PC 才是我们的责任。其余（ART 的隐式空指针检查、bionic 内部故障、
+    //   JNI/UI 线程）一律交回**原来的处理器** —— 抢过来只会把宿主自己的
+    //   信号机制（尤其 ART 的 null-check）搞坏，还会误杀整个进程。
+    {
+        unsigned long pc0 = ctx ? (unsigned long)((ucontext_t *)ctx)->uc_mcontext.pc : 0;
+        int ours = 0;
+        extern unsigned char *za_guest_base;
+        extern volatile unsigned long za_sdk_base, za_sdk_size;
+        if (pc0 && za_guest_base && pc0 >= (unsigned long)(uintptr_t)za_guest_base &&
+            pc0 < (unsigned long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE) ours = 1;
+        if (pc0 && za_sdk_base && pc0 >= za_sdk_base && pc0 < za_sdk_base + za_sdk_size) ours = 1;
+        if (pc0 && za_self_base && pc0 >= za_self_base && pc0 < za_self_end) ours = 1;
+        // 客机线程上：即使 PC 在宿主 libc（客机 import 的 abort/assert/memcpy），
+        // 也是我们的责任；非客机线程（ART/JNI）才交回原处理器。
+        if (!ours && za_is_guest_thread()) ours = 1;
+        if (!ours)
+        {
+            if (sig > 0 && sig < 64 && za_fatal_prev_ok[sig])
+            {
+                struct sigaction *o = &za_fatal_prev[sig];
+                if (o->sa_flags & SA_SIGINFO)
+                {
+                    if (o->sa_sigaction && o->sa_sigaction != za_segv_handler)
+                    {
+                        o->sa_sigaction(sig, info, ctx);
+                        return;
+                    }
+                }
+                else if (o->sa_handler == SIG_IGN)
+                {
+                    return;
+                }
+                else if (o->sa_handler && o->sa_handler != SIG_DFL)
+                {
+                    o->sa_handler(sig);
+                    return;
+                }
+            }
+            // 没有可转交的处理器 ⇒ 恢复默认行为后返回（内核会按默认动作重投递）
+            signal(sig, SIG_DFL);
+            return;
+        }
+    }
+    // ★★ 串行化：多线程同时崩时，只让**一个**线程做 dump。
+    //   其它线程**挂起**而不是 _exit —— 以前一有第二个线程故障就把整个进程
+    //   杀掉，日志里只剩最先那个线程的现场，其它线程的死因完全看不到。
     if (__atomic_exchange_n(&za_fatal_owner, 1, __ATOMIC_ACQ_REL) != 0)
-        _exit(99);
+    {
+        for (;;) pause();
+    }
     unsigned long pc = 0;
     if (ctx) { ucontext_t *uc = (ucontext_t *)ctx; pc = (unsigned long)uc->uc_mcontext.pc; }
     {
@@ -797,6 +870,27 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
         za_fatal_write(buf, (size_t)(p - buf));
     }
     za_log_raw(sig, pc, off, rel, info ? info->si_addr : NULL);
+
+    // ★ gate 现场：崩溃是否发生在 svc 门里（nr / guest sp / guest x30）。
+    //   每线程 regs 里的 [10]=服务号、[9]=客机 sp、[11]=客机 x30。
+    //   若 nr 非 0 ⇒ 崩在「宿主替客机执行 svc」的过程中；
+    //   若 nr=0 且 guest_x30=0 ⇒ 客机自己 ret 到了 0。
+    {
+        extern unsigned long long *za_regs_get(void);
+        unsigned long long *rr = za_regs_get();
+        char buf[256];
+        char *p = buf;
+        p = za_put_str(p, "ZaGuest: gate nr=");
+        p = za_put_dec(p, rr ? rr[10] : 0);
+        p = za_put_str(p, " guest_sp=");
+        p = za_put_hex(p, rr ? rr[9] : 0);
+        p = za_put_str(p, " guest_x30=");
+        p = za_put_hex(p, rr ? rr[11] : 0);
+        p = za_put_str(p, " regs=");
+        p = za_put_hex(p, (unsigned long long)(uintptr_t)rr);
+        p = za_put_str(p, "\n");
+        za_fatal_write(buf, (size_t)(p - buf));
+    }
 
     // x0..x30 + sp + pc 全打（寄存器里常能直接看出「哪个值变垃圾了」）
     if (ctx)
@@ -889,6 +983,40 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 p = za_put_hex(p, *got);
                 p = za_put_str(p, " global=");
                 p = za_put_hex(p, *g);
+                p = za_put_str(p, "\n");
+                za_fatal_write(buf, (size_t)(p - buf));
+            }
+        }
+        // ★ 线程 StartThread 路径的跳板/GOT 回读。
+        //   实测 boot 线程在 CreateThread(handle=7) 之后、svc#9 之前跳到
+        //   pc=0x7fffffff00000000。这条路径只经过：
+        //     ThreadManager::StartThread → Enter(type+0x1a8)
+        //                                → GOT[0xb7ad18] = Impl::StartThread
+        //                                → svc#9（门桩 @0x170044）
+        //   把这几处现场打出来，就能立刻区分「GOT 坏」还是「门桩坏」。
+        {
+            extern volatile unsigned long za_sdk_base;
+            if (za_sdk_base)
+            {
+                unsigned long long b = za_sdk_base;
+                static const unsigned long long slots[] = {
+                    0xb7ad18ull, 0xb7a880ull, 0xb7a888ull, 0xb7a890ull, 0xb79018ull
+                };
+                char *p = buf;
+                p = za_put_str(p, "ZaGuest: GOTCHK");
+                for (unsigned i = 0; i < sizeof slots / sizeof slots[0]; i++)
+                {
+                    unsigned long long v = 0;
+                    memcpy(&v, (const void *)(uintptr_t)(b + slots[i]), 8);
+                    p = za_put_str(p, " [");
+                    p = za_put_hex(p, slots[i]);
+                    p = za_put_str(p, "]=");
+                    p = za_put_hex(p, v);
+                }
+                p = za_put_str(p, " gate9=");
+                p = za_put_hex(p, (unsigned long long)*(const unsigned int *)(uintptr_t)(b + 0x170044));
+                p = za_put_str(p, " trip9=");
+                p = za_put_hex(p, (unsigned long long)*(const unsigned int *)(uintptr_t)(b + 0xc70040));
                 p = za_put_str(p, "\n");
                 za_fatal_write(buf, (size_t)(p - buf));
             }
@@ -1091,12 +1219,47 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
 
 static void za_segv_handler(int sig, siginfo_t *info, void *ctx) { za_fatal_handler(sig, info, ctx); }
 static void za_rt_catch(int sig, siginfo_t *info, void *ctx) { za_fatal_handler(sig, info, ctx); }
+
+// 本 .so 自己的映射范围：致命处理器要先判断「这个故障是不是我们该管的」
+// （客机映像 / SDK 映像 / 本 .so）。不是就交回原来的处理器 ——
+// 否则会把 ART 的隐式空指针检查、bionic 自己的故障处理全都抢掉。
+void za_install_signal_handlers(void);
+static void za_compute_self_range(void)
+{
+    Dl_info di;
+    memset(&di, 0, sizeof di);
+    if (!dladdr((void *)(uintptr_t)&za_install_signal_handlers, &di) || !di.dli_fbase)
+        return;
+    unsigned long bias = (unsigned long)di.dli_fbase;
+    const unsigned char *p = (const unsigned char *)bias;
+    unsigned long lo = 0, hi = 0;
+    if (memcmp(p, "\177ELF", 4) == 0)
+    {
+        unsigned long phoff = *(const unsigned int *)(p + 0x20);
+        unsigned int phentsize = *(const unsigned short *)(p + 0x36);
+        unsigned int phnum = *(const unsigned short *)(p + 0x38);
+        lo = ~0ul;
+        for (unsigned i = 0; i < phnum && i < 32; i++)
+        {
+            const unsigned char *ph = p + phoff + (unsigned long)i * phentsize;
+            if (*(const unsigned int *)ph != 1) continue;          /* PT_LOAD */
+            unsigned long va = *(const unsigned long *)(ph + 0x10);
+            unsigned long memsz = *(const unsigned long *)(ph + 0x28);
+            if (va < lo) lo = va;
+            if (va + memsz > hi) hi = va + memsz;
+        }
+    }
+    if (hi == 0) { lo = 0; hi = 0x400000; }
+    za_self_base = bias + lo;
+    za_self_end = bias + hi;
+}
 // 装好致命信号的处理器（SIGSEGV/BUS/ILL/FPE/ABRT/SYS）。
 // ⚠ 必须每次 svc 后重装：SDK 初始化会**替换**掉我们装的 SIGSEGV 处理器
 //   ⇒ 客机崩了就没人接，直接被内核杀掉（连日志都没有）。
 void za_reinstall_signal_handlers(void)
 {
     za_install_altstack();
+    if (!za_self_base) za_compute_self_range();
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = za_segv_handler;
@@ -1104,7 +1267,16 @@ void za_reinstall_signal_handlers(void)
     sigemptyset(&sa.sa_mask);
     static const int fatal[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT, SIGSYS };
     for (unsigned i = 0; i < sizeof fatal / sizeof fatal[0]; i++)
-        sigaction(fatal[i], &sa, NULL);
+    {
+        int s = fatal[i];
+        struct sigaction old;
+        memset(&old, 0, sizeof old);
+        if (sigaction(s, &sa, &old) == 0 && old.sa_sigaction != za_segv_handler)
+        {
+            za_fatal_prev[s] = old;
+            za_fatal_prev_ok[s] = 1;
+        }
+    }
 }
 
 // 接管 32..62（63 留给 PC 采样器；SIGRTMIN=42 是 bionic 内部定时器，不抢）
@@ -1424,6 +1596,35 @@ void za_os_install_tls_descriptor(void)
         vt[2] = (unsigned long long)(uintptr_t)&za_fs_vt_alloc;
         vt[3] = (unsigned long long)(uintptr_t)&za_fs_vt_free;
         *(unsigned long long *)(hdr) = (unsigned long long)(uintptr_t)vt;
+    }
+    // ★ 每线程的 svc 寄存器槽（gate trampoline 用 TPIDR_EL0 现取）。
+    //   布局：hdr+0xA0 = 槽地址；槽本体在 hdr+0x200（32 个 u64，末槽放魔数）。
+    //   以前这是一张全局数组，多线程并发 svc 会互相覆盖 nr / x1..x7。
+    {
+        unsigned long long *regs = (unsigned long long *)(hdr + 0x200);
+        memset(regs, 0, 32 * sizeof(unsigned long long));
+        regs[31] = 0x5a5a524547535f31ull;          /* "ZA_REGS_1" */
+        *(unsigned long long *)(hdr + 0xA0) = (unsigned long long)(uintptr_t)regs;
+    }
+    // ★★ 每线程的 svc 门宿主栈（hdr+0xA8 = 栈顶）。
+    //   以前门里 `mov sp, <全局栈顶>; sub sp,#0x80`：**所有线程共用同一条栈**，
+    //   两个线程并发进 svc 时栈帧完全重叠 ⇒ C 局部变量/canary 互相踩烂
+    //   （实测 libc 报 "stack corruption detected (-fstack-protector)" → abort）。
+    //   512KB/线程足够深（C 调度链最深处几十 KB）。
+    {
+        size_t hsz = 512u << 10;
+        void *hs = mmap(NULL, hsz, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (hs == MAP_FAILED)
+        {
+            ZLOGE("每线程宿主栈 mmap 失败（%zu 字节）⇒ svc 门会退回全局栈", hsz);
+            *(unsigned long long *)(hdr + 0xA8) = 0;
+        }
+        else
+        {
+            *(unsigned long long *)(hdr + 0xA8) =
+                ((unsigned long long)(uintptr_t)hs + hsz) & ~0xFull;   // 栈顶，16 对齐
+        }
     }
     // ★ 把本线程的头页指针写进 bionic TLS 的空闲槽 [TP+0x40]。
     //   实测三个线程该位置都是已映射的 0（主程序静态 TLS 区为空）。

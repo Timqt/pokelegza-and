@@ -209,6 +209,9 @@ def main():
     # ★ 上一轮的日志留档，本轮从空文件开始（这样每轮的文件就是本轮的现场）
     adb(serial, "shell", "run-as", PKG, "rm", "-f", "files/za_log.txt")
     adb(serial, "shell", "run-as", PKG, "rm", "-f", "files/za_crash.log")
+    # ⚠ za_fatal.log 是 append 打开的：不删就会把**上一轮**的现场当成这一轮的
+    #   （踩过：连续几轮都在读同一个旧崩溃现场，白追半天）。
+    adb(serial, "shell", "run-as", PKG, "rm", "-f", "files/za_fatal.log")
     time.sleep(1)
     adb(serial, "shell", "am", "start", "-n", f"{PKG}/android.app.NativeActivity")
     print(f"运行 {args.seconds}s …")

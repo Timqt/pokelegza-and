@@ -36,7 +36,6 @@ void *za_sdk_ctx = NULL;
 #include "za_tlsro_patch.h"
 #include "za_tlsbase_patch.h"
 extern long za_horizon_svc(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7, long nr);
-extern volatile unsigned long za_horizon_regs[16];
 // 崩溃现场要用它把地址换算成「sdk+偏移」（定义在 za_guest.c）
 volatile int za_cnctp_ready;   /* CNTPCT 桩/hook 槽已装好（看门狗门控用） */
 
@@ -158,6 +157,93 @@ static void za_hook_abort_entry(unsigned long long *r)
         if (nfp <= fp) break;
         fp = nfp;
     }
+}
+
+// LockMutex / UnlockMutex 追踪：只盯出问题的那个队列锁（0x452000308）。
+// 目的：确认 worker 线程到底有没有真的锁上，以及谁把 owner/count 清掉了。
+#define ZA_TRACE_MUTEX 0x452000308ull
+static void za_trace_mutex(const char *tag, unsigned long long m)
+{
+    if (m != ZA_TRACE_MUTEX) return;
+    unsigned int count = 0, recursive = 0;
+    unsigned long long owner = 0;
+    memcpy(&count, (const void *)(uintptr_t)(m + 0x08), 4);
+    memcpy(&owner, (const void *)(uintptr_t)(m + 0x10), 8);
+    memcpy(&recursive, (const void *)(uintptr_t)(m + 0x01), 1);
+    ZLOGE("★ %s(q): count=%u owner=%#llx recursive=%u tid=%ld", tag, count, owner,
+          recursive, (long)syscall(SYS_gettid));
+}
+// StartThread 路径：ThreadManager::StartThread(0x13e904) 与
+// ThreadManagerImplByHorizon::StartThread(0x144ac4)。boot 线程在
+// CreateThread(handle=7) 之后、svc#9 之前跳到 0x7fffffff00000000 ⇒ 看这两处。
+static void za_probe_threadtype(const char *tag, unsigned long long t)
+{
+    unsigned int handle = 0, state = 0;
+    if (t) {
+        memcpy(&handle, (const void *)(uintptr_t)(t + 0x1b0), 4);
+        memcpy(&state, (const void *)(uintptr_t)(t + 0x40), 1);
+    }
+    ZLOGE("★ %s: type=%#llx handle=%#x state=%u tid=%ld", tag, t, handle, state,
+          (long)syscall(SYS_gettid));
+}
+static void za_hook_startthread(unsigned long long *r)   { za_probe_threadtype("os::StartThread", r[0]); }
+static void za_hook_startimpl(unsigned long long *r)     { za_probe_threadtype("Impl::StartThread", r[0]); }
+static void za_hook_lockmutex(unsigned long long *r)     { za_trace_mutex("lock", r[0]); }
+// SDK 内部的「Result 检查器」：0x500180 `bl <fn>; cbnz w0, abort`。
+// 在 0x500194（cbnz 之前）探针，直接拿到失败的错误码。
+static void za_hook_rescheck(unsigned long long *r)
+{
+    unsigned int w0 = (unsigned int)r[0];
+    if (!w0) return;
+    static int n;
+    if (n++ >= 16) return;
+    ZLOGE("★ Result 检查失败: w0=%#x lr=%#llx x1=%#llx x2=%#llx x3=%#llx",
+          w0, r[19], r[1], r[2], r[3]);
+}
+static void za_hook_unlockmutex(unsigned long long *r)   { za_trace_mutex("unlock", r[0]); }
+
+// InternalConditionVariableImplByHorizon::Wait(cs) 入口（sdk+0x1458e8）：
+//   它先校验「cs 的锁字 owner == GetCurrentThread()->[0x1b0]」，不等就 AbortImpl。
+//   实测 worker 线程就是死在这里 ⇒ 把两边的身份值都打出来。
+//   ⚠ 这里不能用 `mrs TPIDRRO_EL0`：宿主 C 跑在宿主线程上，那个寄存器是宿主的
+//     （Android 上通常是 0）。必须走 za_os_tls_ro_area() 拿**客机**每线程页。
+static void za_hook_cvwait(unsigned long long *r)
+{
+    int *used = za_probe_budget("cv-wait");
+    if (*used >= 12) return;
+    (*used)++;
+    unsigned long long cv = r[0], cs = r[1];
+    unsigned long ro = za_os_tls_ro_area(), self = 0;
+    unsigned int word = 0, self_h = 0;
+    unsigned long long owner_ptr = 0;
+    unsigned int count = 0;
+    if (ro) memcpy(&self, (const void *)(uintptr_t)(ro + 0x1f8), 8);
+    if (self) memcpy(&self_h, (const void *)(uintptr_t)(self + 0x1b0), 4);
+    if (cs) {
+        memcpy(&word, (const void *)(uintptr_t)cs, 4);
+        memcpy(&owner_ptr, (const void *)(uintptr_t)(cs - 8), 8);
+        memcpy(&count, (const void *)(uintptr_t)(cs - 16), 4);
+    }
+    ZLOGE("★ cv-wait: cv=%#llx cs=%#llx *cs=%#x(owner=%#x bit30=%d) "
+          "ro=%#lx self=%#llx self[0x1b0](handle)=%#x mutex_owner=%#llx count=%u hosttid=%ld",
+          cv, cs, word, word & 0xbfffffffu, (word >> 30) & 1, ro, self, self_h,
+          owner_ptr, count, (long)syscall(SYS_gettid));
+}
+// InternalCriticalSectionImplByHorizon::Enter(cs) 入口（sdk+0x145efc）：
+//   把 [self+0x1b0]（线程 handle）CAS 进锁字。看它到底存了什么。
+static void za_hook_csenter(unsigned long long *r)
+{
+    int *used = za_probe_budget("cs-enter");
+    if (*used >= 12) return;
+    (*used)++;
+    unsigned long long cs = r[0];
+    unsigned long ro = za_os_tls_ro_area(), self = 0;
+    unsigned int word = 0, self_h = 0;
+    if (ro) memcpy(&self, (const void *)(uintptr_t)(ro + 0x1f8), 8);
+    if (self) memcpy(&self_h, (const void *)(uintptr_t)(self + 0x1b0), 4);
+    if (cs) memcpy(&word, (const void *)(uintptr_t)cs, 4);
+    ZLOGE("★ cs-enter: cs=%#llx *cs=%#x self=%#llx self[0x1b0](handle)=%#x hosttid=%ld",
+          cs, word, self, self_h, (long)syscall(SYS_gettid));
 }
 
 static void za_hook_waitloop(unsigned long long *r)     { za_probe_log("svc52-loop", r); }
@@ -429,6 +515,8 @@ int za_sdk_load(za_mod_t *sdk,
             0xb7a860,   // InternalCriticalSectionImplByHorizon::C1
             0xb7a868,   // InternalConditionVariableImplByHorizon::C1
             0xb7a880,   // InternalCriticalSectionImplByHorizon::Enter
+            0xb79018,   // nn::os::GetCurrentThread（CV Wait 用它取线程对象）
+            0xb79010,   // 相邻槽（对照）
             0xb7acf0,   // SetupThreadObjectUnsafe
             0xb7ad80,   // ThreadManager::ThreadManager
             0xb7af60,   // TlsManager::TlsManager
@@ -450,9 +538,12 @@ int za_sdk_load(za_mod_t *sdk,
         }
         // 槽里放宿主 C 函数地址（trampoline 用 adr 从这里读）
         *(void **)(base + ZA_SVC_SLOT_OFF) = (void *)za_horizon_svc;
-        // 另一个槽放 za_horizon_regs[] 的地址 —— trampoline 用它回写 x1..x7
-        // （Horizon 的出参在 W1/W2，C 函数只能返回一个值）
-        *(void **)(base + ZA_SVC_REGS_OFF) = (void *)za_horizon_regs;
+        // 寄存器槽指针槽：**不再使用**。
+        //   原来这里放全局 za_horizon_regs[] 的地址，trampoline 用它回写 x1..x7；
+        //   但全局表在多线程并发 svc 时会互相覆盖（nr 与 x1..x7 都会被污染）。
+        //   现在 trampoline 自己用 `mrs TPIDR_EL0 → [tp+0x40] → [+0xa0]` 取
+        //   **本线程**的 regs，这个槽保留只为不改变 trampoline 的布局/偏移。
+        *(void **)(base + ZA_SVC_REGS_OFF) = (void *)0;
         // ★★★ 第三个槽：宿主栈顶。
         //   svc 门会**把栈切到这里**再调 C 函数 —— 因为客人的 svc 包装函数只预留
         //   0x10 字节栈空间，而我们的 C 调度器链很深（几百字节），在客人的栈上跑
@@ -715,6 +806,19 @@ int za_sdk_load(za_mod_t *sdk,
         za_install_entry_probe(base, 0x144aa0, 0xc909e0, 0xc90a58, za_hook_workerblr);
         // abort 前的判错点：哪条等待返回了非 0
         za_install_entry_probe(base, 0x145934, 0xc90a60, 0xc90ad8, za_hook_waiterr);
+        // Wait(cs) 入口：owner 校验失败就会 Abort（sdk+0x1458e8 → 0x145948）。
+        za_install_entry_probe(base, 0x1458e8, 0xc90b00, 0xc90b78, za_hook_cvwait);
+        za_install_entry_probe(base, 0x145efc, 0xc90b80, 0xc90bf8, za_hook_csenter);
+        za_install_entry_probe(base, 0x13c100, 0xc90c00, 0xc90c78, za_hook_lockmutex);
+        za_install_entry_probe(base, 0x13c1c0, 0xc90c80, 0xc90cf8, za_hook_unlockmutex);
+        // ⚠ 探针在一个函数的**中间指令**上（0x500194 = `cbnz w0, abort`）时，
+        //   hook 的返回值/寄存器约定必须和原指令自洽 —— 实测这条探针让执行流
+        //   落进了 hook 槽中间（sdk+0xc90d7c），SIGILL。已移除。
+        // StartThread 的两个探针读错了寄存器（type 在 x1 而不是 x0），也一并移除。
+        {
+            unsigned int w = *(unsigned int *)(base + 0x145934);
+            ZLOGI("0x145934 探针回读: %#x（应为 b 指令 0x14xxxxxx）", w);
+        }
         za_install_entry_probe(base, 0x13b370, 0xc908e0, 0xc90958, za_hook_cswait);
         // 内存池初始化（main+0x1653cc0：x0=desc, x1=stride, x2=base, w3=size）。
         // PC 采样多次落在这个链表构建循环上；若 size/stride 不自洽会越界写。

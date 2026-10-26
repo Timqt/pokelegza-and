@@ -47,10 +47,17 @@ za_horizon_tramp:
     stp  x14, x15, [sp, #0x30]
     stp  x16, x17, [sp, #0x40]
     stp  x18, x30, [sp, #0x50]
-    // regs[] 诊断槽
-    adr  x16, 2f
-    ldr  x16, [x16]                 // &za_horizon_regs[]
-    ldr  x17, [sp, #0x40]           // 服务号
+    // ★★★ 每线程的 svc 寄存器槽。
+    //   以前 `adr x16,2f; ldr x16,[x16]` 取的是**全局** za_horizon_regs[]：
+    //   服务号先写进 regs[10] 再读回来当第 9 个参数，x1..x7 也从它回写。
+    //   两个线程同时进 svc 时互相覆盖 —— 实测 svc#28 的 nr 被读成另一个线程的
+    //   44，x1..x7 被写成别人的陈旧值（Horizon 约定 svc 只改 x0），
+    //   客机随后随机跳 pc=0x7fffffff00000000。
+    //   现在按 `TPIDR_EL0 → [tp+0x40]（本线程描述符页）→ [+0xa0]（槽地址）` 现取。
+    mrs  x16, TPIDR_EL0
+    ldr  x16, [x16, #0x40]
+    ldr  x16, [x16, #0xa0]
+    ldr  x17, [sp, #0x40]           // 服务号（门桩写在 x16 里，已保存）
     str  x17, [x16, #80]            // regs[10] = service number
     mov  x17, sp                    // SP 不能作为 str 的源寄存器
     str  x17, [x16, #72]            // regs[9]  = guest sp（已下移 0x60）
@@ -59,13 +66,23 @@ za_horizon_tramp:
     str  x19, [x16, #128]           // regs[16] = guest x19（诊断）
     str  x29, [x16, #136]           // regs[17] = guest x29（诊断）
     str  x28, [x16, #144]           // regs[18] = guest x28（诊断）
-    adr  x16, 3f
-    ldr  x16, [x16]                 // host stack top
-    mov  sp, x16                    // switch to the host stack
+    // ★★ 宿主栈：**每线程一条**（描述符 +0xA8 = 栈顶）。
+    //   以前用全局槽 3f 的栈顶：所有线程都 `sp = top - 0x80` ⇒ 并发 svc 时
+    //   两条线程的 C 栈帧完全重叠，局部变量/canary 互相踩烂
+    //   （实测 libc: "stack corruption detected (-fstack-protector)" → abort）。
+    //   描述符里没填（mmap 失败）时退回全局槽。
+    mrs  x16, TPIDR_EL0
+    ldr  x16, [x16, #0x40]
+    ldr  x17, [x16, #0xa8]
+    cbnz x17, 4f
+    adr  x17, 3f
+    ldr  x17, [x17]
+4:  mov  sp, x17
     sub  sp, sp, #0x80
-    // C 第 9 个参数 = 服务号（放在 [sp+0]）
-    adr  x16, 2f
-    ldr  x16, [x16]
+    // C 第 9 个参数 = 服务号（放在 [sp+0]）—— 从本线程 regs 取
+    mrs  x16, TPIDR_EL0
+    ldr  x16, [x16, #0x40]
+    ldr  x16, [x16, #0xa0]
     ldr  x17, [x16, #80]
     str  x17, [sp, #0x00]
     stp  x19, x20, [sp, #0x10]
@@ -84,9 +101,10 @@ za_horizon_tramp:
     ldp  x21, x22, [sp, #0x20]
     ldp  x19, x20, [sp, #0x10]
     add  sp, sp, #0x80
-    // 写回 x1..x7（Horizon 的出参在 regs[1..7]）
-    adr  x16, 2f
-    ldr  x16, [x16]
+    // 写回 x1..x7（Horizon 的出参在 regs[1..7]，本线程私有）
+    mrs  x16, TPIDR_EL0
+    ldr  x16, [x16, #0x40]
+    ldr  x16, [x16, #0xa0]
     ldp  x1, x2, [x16, #8]
     ldp  x3, x4, [x16, #24]
     ldp  x5, x6, [x16, #40]
