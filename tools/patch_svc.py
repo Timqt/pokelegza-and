@@ -201,7 +201,7 @@ def main():
         struct.pack_into("<I", gate, TRAMP_BASE - GATE_BASE + i * 4, struct.unpack_from("<I", tramp, i * 4)[0])
     for nr in range(1, maxnr + 1):
         g = GATE_BASE + (nr - 1) * 8
-        struct.pack_into("<II", gate, g - GATE_BASE, enc_mov_w_imm(9, nr), enc_b(g + 4, TRAMP_BASE))
+        struct.pack_into("<II", gate, g - GATE_BASE, enc_mov_w_imm(16, nr), enc_b(g + 4, TRAMP_BASE))
 
     # 补丁表：改写**包装函数入口**
     patches = []
