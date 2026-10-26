@@ -361,6 +361,7 @@ long za_horizon_svc(long a0, long a1, long a2, long a3,
 // 只读 TLS 页地址由 za_sdk.c 在装载时填好，这里通过导出变量取。
 extern volatile unsigned long za_ro_tls_page;
 unsigned long long za_dbg_last_wait;   // 最近一次 WaitForAddress 的地址
+unsigned long long za_dbg_last_phys_addr, za_dbg_last_phys_size;
 static unsigned int za_current_owner_id(void)
 {
     unsigned long ro = za_os_tls_ro_area();   // ★ 每线程页（不是全局页）
@@ -1045,6 +1046,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     }
     case 44: // MapPhysicalMemory(addr=x0, size=x1)
     case 45: // UnmapPhysicalMemory(addr=x0, size=x1)
+        if (nr == 44) { za_dbg_last_phys_addr = (unsigned long long)a0;
+                        za_dbg_last_phys_size = (unsigned long long)a1; }
         ZLOGI("svc#%ld MapPhys addr=%#lx size=%#lx (pc=sdk+%#lx)", nr,
               (unsigned long)a0, (unsigned long)a1,
               (unsigned long)(za_horizon_regs[ZA_REG_PC] - (unsigned long)za_sdk_base));

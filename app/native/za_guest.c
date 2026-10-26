@@ -981,6 +981,23 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
             }
         }
+        // ★ 最近一次 svc#44 映射的物理区（前 0x200 字节）
+        {
+            extern unsigned long long za_dbg_last_phys_addr, za_dbg_last_phys_size;
+            unsigned long long a = za_dbg_last_phys_addr;
+            if (a && za_va_plausible(a))
+            {
+                ZLOGI("ZaGuest: PHYSMAP last %#llx+%#llx 内容前 0x80：",
+                      a, za_dbg_last_phys_size);
+                for (int i = 0; i < 0x80; i += 0x20)
+                {
+                    unsigned long long w[4];
+                    memcpy(w, (const void *)(uintptr_t)(a + i), 32);
+                    ZLOGI("  +%#04x: %016llx %016llx %016llx %016llx",
+                          i, w[0], w[1], w[2], w[3]);
+                }
+            }
+        }
         // ★ 最近一次等待类 svc 的返回值
         {
             extern volatile long za_dbg_last_wait_nr, za_dbg_last_wait_ret;
