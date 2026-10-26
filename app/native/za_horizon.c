@@ -360,6 +360,7 @@ long za_horizon_svc(long a0, long a1, long a2, long a3,
 // 所以我们这里必须用同一个来源（不能另编一个值，否则锁字和判定永远对不上）。
 // 只读 TLS 页地址由 za_sdk.c 在装载时填好，这里通过导出变量取。
 extern volatile unsigned long za_ro_tls_page;
+unsigned long long za_dbg_last_wait;   // 最近一次 WaitForAddress 的地址
 static unsigned int za_current_owner_id(void)
 {
     unsigned long ro = za_os_tls_ro_area();   // ★ 每线程页（不是全局页）
@@ -1388,6 +1389,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     case 52: // WaitForAddress(addr=x0, type=w1, value=w2, timeout=x3)
     {
         unsigned int *p = (unsigned int *)(uintptr_t)a0;
+        za_dbg_last_wait = (unsigned long long)a0;   // 崩溃 dump 用
         if (!p) return 0xFA01u;
         int type = (int)a1;
         unsigned int v = (unsigned int)a2;

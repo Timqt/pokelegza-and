@@ -981,6 +981,24 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
             }
         }
+        // ★ 最近一次 WaitForAddress 的锁字现场（活锁排查）
+        {
+            extern unsigned long long za_dbg_last_wait;
+            unsigned long long a = za_dbg_last_wait;
+            if (a && za_va_plausible(a))
+            {
+                for (int i = -2; i < 6; i++)
+                {
+                    char *q = buf;
+                    q = za_put_str(q, "ZaGuest: WAITWORD[");
+                    q = za_put_hex(q, (unsigned long long)(a + i * 8));
+                    q = za_put_str(q, "]=");
+                    q = za_put_hex(q, *(unsigned long long *)(uintptr_t)(a + i * 8));
+                    q[0] = 10; q++;
+                    za_fatal_write(buf, (size_t)(q - buf));
+                }
+            }
+        }
         za_log_sdk_state((unsigned long)uc->uc_mcontext.regs[19],
                          (unsigned long)uc->uc_mcontext.regs[8]);
         // svc 轨迹：崩溃前最后几次 svc 的服务号 + 调用点 PC + 寄存器
