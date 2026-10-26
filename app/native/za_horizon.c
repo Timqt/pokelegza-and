@@ -1326,8 +1326,49 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             return 1;               // 别人持有 ⇒ 让调用方去等
         }
     case 28: // WaitProcessWideKeyAtomic(addr=x0, key=x1, tag=w2, timeout=x3)
+    {
+        // Horizon 内核语义：
+        //   ① 若 *addr != tag ⇒ 条件已变，直接返回（不等待）
+        //   ② 否则原子地 *addr = *key，然后在 *key 上睡眠
+        //   ③ 被唤醒后把 *addr 恢复成 tag
+        // SDK 的用户态事件/信号量就靠它（InitializeEvent 是纯用户态初始化）。
+        unsigned int *p = (unsigned int *)(uintptr_t)a0;
+        unsigned int *key = (unsigned int *)(uintptr_t)a1;
+        unsigned int tag = (unsigned int)a2;
+        long long ns = (long long)a3;
+        if (!p || !key) return 0xFA01u;
+        unsigned int expect = tag;
+        unsigned int kval = __atomic_load_n(key, __ATOMIC_ACQUIRE);
+        if (!__atomic_compare_exchange_n(p, &expect, kval, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return 0;                       // 值已变（别人先动手）⇒ 不需要等
+        if (ns == 0) return 0xEA01u;        // 不等待
+        struct timespec ts, *tsp = NULL;
+        if (ns > 0)
+        {
+            ts.tv_sec = (time_t)(ns / 1000000000LL);
+            ts.tv_nsec = (long)(ns % 1000000000LL);
+            tsp = &ts;
+        }
+        int rc;
+        do {
+            rc = (int)syscall(SYS_futex, (int *)key, FUTEX_WAIT_PRIVATE,
+                              (int)kval, tsp, NULL, 0);
+        } while (rc == -1 && errno == EINTR);
+        __atomic_store_n(p, tag, __ATOMIC_RELEASE);   // 唤醒后恢复 tag
+        return rc == 0 ? 0 : 0xEA01u;
+    }
     case 29: // SignalProcessWideKey(key=x0, count=w1)
+    {
+        unsigned int *key = (unsigned int *)(uintptr_t)a0;
+        if (key)
+        {
+            int n = (int)a1;
+            syscall(SYS_futex, (int *)key, FUTEX_WAKE_PRIVATE,
+                    n > 0 ? n : 0x7fffffff, NULL, NULL, 0);
+        }
         return 0;
+    }
 
     // ── 地址等待/唤醒（nn::os 的用户态 futex 算法）──────────────────
     // 实测（SDK+0x13b2xx，nn::os 的 mutex/条件变量实现）：
