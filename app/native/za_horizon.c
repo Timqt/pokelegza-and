@@ -1339,29 +1339,60 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                           (void *)(uintptr_t)a0, cur, za_current_owner_id());
                 }
             }
-            if (a0) __atomic_store_n((unsigned int *)(uintptr_t)a0, 0u, __ATOMIC_RELEASE);
+            if (a0)
+            {
+                __atomic_store_n((unsigned int *)(uintptr_t)a0, 0u, __ATOMIC_RELEASE);
+                // 唤醒在 svc#26 里阻塞的等待者（快速路径不加这个唤醒，
+                // 但快速路径只在「无等待者」时才会走）。
+                syscall(SYS_futex, (int *)(uintptr_t)a0, FUTEX_WAKE_PRIVATE,
+                        0x7fffffff, NULL, NULL, 0);
+            }
             return 0;
         }
         {
-            // ArbitrateLock(cur_handle = x0, ptr = x1, req_handle = w2)
+            // ArbitrateLock(old_owner = x0, ptr = x1, my_id = w2)
+            //
+            // ★★ 2026-10-26 修正语义：**必须阻塞到拿到锁，然后返回 0**。
+            //   SDK 的 InternalCriticalSection::Enter（sdk+0x145efc）慢路径：
+            //       145f38: orr  w9,w8,#0x40000000 ; stlxr   ; 先置「有等待者」位
+            //       145f50: bl   svc#26(old_owner, lock, my_id)
+            //       145f58: cbnz w0, abort                   ; ★ 非 0 直接 Abort
+            //   以前这里「别人持有时返回 1」⇒ Enter 立刻 Abort(Result=1)。
+            //   真机语义：内核让调用者睡眠，等持有者释放后把锁字写成本线程 id。
+            //
+            //   唤醒配对：Leave 的快速路径只在锁字没有 0x40000000 位时走
+            //   （即「没有等待者」）；有等待者时 Enter 已经置了该位，
+            //   Leave 必然走 svc#27（慢路径）⇒ 我们在那里 futex_wake 即可。
             unsigned int *lock = (unsigned int *)(uintptr_t)a1;
-            if (!lock) return 0;
-            unsigned int owner = za_current_owner_id();
+            unsigned int me = (unsigned int)a2;
+            if (!lock || !me) return 0;
             {
                 static int n26;
                 if (n26 < 12)
                 {
                     n26++;
-                    ZLOGI("svc#26 ArbitrateLock lock=%p before=%#x owner=%u host_tid=%u",
-                          (void *)lock, *lock, owner, (unsigned)syscall(SYS_gettid));
+                    ZLOGI("svc#26 ArbitrateLock lock=%p before=%#x me=%u host_tid=%u",
+                          (void *)lock, __atomic_load_n(lock, __ATOMIC_RELAXED), me,
+                          (unsigned)syscall(SYS_gettid));
                 }
             }
-            unsigned int expect = 0;
-            if (__atomic_compare_exchange_n(lock, &expect, owner, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-                return 0;           // 拿到
-            if (expect == owner) return 0;   // 已经是自己持有（可重入视作拿到）
-            return 1;               // 别人持有 ⇒ 让调用方去等
+            for (;;)
+            {
+                unsigned int expect = 0;
+                if (__atomic_compare_exchange_n(lock, &expect, me, 0,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                    return 0;                       // 拿到（顺带清掉 0x40000000）
+                if ((expect & 0xbfffffffu) == me) return 0;   // 已经是自己
+                // 等持有者释放：锁字变化就重试。
+                // ⚠ 必须**有界**：SDK 的 Leave 在「锁字没有 0x40000000 位」时
+                //   走快速路径（直接 CAS 成 0），**不会** svc#27 ⇒ 不会 futex_wake。
+                //   如果我们在它读到锁字之后、CAS 之前进入无限等待，就永远
+                //   收不到唤醒（实测：线程卡死在 svc#26，10 秒后看门狗发
+                //   SIGSEGV 倒现场，看起来像崩溃）。2ms 轮询既安全又便宜。
+                struct timespec ts = { 0, 2 * 1000 * 1000 };
+                syscall(SYS_futex, (int *)lock, FUTEX_WAIT_PRIVATE, (int)expect,
+                        &ts, NULL, 0);
+            }
         }
     case 28: // WaitProcessWideKeyAtomic(addr=x0, key=x1, tag=w2, timeout=x3)
     {
@@ -1640,6 +1671,35 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                               w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7],
                               w[8], w[9], w[10], w[11], w[12], w[13], w[14], w[15],
                               w[16], w[17], w[18], w[19]);
+                    }
+                }
+                // 取证：把请求缓冲里的可打印字符串（文件路径等）打出来。
+                // 实测 main 的 OpenFile 失败会让它在重试后 Abort，
+                // 所以必须知道它到底在开哪个文件。
+                {
+                    static int strdumps;
+                    const char *nm2 = za_fake_svc_name(sess);
+                    if (strdumps < 24 && nm2 && (strcmp(nm2, "fsp-srv") == 0 || strcmp(nm2, "fs") == 0))
+                    {
+                        for (unsigned off = 0; off < 0x200 && strdumps < 24; off++)
+                        {
+                            const unsigned char *q = (const unsigned char *)(uintptr_t)(ro + off);
+                            unsigned n = 0;
+                            while (n < 120 && q[n] >= 0x20 && q[n] < 0x7f) n++;
+                            if (n >= 4 && (off == 0 || q[-1] == 0))
+                            {
+                                strdumps++;
+                                // ⚠ 必须拷到本地再 NUL 结尾：客机的字符串可能在
+                                //   页尾没有终止符，直接把 q 交给 vsnprintf("%s")
+                                //   会让 libc 走过映射边界 ⇒ SIGSEGV（实测）。
+                                char tmp[72];
+                                unsigned m = n < 64 ? n : 64;
+                                memcpy(tmp, q, m);
+                                tmp[m] = 0;
+                                ZLOGI("    fs 字符串 @TLS+%#x: \"%s\"", off, tmp);
+                                off += n;
+                            }
+                        }
                     }
                 }
                 za_write_cmif_reply(ro, (unsigned long long)a2, (unsigned long long)a4, hdr0, hdr1);

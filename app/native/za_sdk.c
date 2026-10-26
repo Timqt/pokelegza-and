@@ -246,6 +246,56 @@ static void za_hook_csenter(unsigned long long *r)
           cs, word, self, self_h, (long)syscall(SYS_gettid));
 }
 
+// CMIF 应答槽位解码（sdk+0xc4c50 `bl 0x9a8f0` 返回后）：
+//   SDK 在 0xc4c54 把返回值存进结构，其中 **bits 24..31 = idx**，
+//   最终槽位 = align16(缓冲 + idx*4 + 0xf)。
+//   我们一直按「SFCI 所在位置」猜槽位；这里直接读出 SDK 算出的 idx 来核对。
+static void za_hook_cmifidx(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 24) return;
+    unsigned int v = (unsigned int)r[0];
+    unsigned int idx = (v >> 24) & 0xFF;
+    ZLOGE("★ CMIF idx: ret=%#x idx=%u ⇒ 槽位偏移=%#x", v, idx,
+          (idx * 4 + 0xf) & ~0xfu);
+}
+
+// CMIF 应答校验点（sdk+0x14eb38，正在读 [sp+0xb2]）：
+//   [sp+0x88] = 请求缓冲基址，[sp+0x90] = **应答**缓冲基址，[sp+0xaf] = idx。
+//   探针桩自己的帧是 0xd0 字节（0x30+0xa0），所以 sp_func = r + 0xd0。
+//   只有把这三个值拿到，才能算出 SDK 真正读 SFCO 的地址。
+static void za_hook_cmifslot(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 16) return;
+    unsigned long spf = (unsigned long)(uintptr_t)r + 0xd0;
+    unsigned long long req = 0, rsp = 0;
+    unsigned int idx = 0, hc = 0;
+    memcpy(&req, (const void *)(uintptr_t)(spf + 0x88), 8);
+    memcpy(&rsp, (const void *)(uintptr_t)(spf + 0x90), 8);
+    memcpy(&idx, (const void *)(uintptr_t)(spf + 0xaf), 1);
+    memcpy(&hc, (const void *)(uintptr_t)(spf + 0xb2), 2);
+    ZLOGE("★ CMIF slot: req=%#llx resp=%#llx idx=%u hc=%u ⇒ 期望槽=%#llx",
+          req, rsp, idx, hc, (rsp + (unsigned long long)idx * 4 + 0xf) & ~0xfull);
+}
+
+// 路径 B 的 SFCO 校验（sdk+0x10bf18 = `cmp w9, "SFCO"`）：
+//   0x10bf10 刚算完 x8 = align16(buffer + idx*4 + 0xf)，0x10bf14 读 [x8+0x10]。
+//   r[8] = x8、r[9] = 读到的魔数。失败就说明我们写 SFCO 的位置/缓冲不对。
+static void za_hook_cmifchk(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 16) return;
+    unsigned long long slot = r[8] + 0x10;
+    unsigned int magic = (unsigned int)r[9];
+    ZLOGE("★ pathB 校验: slot=%#llx magic=%#x(%s) ⇒ 槽内 =%#x %#x %#x %#x",
+          slot, magic, magic == 0x4f434653u ? "SFCO" : "非SFCO",
+          (unsigned)*(const unsigned int *)(uintptr_t)slot,
+          (unsigned)*(const unsigned int *)(uintptr_t)(slot + 4),
+          (unsigned)*(const unsigned int *)(uintptr_t)(slot + 8),
+          (unsigned)*(const unsigned int *)(uintptr_t)(slot + 0xc));
+}
+
 static void za_hook_waitloop(unsigned long long *r)     { za_probe_log("svc52-loop", r); }
 static void za_hook_cswait(unsigned long long *r)       { za_probe_log("cs-wait", r); }
 // 等待原语返回后的判错点（sdk+0x145934 = `cbnz w0, abort`）：
@@ -820,6 +870,9 @@ int za_sdk_load(za_mod_t *sdk,
             ZLOGI("0x145934 探针回读: %#x（应为 b 指令 0x14xxxxxx）", w);
         }
         za_install_entry_probe(base, 0x13b370, 0xc908e0, 0xc90958, za_hook_cswait);
+        za_install_entry_probe(base, 0xc4c54, 0xc90e80, 0xc90ef8, za_hook_cmifidx);
+        za_install_entry_probe(base, 0x14eb38, 0xc90f00, 0xc90f78, za_hook_cmifslot);
+        za_install_entry_probe(base, 0x10bf18, 0xc90f80, 0xc90ff8, za_hook_cmifchk);
         // 内存池初始化（main+0x1653cc0：x0=desc, x1=stride, x2=base, w3=size）。
         // PC 采样多次落在这个链表构建循环上；若 size/stride 不自洽会越界写。
         ZLOGI("断言探针已装：0x9b010 / 0x9acb0 / 0x9ac00 / 0x9ad10 / 0x9aa70");

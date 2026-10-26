@@ -939,6 +939,25 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
             }
         }
+        // 宿主 PC 附近的机器码：宿主库里崩了也能看出是哪条指令
+        if (pc >= 0x10000)
+        {
+            unsigned int w[8];
+            int ok = 1;
+            for (int k = 0; k < 8; k++)
+                if (!za_read_bytes(pc - 16 + (unsigned long)k * 4, &w[k], 4)) { ok = 0; break; }
+            if (ok)
+            {
+                char *p = buf;
+                p = za_put_str(p, "ZaGuest: FAULTCODE @pc-16:");
+                for (int k = 0; k < 8; k++) { p = za_put_str(p, " "); p = za_put_hex(p, w[k]); }
+                {
+                    const char nl[2] = { 10, 0 };
+                    p = za_put_str(p, nl);
+                }
+                za_fatal_write(buf, (size_t)(p - buf));
+            }
+        }
         {
             char *p = buf;
             p = za_put_str(p, "ZaGuest: sp=");
@@ -1759,9 +1778,55 @@ static unsigned long long za_get_system_tick(void)
 }
 static unsigned long long za_get_system_tick_frequency(void) { return 19200000ull; }
 // 宿主符号表：客机导入的 nn::* 由我们实现的这些顶替（表在解析链的第一位）。
+// hid 初始化桩：返回 Result=0（u32 在 w0，不能用 void 函数 —— w0 会是野值）。
+static unsigned int za_hid_init_ok(void) { return 0; }
+// hid 的「设置」类 API 返回 void；内部会调 detail（需要真服务），
+// 现阶段直接吞掉，避免它们把未初始化的服务错误当成致命错误 Abort。
+static void za_hid_noop(void) { }
+
+// nn::fs::OpenFile(FileHandle* out, const char* path, int mode)
+// main 的静态构造函数里会开一个文件并用 16 次重试等它出现；失败就 Abort。
+// 我们的 fs 服务还没有实现「指针缓冲」那一层（路径字符串走 PointerAndSize
+// 描述符，宿主看不到），所以先在这里截住、把路径打出来，同时给出成功。
+// TODO: 接真正的 romfs/save 后端后撤掉。
+static unsigned int za_fs_openfile(void *out, const char *path, int mode)
+{
+    char tmp[256];
+    unsigned i = 0;
+    if (path)
+    {
+        for (; i < sizeof tmp - 1; i++)
+        {
+            char c = path[i];
+            if (!c) break;
+            tmp[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
+        }
+    }
+    tmp[i] = 0;
+    ZLOGE("★ fs::OpenFile out=%p path=\"%s\" mode=%d ⇒ 先返回成功（假句柄 1）",
+          out, tmp, mode);
+    if (out) *(unsigned int *)out = 1;
+    return 0;
+}
+
 static const za_host_sym_t za_host_syms[] = {
     // loader 提供的「runtime object file」（真机由 nnrtld 提供）
     { "__nnDetailNintendoSdkRuntimeObjectFile", (void *)za_host_runtime_object_file },
+
+    // ── hid 初始化：先接管成「成功」──────────────────────────────
+    // nn::hid::InitializeNpad 会通过 CMIF 连 hid 服务、建共享内存；
+    // 我们目前的伪造服务应答让它的内部解析返回 Result 0x1a80a，
+    // 它在 main+0x19dca1c 处的 Result 检查里直接 Abort。
+    // 现阶段的目标是进 nnMain，输入设备还没有接；先让它返回 0。
+    // ⚠ 这是**临时**接管（可逆）：真正的 hid 服务/共享内存实现后要撤掉，
+    //   否则 GetNpadState 之类的调用会读到未初始化的服务状态。
+    { "_ZN2nn3hid14InitializeNpadEv", (void *)za_hid_init_ok },
+    { "_ZN2nn3hid21InitializeTouchScreenEii", (void *)za_hid_init_ok },
+    { "_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", (void *)za_hid_init_ok },
+    { "_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", (void *)za_hid_noop },
+    { "_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", (void *)za_fs_openfile },
+    { "_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", (void *)za_hid_noop },
+    { "_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", (void *)za_hid_noop },
 
     // NVN 图形入口（图形层未接：回陷阱桩，客机一调就知道缺哪个）
     { "nvnBootstrapLoader", (void *)za_nvn_bootstrap_loader },
@@ -1901,6 +1966,7 @@ static void za_hook_m_poolinit(unsigned long long *r);
 static void za_hook_m_poolloop(unsigned long long *r);
 static void za_hook_m_w2(unsigned long long *r);
 static void za_hook_m_w3(unsigned long long *r);
+static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
                                   void (*hook)(unsigned long long *));
@@ -2021,6 +2087,9 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0x1653d00, ZA_MPROBE_STUB + 0x80, ZA_MPROBE_SLOT + 0x08, za_hook_m_poolloop);
         za_install_main_probe(base, 0x1a0a204, ZA_MPROBE_STUB + 0x100, ZA_MPROBE_SLOT + 0x10, za_hook_m_w2);
         za_install_main_probe(base, 0x1bab754, ZA_MPROBE_STUB + 0x180, ZA_MPROBE_SLOT + 0x18, za_hook_m_w3);
+        // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
+        //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
+        //   main 的 BSS（pc=main+0x76b732c）。call 类指令不适合这套探针，已移除。
         __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x100);
         mprotect(base + ZA_MPROBE_STUB, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
@@ -2167,6 +2236,29 @@ static void za_hook_m_w2(unsigned long long *r)
     ZLOGI("★ main 探针 w2(0x1a0a204): x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx",
           r[0], r[1], r[2], r[3], r[19]);
 }
+static void za_hook_m_openfile(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 8) return;
+    unsigned long p = (unsigned long)r[1];
+    char txt[128];
+    int ok = 0;
+    unsigned long long gb = (unsigned long long)(uintptr_t)za_guest_base;
+    if (p && ((p >= 0x400000000ull && p < 0xd00000000ull) ||
+              (p >= 0xb400000000000000ull && p < 0xb400010000000000ull) ||
+              (gb && p >= gb && p < gb + ZA_IMAGE_SIZE)))
+    {
+        for (int i = 0; i < 120; i++)
+        {
+            char c = *(const char *)(uintptr_t)(p + i);
+            if (!c) { txt[i] = 0; ok = 1; break; }
+            txt[i] = (c >= 0x20 && c < 0x7f) ? c : '?';
+        }
+    }
+    if (ok) ZLOGE("★ main OpenFile: mode=%#llx path=\"%s\"", r[2], txt);
+    else ZLOGE("★ main OpenFile: out=%#llx path=%#llx mode=%#llx（读不到字符串）", r[0], (unsigned long long)p, r[2]);
+}
+
 static void za_hook_m_w3(unsigned long long *r)
 {
     static int n;
