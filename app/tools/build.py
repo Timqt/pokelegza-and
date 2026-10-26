@@ -97,6 +97,7 @@ def build_native():
     run([sys.executable, str(REPO / "tools" / "gen_stubs.py")])
     so = assert_inside(BUILD / "libzaandroid.so")
     run([clang, "-O2", "-g", "-fPIC", "-shared", "-fvisibility=hidden",
+         "-Wl,-z,relro,-z,now",   # ★ GOT 全只读：客机越界写打到 GOT 会立刻 SIGSEGV
          "-o", so, ROOT / "native" / "za_activity.c", ROOT / "native" / "za_guest.c",
          ROOT / "native" / "za_mod.c", ROOT / "native" / "za_sdk.c",
          ROOT / "native" / "za_horizon.c",
