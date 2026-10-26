@@ -1664,6 +1664,26 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             memcpy(&w1v, (const void *)(uintptr_t)((unsigned long)a1 + 8), 8);
             memcpy(&w2v, (const void *)(uintptr_t)((unsigned long)a1 + 16), 8);
             ZLOGI("  info[0..0x18]=%016llx %016llx %016llx", w0v, w1v, w2v);
+            // ★ 立即把断言元数据（表达式/文件/函数）解析成字符串 —— 不等进程崩
+            {
+                extern unsigned char *za_guest_base;
+                for (int i = 0; i < 8; i++)
+                {
+                    unsigned long long v = 0;
+                    memcpy(&v, (const void *)(uintptr_t)((unsigned long)a1 + i * 8), 8);
+                    if (!v) continue;
+                    int in_sdk = (za_sdk_base && v >= za_sdk_base && v < za_sdk_base + za_sdk_size);
+                    int in_main = (za_guest_base && v >= (unsigned long long)(uintptr_t)za_guest_base &&
+                                   v < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE);
+                    if (!in_sdk && !in_main) continue;
+                    const char *str = (const char *)(uintptr_t)v;
+                    int ok = 0;
+                    for (int k = 0; k < 128; k++) { if (!str[k]) { ok = 1; break; }
+                                                    if ((unsigned char)str[k] < 0x20) break; }
+                    if (ok) ZLOGI("    info[+%#x] → %s 字符串: \"%s\"",
+                                  i * 8, in_sdk ? "sdk" : "main", str);
+                }
+            }
         }
         // ② GetInfo 关键 id 的当前值：0x148f80 的 bics 掩码校验依赖它
         {
