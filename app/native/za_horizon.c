@@ -35,6 +35,7 @@
 #include <errno.h>
 #include <linux/futex.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1410,6 +1411,14 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             if (errno == EAGAIN || errno == EINTR) continue;   // 值变了/被信号打断 ⇒ 重判
             return 0xEA01u;                         // 超时等
         }
+    }
+    case 54: // SynchronizeToAddress / 慢路径让出 CPU（SDK 临界区忙等里调）
+    {
+        // 实测调用点 sdk+0x1385cc：InternalCriticalSection 的慢路径，参数沿用
+        // 外层（没有单独的 addr/type/value）⇒ 语义是「让出/短睡」，不是等待。
+        // 这里按让出 CPU 处理，避免多线程忙等把核跑满。
+        sched_yield();
+        return 0;
     }
     case 53: // SignalToAddress(addr=x0, type=w1, value=w2)
     {

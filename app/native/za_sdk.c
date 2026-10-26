@@ -162,6 +162,7 @@ static void za_hook_abort_entry(unsigned long long *r)
 
 static void za_hook_waitloop(unsigned long long *r)     { za_probe_log("svc52-loop", r); }
 static void za_hook_cswait(unsigned long long *r)       { za_probe_log("cs-wait", r); }
+static void za_hook_poolinit(unsigned long long *r)     { za_probe_log("pool-init", r); }
 
 static void za_install_entry_probe(unsigned char *base, unsigned int func_off,
                                    unsigned int stub_off, unsigned int hook_off,
@@ -662,6 +663,9 @@ int za_sdk_load(za_mod_t *sdk,
         // （0x13b370）。当前 boot 线程在这里空转并最终跳到 pc=0x24，需要看入参。
         za_install_entry_probe(base, 0x13b2e0, 0xc90860, 0xc908d8, za_hook_waitloop);
         za_install_entry_probe(base, 0x13b370, 0xc908e0, 0xc90958, za_hook_cswait);
+        // 内存池初始化（main+0x1653cc0：x0=desc, x1=stride, x2=base, w3=size）。
+        // PC 采样多次落在这个链表构建循环上；若 size/stride 不自洽会越界写。
+        za_install_entry_probe(base, 0x1653cc0, 0xc90960, 0xc909d8, za_hook_poolinit);
         ZLOGI("断言探针已装：0x9b010 / 0x9acb0 / 0x9ac00 / 0x9ad10 / 0x9aa70");
 
         // ★ 互斥 owner 检查旁路（临时，等 nn::os 同步家族整体改道后再撤）
