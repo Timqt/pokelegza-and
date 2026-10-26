@@ -80,21 +80,34 @@ extern volatile unsigned long za_sdk_size;
 // 门区（Horizon svc 宿主门）+ 只读 TLS 页都要在映像末尾扩展区里
 #define ZA_SDK_TOTAL_SIZE (ZA_SDK_EXT_SIZE)
 
+// 极少数 .data 槽位里放的是「数值」而不是模块内偏移，启发式必须放过它们。
+// 已知：nvn 堆对象 @0xb88fa0 的 arena 描述符
+//   +0x38 = 0xc11764 （arena 起始 = SDK bss 内偏移 ⇒ 需要加基址）
+//   +0x40 = 0x20000  （arena 字节数，不是指针 ⇒ 加了基址就变成 8.6GB）
+// 这两个槽都不在 SDK 官方重定位表里（表只覆盖 heap 开头那几个函数指针），
+// 所以只能在这里显式排除尺寸槽。误伤的后果：分配器把 end-0x48 写到未映射区。
+static int za_sdk_is_non_pointer_slot(size_t off)
+{
+    return off == (0x40 + 0xb88fa0) - ZA_SDK_DATA_OFF;   /* heap+0x40 = arena size */
+}
+
 // 基址重定位：只扫 .data，规则与 main NSO 相同
 // （0x1000 <= v < 映像大小 ⇒ 视为模块内指针，加基址）
 static unsigned long long za_sdk_relocate_base(unsigned char *base)
 {
-    unsigned long long moved = 0;
+    unsigned long long moved = 0, skipped = 0;
     for (size_t off = 0; off + 8 <= ZA_SDK_DATA_SIZE; off += 8)
     {
         unsigned long long *slot = (unsigned long long *)(base + ZA_SDK_DATA_OFF + off);
         unsigned long long v = *slot;
         if (v >= 0x1000 && v < ZA_SDK_IMG_SIZE)
         {
+            if (za_sdk_is_non_pointer_slot(off)) { skipped++; continue; }
             *slot = (unsigned long long)base + v;
             moved++;
         }
     }
+    if (skipped) ZLOGI("SDK 重定位：跳过 %llu 个已知非指针槽（nvn arena size）", skipped);
     return moved;
 }
 

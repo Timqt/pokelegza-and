@@ -49,6 +49,7 @@
 #include "za_guest_api.h"
 #include "za_guest_info.h"
 #include "za_mem.h"
+#include "za_os.h"
 
 // SDK 映像基址/大小（定义在 za_guest.c）：崩溃与断言回溯时用来把地址换算成模块偏移
 extern volatile unsigned long za_sdk_base;
@@ -298,6 +299,9 @@ static void *za_thread_trampoline(void *p)
     // 栈溢出时也要能报出来 ⇒ 给这条线程装备用信号栈
     za_install_altstack();
     za_stack_register_current((long)syscall(SYS_gettid), "svc");
+    // ★ 每个客机线程都要有自己的影子 TLS 描述符：mrs 桩内联读 [tp16+0x98]
+    //   来算客机 TLS 区；不装的话读到的是 bionic 的 DTV 指针 ⇒ 野地址。
+    za_os_install_tls_descriptor();
     za_thread_start_t *ts = (za_thread_start_t *)p;
     void (*entry)(void *) = ts->entry;
     void *arg = ts->arg;

@@ -80,6 +80,9 @@ unsigned long za_svc_trace_pos;
 // 前置声明：mrs TPIDR_EL0 替换桩的宿主回调（实现在后面）
 unsigned long za_tls_mrs_hook(void);
 unsigned long za_os_guest_tls_area(void);
+// 宿主分配器（fs 分配器桩 + 线程上下文对象 vtable 共用，实现在后面）
+void *za_fs_vt_alloc(void *obj, unsigned long size, unsigned long align);
+void za_fs_vt_free(void *obj, void *ptr, unsigned long size, unsigned long align);
 
 static char *za_put_str(char *p, const char *s)
 {
@@ -1168,6 +1171,7 @@ typedef struct
     unsigned long long slot_orig;   // [tp16+0x98] 的 bionic 原值
     unsigned long long slot_guest;  // 客机期望值（变量区相对 tp16 的偏移 / 8）
     unsigned long tp16;
+    long tid;           // 归属线程（0 = 槽位空闲）
 } za_tls_state_t;
 static za_tls_state_t za_tls_states[ZA_TLS_SLOTS];
 
@@ -1178,10 +1182,23 @@ static void *za_get_tls(void)
     return (void *)(uintptr_t)tp;
 }
 
+// 按 tid 认领固定槽位：不能只用 tid % 64，否则两个线程会共用一份
+// state（tp16/area/slot_guest 全是另一个线程的）⇒ mrs 桩算出别人的 TLS 区。
 static za_tls_state_t *za_tls_cur(void)
 {
     long tid = syscall(SYS_gettid);
-    return &za_tls_states[tid % ZA_TLS_SLOTS];
+    unsigned idx = (unsigned)tid % ZA_TLS_SLOTS;
+    if (za_tls_states[idx].tid == tid) return &za_tls_states[idx];
+    for (unsigned i = 0; i < ZA_TLS_SLOTS; i++)
+        if (za_tls_states[i].tid == tid) return &za_tls_states[i];
+    for (unsigned i = 0; i < ZA_TLS_SLOTS; i++)
+    {
+        long expect = 0;
+        if (__atomic_compare_exchange_n(&za_tls_states[i].tid, &expect, tid, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return &za_tls_states[i];
+    }
+    return &za_tls_states[idx];   // 线程数超过槽位：退回取模槽（可能互相干扰）
 }
 
 void za_tls_enter(void)
@@ -1206,6 +1223,8 @@ extern volatile unsigned long za_ro_tls_page;
 
 void za_os_install_tls_descriptor(void)
 {
+    za_tls_state_t *st_chk = za_tls_cur();
+    if (st_chk->tp16) return;            // 本线程已装过（幂等）
     void *b = za_get_tls();
     if (!b) { ZLOGE("读不到 TPIDR_EL0"); return; }
     unsigned long b16 = (unsigned long)b & ~0x1FFFul;
@@ -1476,13 +1495,36 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
             *(unsigned int *)(base + za_tls_patches[i].off + 4) = za_tls_patches[i].w1;
             n++;
         }
-        ZLOGI("客机 TLS: 改写 %u 个 helper，描述符区=%#x 变量区=%#x",
-              n, (unsigned)ZA_TLS_DESC_OFF, (unsigned)ZA_TLS_VAR_OFF);
+        // ★★ 描述符槽必须写：(改写后的 helper 算的是) P + [P+0x98]*8，
+        //    所以 [P+0x98] 必须是 (V-P)/8 = 0x2000。之前这个写入丢了 ⇒
+        //    helper 站点算出的「TLS 区」变成描述符页 P 本身（不是变量区 V），
+        //    与 mrs 桩（返回 V）不一致，且 P 被当对象用时全是 0。
+        *(unsigned long long *)(base + ZA_TLS_DESC_OFF + 0x98) =
+            (unsigned long long)((ZA_TLS_VAR_OFF - ZA_TLS_DESC_OFF) / 8);
+        // ★ 有些站点把「TPIDR & ~0x1FFF」（改写后 = P）当**线程上下文对象**：
+        //     mrs x8 ; and ; ... ; str x8,[obj+8]      ← 存的是这个指针
+        //     之后 ldr x8,[ctx] ; ldr x8,[x8,#0x10] ; blr x8
+        //   实测回调语义 = Allocate(size,align)（main+0x1a09d58，崩在 pc=0x10）。
+        //   ⇒ 给 P 一个最小 vtable：槽 2 = 宿主 Allocate，槽 3 = 宿主 Free。
+        {
+            unsigned long long *vt = (unsigned long long *)(base + ZA_TLS_DESC_OFF + 0x1000);
+            vt[2] = (unsigned long long)(uintptr_t)&za_fs_vt_alloc;
+            vt[3] = (unsigned long long)(uintptr_t)&za_fs_vt_free;
+            *(unsigned long long *)(base + ZA_TLS_DESC_OFF) = (unsigned long long)(uintptr_t)vt;
+        }
+        ZLOGI("客机 TLS: 改写 %u 个 helper，描述符区=%#x（+0x98=%#llx）变量区=%#x；"
+              "上下文 vtable=%#x",
+              n, (unsigned)ZA_TLS_DESC_OFF,
+              *(unsigned long long *)(base + ZA_TLS_DESC_OFF + 0x98),
+              (unsigned)ZA_TLS_VAR_OFF, (unsigned)(ZA_TLS_DESC_OFF + 0x1000));
     }
 
-    // mrs TPIDR_EL0 全量替换：`b <桩>`，桩里回调宿主取线程基址（10,193 条）
+    // mrs TPIDR_EL0 全量替换：`b <桩>`，桩里内联算线程 TLS 基址（10,193 条）：
+    //    mrs x16,tpidr ; and ~0x1FFF ; ldr x17,[x16,#0x98] ; add x16,x16,x17,lsl3
+    // ⚠ 桩内联、**不调用 C 函数**：调 C 会按 AAPCS 改掉 x0–x17，而 mrs 只写目标寄存器。
     {
         memcpy(base + ZA_TLS_STUB_OFF, za_tls_mrs_blob, (size_t)ZA_TLS_STUB_SIZE);
+        // 桩区末尾这格只作为映射上界标记（本版桩不再从这里取回调）
         *(unsigned long long *)(base + ZA_TLS_HOOK_SLOT) = (unsigned long long)(uintptr_t)za_tls_mrs_hook;
         // ★ 桩区必须可执行！它在文件映像（bss 末 0x5f7a000）之外、初始 mmap 是
         //   RW ⇒ 不收紧就是 NX ⇒ mrs 替换点第一次执行就 SIGSEGV（pc=桩地址）。
@@ -1535,6 +1577,26 @@ void *za_fs_alloc_host(unsigned long size)
 void za_fs_free_host(void *p)
 {
     free(p);
+}
+
+// 同一个分配器的 **vtable 版本**（首参是分配器对象）。
+//   Allocate(x0=obj, x1=size, x2=align)
+//   Free    (x0=obj, x1=ptr,  x2=size, x3=align)
+// 游戏里的 vector/resize 走 helper 0x24f20 → `ldr x8,[obj]; ldr x8,[x8,#0x10]; blr x8`，
+// 不经过 fs 的那两个跳板，所以必须直接填 vtable。
+void *za_fs_vt_alloc(void *obj, unsigned long size, unsigned long align)
+{
+    (void)obj;
+    if (align < sizeof(void *)) align = sizeof(void *);
+    if ((align & (align - 1)) != 0) align = 16;      // 非 2 的幂：退回 16
+    void *p = NULL;
+    if (posix_memalign(&p, (size_t)align, size ? (size_t)size : 1) != 0) return NULL;
+    return p;
+}
+void za_fs_vt_free(void *obj, void *ptr, unsigned long size, unsigned long align)
+{
+    (void)obj; (void)size; (void)align;
+    free(ptr);
 }
 
 // ── 基址重定位 ──────────────────────────────────────────────────
@@ -1629,8 +1691,17 @@ int za_guest_relocate(unsigned char *base, za_guest_t *out)
         f[3] = 0xD61F0200u;
         __builtin___clear_cache((char *)a, (char *)a + 16);
         __builtin___clear_cache((char *)f, (char *)f + 16);
-        ZLOGI("fs 分配器桩 → 宿主：alloc=%p free=%p", (void *)za_fs_alloc_host,
-              (void *)za_fs_free_host);
+        // ★ 还有第二条路：vector/resize 的 helper（main+0x24f20）直接
+        //   `ldr x8,[obj]; ldr x8,[x8,#0x10]; blr x8`，**不经过上面两个跳板**。
+        //   分配器对象 main+0x3de4b90 的 vtable（main+0x3af0ac8）槽 2/3 = 0x20/0x98
+        //   ⇒ blr 0x20（实测崩溃 pc=0x20，调用点 main+0x24f38）。
+        //   槽 2 = Allocate(size,align)，槽 3 = Free(ptr,size,align)，都换成宿主实现。
+        unsigned long long *vt = (unsigned long long *)(base + 0x3af0ac8);
+        vt[2] = (unsigned long long)(uintptr_t)&za_fs_vt_alloc;
+        vt[3] = (unsigned long long)(uintptr_t)&za_fs_vt_free;
+        ZLOGI("fs 分配器桩 → 宿主：alloc=%p free=%p；vtable[2/3] ← %p/%p",
+              (void *)za_fs_alloc_host, (void *)za_fs_free_host,
+              (void *)za_fs_vt_alloc, (void *)za_fs_vt_free);
     }
     // 段权限收紧：text=RX / rodata=R / data=RW
     mprotect(base + ZA_TEXT_OFF, ZA_TEXT_SIZE, PROT_READ | PROT_EXEC);

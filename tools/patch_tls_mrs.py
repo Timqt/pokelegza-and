@@ -13,13 +13,24 @@
 ⇒ 换个层次：**只换 `mrs` 这一条指令**，让它给出「我们控制的指针」。
    后续无论 and/ubfm/add/lsr/mov 怎么算，结果都自然正确，覆盖率 100%。
 
-替换序列（借红区存临时寄存器，不破坏 callee-saved）：
-    stur x16, [sp, #-16]        ; 临时保存（xN != 16 时用 16）
-    adrp x16, <桩区>            ; 桩区 = 宿主写进来的函数指针表
-    ldr  x16, [x16, #0]         ; x16 = 宿主回调地址
-    blr  x16                    ; 回调宿主 → 宿主返回本线程的客机 TLS 基址
-    mov  xN, x0                 ; ★ 结果
-    ldur x16, [sp, #-16]
+替换序列（返回**进程级**的客机 TLS 变量区 V = base + 0x5F90000）：
+    stur x16, [sp, #-8]
+    adrp x16, <V 所在页>
+    mov  xN, x16                 ; ★ 结果
+    ldur x16, [sp, #-8]
+
+为什么是「进程级常数」而不是每线程区域：
+  * 4756 个 helper 已经被 patch_tls_helpers.py 改写成 `adrp Xt,<描述符区 P>`，
+    它们算出来的永远是 P + [P+0x98]*8 = V（**同一个块**）。
+    两种机制必须给出同一个地址，否则同一个 __thread 变量经不同站点读到不同内存。
+  * 曾经试过「每线程 area = tp16 + [tp16+0x98]*8」：那个槽在 bionic 的
+    pthread 结构里，宿主代码/其它线程会改它。实测静态构造器跑到一半时它从
+    我们写入的 0xfffffffffb8b9600 变成了 0x1FFFFF80FFFFFFD8，
+    ⇒ x8 算成 0xfffffc756969dec0 ⇒ 崩在 main+0x165272c。
+  * 也试过桩里 blr 宿主 C：C 按 AAPCS 改 x0–x17，而 mrs 只该写目标寄存器。
+    实测 main+0x1a44fc 是 `movz/movk x0,#0x1000 ; mrs x8 ; add x8,x8,x0`，
+    x0 被改成 area ⇒ x8 = area*2 ⇒ 崩在 0xda8ef48000。
+  ⇒ 常数最稳：不读任何共享状态、不调用任何函数，只借 x16 并原样恢复。
 
 ⚠ 为什么不用 thread_base 那套（d2r-android 的 `sub sp + 键页`）：
    那一套是**离线改写 + 宿主可 dlopen 的 .so** 场景，需要键页与 fixups。
@@ -40,6 +51,7 @@ OUT_H = os.path.join(ROOT, "app", "native", "za_tls_mrs.h")
 OUT_BLOB = os.path.join(ROOT, "app", "native", "za_tls_mrs_blob.h")
 
 STUB_OFF = 0x6000000        # 桩区（在映像 0x5f7a000 之后、必须纳入映射范围）
+TLS_VAR_OFF = 0x5F90000     # 客机 TLS 变量区（必须与 patch_tls_helpers.py 一致！）
 
 MRS_TPIDR_EL0 = 0xD53BD040
 
@@ -71,6 +83,23 @@ def enc_blr(rn):
     return 0xD63F0000 | (rn << 5)
 
 
+def enc_mrs_tpidr(rt):
+    return 0xD53BD040 | rt
+
+
+def enc_and_not1fff(rd, rn):
+    # AND (imm) 64-bit，N=1 immr=51 imms=50 ⇒ 掩掉低 13 位（同 patch_tls_helpers 的 AND_MASK_13）
+    return 0x92000000 | (1 << 22) | (51 << 16) | (50 << 10) | (rn << 5) | rd
+
+
+def enc_add_lsl3(rd, rn, rm):
+    # ADD (shifted reg) Xd, Xn, Xm, LSL #3
+    return 0x8B000000 | (rm << 16) | (3 << 10) | (rn << 5) | rd
+
+
+NOP = 0xD503201F
+
+
 def enc_b(frm, to):
     off = to - frm
     assert -(1 << 27) <= off < (1 << 27) and off % 4 == 0, "b 越界"
@@ -98,53 +127,36 @@ def main():
         sites.append((off, n, w))
     print("main 里 mrs Xt, TPIDR_EL0 共 %d 处" % len(sites))
 
-    # 生成替换序列：每条 = 6 条指令，放在桩区里，原位置写 b <桩>
+    # 生成替换序列：每条 = 5 条指令（固定步长），原位置写 b <桩>
+    STRIDE_INSNS = 5
+    V_ADDR = TLS_VAR_OFF            # 客机 TLS 变量区（与 helper 改写同一块）
     blob = bytearray()
     entries = []
     for off, n, orig in sites:
-        tmp = 17 if n == 17 else 16      # 临时寄存器（不用目标寄存器自己）
         stub_pc = STUB_OFF + len(blob)
         seq = []
-        # ★ 必须同时保存 x30：被替换的 mrs 站点可能是**叶子函数**，x30 就是
-        #   调用者的返回地址（没有 prologue 保护）。桩里的 blr 会覆盖 x30，
-        #   之后 `b 回原址` 落到函数末尾的 ret ⇒ ret 跳回桩里 ⇒ 桩↔ret 无限
-        #   乒乓（实测：pc 恒在 main+0x603447c 桩区、100% CPU 无 svc）。
-        #   x16 用红区 [sp-16]，x30 用 [sp-32]（同样是红区，安全）。
-        seq.append(enc_stur(tmp, 31, -16))
-        seq.append(enc_stur(30, 31, -32))
-        # 回调地址放在**整个桩区末尾之后**的一格（运行时装进去），
-        # 用 adrp+ldr 取：adrp 给页基址，ldr 的 imm12 按 8 字节缩放给页内偏移。
-        seq_adrp_pc = stub_pc + 4
-        seq.append(0)                    # 先占位，循环结束后统一回填
-        seq.append(0)                    # ldr
-        seq.append(enc_blr(tmp))
-        seq.append(enc_mov(n, 0))
-        seq.append(enc_ldur(30, 31, -32))
-        seq.append(enc_ldur(tmp, 31, -16))
-        # 回原位置的下一条
-        seq.append(enc_b(stub_pc + len(seq) * 4, off + 4))
-        entries.append((off, orig, stub_pc, seq, seq_adrp_pc))
+        if n == 16:
+            # 目标就是 x16：mrs 本来就会覆盖它，不必保存
+            seq += [NOP, 0, NOP, NOP]
+        else:
+            seq += [enc_stur(16, 31, -8), 0, enc_mov(n, 16), enc_ldur(16, 31, -8)]
+        seq.append(0)                    # b 回原址+4，下面统一回填
+        assert len(seq) == STRIDE_INSNS
+        entries.append([off, orig, stub_pc, seq])
         for w in seq:
             blob.extend(struct.pack("<I", w))
 
-    # 回调地址那格 = 桩区末尾（8 字节对齐）
-    hook_slot = (STUB_OFF + len(blob) + 7) & ~7
-    print("回调地址格：%#x（桩区末尾）" % hook_slot)
-    # 回填每条序列里的 adrp/ldr
-    for off, orig, stub_pc, seq, adrp_pc in entries:
-        adrp = enc_adrp(16, adrp_pc, hook_slot)
-        page = hook_slot & ~0xFFF
-        imm12 = (hook_slot - page) // 8          # LDR 的 imm12 按 8 缩放
-        assert 0 <= imm12 < 0x1000, "ldr imm12 越界"
-        ldr = enc_ldr(16, 16, imm12)
-        base_idx = (stub_pc - STUB_OFF) // 4
-        # 序列：stur x16 / stur x30 / adrp / ldr / blr / mov / ldur x30 / ldur x16 / b
-        #               [0]      [1]     [2]   [3]   [4]   [5]     [6]       [7]    [8]
-        struct.pack_into("<I", blob, (base_idx + 2) * 4, adrp)
-        struct.pack_into("<I", blob, (base_idx + 3) * 4, ldr)
+    # 回填每条序列的 adrp + 末尾 b
+    for off, orig, stub_pc, seq in entries:
+        idx = (stub_pc - STUB_OFF) // 4
+        adrp = enc_adrp(16, stub_pc + 4, V_ADDR)
+        struct.pack_into("<I", blob, (idx + 1) * 4, adrp)
+        b_insn = enc_b(stub_pc + (STRIDE_INSNS - 1) * 4, off + 4)
+        struct.pack_into("<I", blob, (idx + STRIDE_INSNS - 1) * 4, b_insn)
 
-    # 重新写 entries（此时 stub 地址不变）
-    entries = [(off, orig, stub_pc) for off, orig, stub_pc, _, _ in entries]
+    # 桩区末尾留一格（映射/mprotect 的上界；本版桩不再需要宿主回调）
+    hook_slot = (STUB_OFF + len(blob) + 7) & ~7
+    entries = [(off, orig, stub_pc) for off, orig, stub_pc, _ in entries]
 
     print("替换序列 %d 条，桩区 %#x 字节（%#x .. %#x）"
           % (len(entries), len(blob), STUB_OFF, STUB_OFF + len(blob)))
@@ -156,8 +168,7 @@ def main():
         o.write("#include <stdint.h>\n\n")
         o.write("#define ZA_TLS_STUB_OFF  0x%xul\n" % STUB_OFF)
         o.write("#define ZA_TLS_STUB_SIZE %d\n" % len(blob))
-        o.write("#define ZA_TLS_HOOK_SLOT 0x%xul\n" % hook_slot)
-        o.write("#define ZA_TLS_HOOK_SLOT 0x%xul\n" % hook_slot)
+        o.write("#define ZA_TLS_HOOK_SLOT 0x%xul   /* 桩区末尾（映射上界） */\n" % hook_slot)
         o.write("static const unsigned int za_tls_mrs_blob[%d] = {\n" % (len(blob) // 4))
         for i in range(0, len(blob), 4):
             w = struct.unpack_from("<I", blob, i)[0]
@@ -166,7 +177,7 @@ def main():
 
     with open(OUT_H, "w", encoding="utf-8", newline="\n") as o:
         o.write("// 自动生成：tools/patch_tls_mrs.py —— 别手改\n")
-        o.write("// 每条 mrs TPIDR_EL0 → `b <桩>`，桩里回调宿主取线程基址。\n")
+        o.write("// 每条 mrs TPIDR_EL0 → `b <桩>`，桩里内联算客机 TLS 基址。\n")
         o.write("#ifndef ZA_TLS_MRS_H\n#define ZA_TLS_MRS_H\n\n")
         o.write("#define ZA_TLS_MRS_COUNT %d\n\n" % len(entries))
         o.write("typedef struct { unsigned int off; unsigned int orig; unsigned int stub; } za_tls_mrs_t;\n\n")
