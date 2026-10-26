@@ -1911,10 +1911,36 @@ volatile long za_dbg_last_wait_nr;
 volatile long za_dbg_last_wait_ret;
 static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
                                 long a4, long a5, long a6, long a7, long nr);
+// ★ 最近若干次 svc 的「服务号 + 返回值 + 调用点 PC + a0」环形记录。
+//   崩溃时打印出来，就能同时看到「最后几个 svc 返回了什么」。
+#define ZA_RETRING 16
+static volatile long za_ret_nr[ZA_RETRING];
+static volatile long za_ret_val[ZA_RETRING];
+static volatile unsigned long long za_ret_pc[ZA_RETRING];
+static volatile unsigned long long za_ret_a0[ZA_RETRING];
+static volatile int za_ret_head;
+void za_dump_ret_ring(void)
+{
+    int h = za_ret_head;
+    for (int k = 0; k < ZA_RETRING; k++)
+    {
+        int i = (h - 1 - k + ZA_RETRING * 2) % ZA_RETRING;
+        if (za_ret_nr[i] == 0 && za_ret_val[i] == 0 && za_ret_pc[i] == 0) continue;
+        ZLOGI("  ret-ring[%d] svc#%ld ret=%#lx a0=%#llx pc=%#llx", k,
+              za_ret_nr[i], (unsigned long)za_ret_val[i], za_ret_a0[i], za_ret_pc[i]);
+    }
+}
 long za_horizon_svc(long a0, long a1, long a2, long a3,
                     long a4, long a5, long a6, long a7, long nr)
 {
     long r = za_horizon_svc_impl(a0, a1, a2, a3, a4, a5, a6, a7, nr);
+    {
+        int i = __atomic_fetch_add(&za_ret_head, 1, __ATOMIC_RELAXED) % ZA_RETRING;
+        za_ret_nr[i] = nr;
+        za_ret_val[i] = r;
+        za_ret_pc[i] = (unsigned long long)za_horizon_regs[ZA_REG_PC];
+        za_ret_a0[i] = (unsigned long long)a0;
+    }
     if (nr == 24 || nr == 28 || nr == 52 || nr == 53 || nr == 54)
     {
         za_dbg_last_wait_nr = nr;

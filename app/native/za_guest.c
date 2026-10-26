@@ -998,6 +998,11 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
             }
         }
+        // ★ 最近 16 次 svc 的返回值环形记录
+        {
+            extern void za_dump_ret_ring(void);
+            za_dump_ret_ring();
+        }
         // ★ 最近一次等待类 svc 的返回值
         {
             extern volatile long za_dbg_last_wait_nr, za_dbg_last_wait_ret;
