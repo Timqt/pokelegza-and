@@ -719,8 +719,11 @@ void za_install_altstack(void)
 // dump 自己就会二次 fault —— 以前实测：SIGBUS 现场 fp/ x29 是 ASCII 文本，
 // 打 FRAME0 时再次 SIGSEGV，日志戛然而止，后面的 svc 轨迹全丢。
 // ⇒ 用 siglongjmp 兜住：嵌套 fault 时放弃剩余 dump，继续走原信号收尾。
-static sigjmp_buf za_fatal_jmp;
-static volatile sig_atomic_t za_fatal_dumping;
+// ★ 必须**每线程**一份：SDK 有多个 worker 线程，会同时崩；共用一份时
+//   A 线程 sigsetjmp、B 线程 siglongjmp ⇒ libc 报 "setjmp cookie mismatch"
+//   并在 longjmp 里 abort（实测调用链正好落在 libc 的 setjmp/longjmp 实现）。
+static __thread sigjmp_buf za_fatal_jmp;
+static __thread volatile sig_atomic_t za_fatal_dumping;
 
 // 「像不像一个用户态地址」：dump 前的廉价检查（8 对齐 + 47 位内）
 static int za_va_plausible(unsigned long v)
