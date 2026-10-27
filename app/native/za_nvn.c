@@ -87,8 +87,18 @@ static inline u32 ld32(const void *p, u32 off)
 }
 static inline void st32(void *p, u32 off, u32 v) { memcpy((char *)p + off, &v, 4); }
 static inline int is_obj(const void *p) { return p && ld32(p, F_MAGIC) == M_MAGIC; }
+// 初始化 NVN 对象：**最多清 0x100 字节**。
+// ★ 2026-10-27：以前按参考头文件的尺寸 memset（device 0x3000 / queue 0x2000 …）。
+//   但这套 SDK 里的实际对象**比参考头文件小**（已证实：sampler builder 是 0x40
+//   而不是 0x60，按 0x60 清会把栈上保存的 x29/x30 抹掉 ⇒ ret 跳飞）。
+//   客机的 C++ 对象走 libc++（宿主 Scudo 堆）⇒ 清多了就会覆盖相邻堆块的
+//   chunk header，表现为：
+//     'Scudo ERROR: corrupted chunk header ... (Header Value: 0xb400006d…)'
+//   NVN 对象对客机是不透明的，它的字段我们自己只用前 0x80 字节，
+//   所以只清我们真正会用到的那一段就够了。
 static void init_obj(void *p, u64 size)
 {
+    if (size > 0x100) size = 0x100;
     memset(p, 0, size);
     st32(p, F_MAGIC, M_MAGIC);
 }
