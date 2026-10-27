@@ -1138,6 +1138,9 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     case 8: // CreateThread(out_handle=x0, entry=x1, arg=x2, stack_bottom=x3, prio=w4, core=w5)
     {
         int id = za_handle_alloc(ZA_H_THREAD);
+        ZLOGI("svc#8 CreateThread: out=%#lx entry=%#lx arg=%#lx stack=%#lx prio=%ld core=%ld -> handle=%d",
+              (unsigned long)a0, (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
+              (long)a4, (long)a5, id);
         if (id <= 0) return 1;
         za_handle_t *h = za_handle_get(id);
         h->entry = (void (*)(void *))(uintptr_t)a1;
