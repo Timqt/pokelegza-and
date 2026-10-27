@@ -1382,7 +1382,24 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 if (__atomic_compare_exchange_n(lock, &expect, me, 0,
                                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
                     return 0;                       // 拿到（顺带清掉 0x40000000）
-                if ((expect & 0xbfffffffu) == me) return 0;   // 已经是自己
+                {
+                    unsigned int owner = expect & 0xbfffffffu;
+                    if (owner == me) return 0;      // 已经是自己
+                    // ★ 陈旧/损坏的锁字恢复：owner 必须是一个**线程句柄**
+                    //   （SDK 写的是 [self+0x1b0]，本工程里是 1..7 这种小值）。
+                    //   实测栈上的局部 mutex 曾出现 0x40696d45（bit30|0x696d45），
+                    //   既不是句柄也不可能再被释放 ⇒ 永远等不到唤醒。
+                    //   这里强制夺取并记录，避免整条线死等（watchdog 会开枪）。
+                    if (owner >= 0x100000u)
+                    {
+                        static int nforce;
+                        if (nforce++ < 8)
+                            ZLOGE("svc#26 陈旧锁字 %#x（owner 不像线程句柄）⇒ 强制取得",
+                                  expect);
+                        __atomic_store_n(lock, me, __ATOMIC_RELEASE);
+                        return 0;
+                    }
+                }
                 // 等持有者释放：锁字变化就重试。
                 // ⚠ 必须**有界**：SDK 的 Leave 在「锁字没有 0x40000000 位」时
                 //   走快速路径（直接 CAS 成 0），**不会** svc#27 ⇒ 不会 futex_wake。
@@ -1415,7 +1432,19 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         if (!__atomic_compare_exchange_n(p, &expect, kval, 0,
                                          __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
             return 0;                       // 值已变（别人先动手）⇒ 不需要等
-        if (ns == 0) return 0xEA01u;        // 不等待
+        // ★★ CV 字必须 **加 1 登记等待者**：
+        //   SDK 的 SignalConditionVariable（sdk+0x1458c0）是
+        //       ldr w8,[cv] ; cbz w8, ret ; svc#29(cv, ±1)
+        //   即「*cv == 0 就什么都不发」。我们以前从不让 *cv 变非 0
+        //   ⇒ 信号方永远跳过 ⇒ 所有等待者无限睡眠（实测一轮里 0 次 svc#29）。
+        unsigned int wval = __atomic_add_fetch(key, 1u, __ATOMIC_ACQ_REL);
+        if (ns == 0)
+        {
+            // 不等待：把锁字恢复成 tag，并把刚才登记的等待者计数撤掉
+            __atomic_store_n(p, tag, __ATOMIC_RELEASE);
+            __atomic_fetch_sub(key, 1u, __ATOMIC_RELEASE);
+            return 0xEA01u;
+        }
         struct timespec ts, *tsp = NULL;
         if (ns > 0)
         {
@@ -1423,23 +1452,64 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             ts.tv_nsec = (long)(ns % 1000000000LL);
             tsp = &ts;
         }
+        else
+        {
+            // ★ 无限等待也退化成 20ms 轮询：
+            //   SDK 的信号方是「先读 *cv，为 0 就直接返回不发 svc#29」，
+            //   等待方随后才把计数加 1 —— 存在固有竞态（signal 先于 wait 登记）。
+            //   内核靠等待队列避免，我们用户态近似做不到，只能靠有界等待兜底。
+            //   CV 允许伪唤醒，调用方会重新检查条件，所以轮询是安全的。
+            ts.tv_sec = 0;
+            ts.tv_nsec = 20 * 1000 * 1000;
+            tsp = &ts;
+        }
+        {
+            static int nw;
+            if (nw++ < 24)
+                ZLOGI("svc#28 WaitKey cs=%p cv=%p tag=%u keyval=%u timeout=%lld",
+                      (void *)p, (void *)key, tag, kval, ns);
+        }
         int rc;
         do {
             rc = (int)syscall(SYS_futex, (int *)key, FUTEX_WAIT_PRIVATE,
-                              (int)kval, tsp, NULL, 0);
+                              (int)wval, tsp, NULL, 0);
         } while (rc == -1 && errno == EINTR);
         int timedout = (rc == -1 && errno == ETIMEDOUT);
+        // ★ 轮询超时**不能**返回 0xEA01：SDK 的 Wait（sdk+0x145934）是
+        //   `cbnz w0 → Abort`，任何非 0 都会直接终止进程。这里把有界等待的
+        //   超时当成「伪唤醒」处理（CV 允许），返回 0 让调用方重判条件。
+        {
+            static int nr2;
+            if (nr2++ < 24)
+                ZLOGI("svc#28 WaitKey 返回 rc=%d errno=%d timedout=%d keyval=%u",
+                      rc, rc ? errno : 0, timedout,
+                      __atomic_load_n(key, __ATOMIC_RELAXED));
+        }
         __atomic_store_n(p, tag, __ATOMIC_RELEASE);   // 唤醒后恢复 tag
-        return timedout ? 0xEA01u : 0;
+        (void)timedout;
+        return 0;
     }
     case 29: // SignalProcessWideKey(key=x0, count=w1)
     {
+        // ★★ Horizon 语义：**先把 key 字加 count，再唤醒**。
+        //   我们以前只 FUTEX_WAKE、不改 key：等待者在 signal 之后才进入
+        //   futex_wait 时读到的是旧值 ⇒ 永远等不到下一次唤醒（丢唤醒）。
+        //   实测卡死在 svc#28（cv=0xb400006f3b1150fc），10 秒后看门狗开枪。
         unsigned int *key = (unsigned int *)(uintptr_t)a0;
+        int n = (int)a1;
         if (key)
         {
-            int n = (int)a1;
+            unsigned int before = __atomic_load_n(key, __ATOMIC_RELAXED);
+            if (n > 0)
+                __atomic_fetch_add(key, (unsigned int)n, __ATOMIC_RELEASE);
             syscall(SYS_futex, (int *)key, FUTEX_WAKE_PRIVATE,
                     n > 0 ? n : 0x7fffffff, NULL, NULL, 0);
+            {
+                static int nsig;
+                if (nsig++ < 24)
+                    ZLOGI("svc#29 SignalKey key=%p n=%d: %u -> %u", (void *)key, n,
+                          before, __atomic_load_n(key, __ATOMIC_RELAXED));
+            }
         }
         return 0;
     }
@@ -1710,10 +1780,19 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         else
         {
             // 未知会话：维持旧行为（清挂起位 + result 0）。
-            // ⚠ 实验过「这里也写完整 SFCO 应答」，结果连 M4 都到不了 ——
-            //   说明这条分支里混着 **TIPC** 会话（sm: 系），它们的应答布局不能带 SFCO。
+            // ⚠ 试过「未知会话也按 CMIF 写 SFCO（带 SFCI 判据）」——连 M5 都到不了，
+            //   说明早期仍有 TIPC/控制会话会被误判。先只记录，不改行为。
             if (ro)
             {
+                static int nunk;
+                if (nunk++ < 16)
+                {
+                    unsigned int w[8];
+                    for (int i = 0; i < 8; i++)
+                        memcpy(&w[i], (void *)(uintptr_t)(ro + (unsigned long long)(i * 4)), 4);
+                    ZLOGI("  未知会话 session=%#x cmd=%#x hdr0=%#x hdr1=%#x 前 8 字=%08x %08x %08x %08x %08x %08x %08x %08x",
+                          sess, cmd, hdr0, hdr1, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                }
                 memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
                 memcpy((void *)(uintptr_t)(ro + 0xc), &zero, 4);
             }

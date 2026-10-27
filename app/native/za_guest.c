@@ -1826,6 +1826,41 @@ static int za_embed_lookup(const char *path)
     }
     return -1;
 }
+// 未知文件的句柄 → 路径（诊断用；后续接真实文件后端也用这张表）
+#define ZA_FS_MAXH 32
+static char za_fs_paths[ZA_FS_MAXH][192];
+static int za_fs_hidx(unsigned int h) { return (h & 0x40000000u) ? (int)(h & 0x3FFFFFFFu) : -1; }
+static const char *za_fs_path_of(unsigned int h)
+{
+    int i = za_fs_hidx(h);
+    if (i < 0 || i >= ZA_FS_MAXH || !za_fs_paths[i][0]) return "?";
+    return za_fs_paths[i];
+}
+
+// ── 真实文件后端 ───────────────────────────────────────────────
+// 客机路径形如 "data:/arc/data.trpfs"、"data:/system/config/..."。
+// 映射到平板上的应用私有目录（adb push 到这里，App 无需任何权限）：
+//   /sdcard/Android/data/<pkg>/files/romfs/<去掉 scheme 的路径>
+#define ZA_FS_ROOT "/sdcard/Android/data/org.pokelegza.android.port/files/romfs/"
+#define ZA_FS_HANDLE_BIT 0x20000000u
+
+static const char *za_fs_rel(const char *path)
+{
+    if (!path) return NULL;
+    const char *p = path;
+    for (int i = 0; i < 16 && p[i]; i++)
+    {
+        if (p[i] == ':') { p += i + 1; break; }
+        if (p[i] == '/') break;          // 没有 scheme
+    }
+    while (*p == '/') p++;
+    return p;
+}
+static int za_fs_handle_fd(unsigned int h)
+{
+    return (h & ZA_FS_HANDLE_BIT) ? (int)(h & 0x0FFFFFFFu) : -1;
+}
+
 static const unsigned char *za_embed_by_handle(unsigned int h, unsigned long *size)
 {
     if (size) *size = 0;
@@ -1839,7 +1874,21 @@ static unsigned int za_fs_getfilesize(long long *out, unsigned int h)
 {
     unsigned long sz = 0;
     za_embed_by_handle(h, &sz);
+    {
+        int fd = za_fs_handle_fd(h);
+        if (fd >= 0)
+        {
+            off_t end = lseek(fd, 0, SEEK_END);
+            sz = (end > 0) ? (unsigned long)end : 0;
+        }
+    }
     if (out) *out = (long long)sz;
+    {
+        static int n;
+        if (n++ < 24)
+            ZLOGE("★ fs::GetFileSize(h=%#x \"%s\") => %lld", h, za_fs_path_of(h),
+                  (long long)sz);
+    }
     return 0;
 }
 static unsigned int za_fs_readfile_cnt(unsigned long *out_read, unsigned int h,
@@ -1848,10 +1897,34 @@ static unsigned int za_fs_readfile_cnt(unsigned long *out_read, unsigned int h,
     unsigned long total = 0;
     const unsigned char *d = za_embed_by_handle(h, &total);
     if (out_read) *out_read = 0;
+    {
+        int fd = za_fs_handle_fd(h);
+        if (fd >= 0)
+        {
+            if (off < 0) off = 0;
+            if (!buf || !size) return 0;
+            ssize_t n = pread(fd, buf, (size_t)size, (off_t)off);
+            if (n < 0) n = 0;
+            if (out_read) *out_read = (unsigned long)n;
+            {
+                static int lg2;
+                if (lg2++ < 32)
+                    ZLOGE("★ fs::ReadFile(fd=%d \"%s\" off=%lld size=%lu) => %zd",
+                          fd, za_fs_path_of(h), off, size, n);
+            }
+            return 0;
+        }
+    }
     if (!d)
     {
         if (buf && size && size <= (4u << 20)) memset(buf, 0, (size_t)size);
         return 0;
+    }
+    {
+        static int lg;
+        if (lg++ < 32)
+            ZLOGE("★ fs::ReadFile(h=%#x \"%s\" off=%lld size=%lu) => 0（空文件）",
+                  h, za_fs_path_of(h), off, size);
     }
     if (off < 0) off = 0;
     if (!buf || (unsigned long long)off >= total) return 0;
@@ -1865,12 +1938,49 @@ static unsigned int za_fs_readfile(unsigned int h, long long off, void *buf, uns
 {
     return za_fs_readfile_cnt(NULL, h, off, buf, size);
 }
-static unsigned int za_fs_closefile(unsigned int h) { (void)h; return 0; }
+static unsigned int za_fs_closefile(unsigned int h)
+{
+    int fd = za_fs_handle_fd(h);
+    if (fd >= 0) close(fd);
+    return 0;
+}
 static unsigned int za_fs_flushfile(unsigned int h) { (void)h; return 0; }
 static unsigned int za_fs_setfilesize(unsigned int h, long long sz) { (void)h; (void)sz; return 0; }
 static unsigned int za_fs_createfile(const char *p, int mode) { (void)p; (void)mode; return 0; }
 static unsigned int za_fs_deletefile(const char *p) { (void)p; return 0; }
 static unsigned int za_fs_createdir(const char *p) { (void)p; return 0; }
+// ── mount / 目录：同样走“空 fs” ────────────────────────────────
+// 这些调用以前要经过 CMIF 应答（我们知道那条路会返回 0x1a80a 一类错误），
+// 静态构造函数在 mount 失败后也会 Abort。直接接管成成功/空目录。
+// ⚠ 临时：真 fs 后端接入后撤掉。
+static unsigned int za_fs_mount(const char *mount) { (void)mount; return 0; }
+static unsigned int za_fs_mount2(const char *mount, int idx, void *cache, unsigned long sz)
+{ (void)mount; (void)idx; (void)cache; (void)sz; return 0; }
+static unsigned int za_fs_mount_rom(const char *mount, void *cache, unsigned long sz)
+{ (void)mount; (void)cache; (void)sz; return 0; }
+static unsigned int za_fs_unmount(const char *mount) { (void)mount; return 0; }
+static unsigned int za_fs_commit(const char *mount) { (void)mount; return 0; }
+static unsigned int za_fs_opendir(unsigned int *out, const char *path, int mode)
+{
+    (void)path; (void)mode;
+    if (out) *out = 1;          // 假目录句柄
+    return 0;
+}
+static unsigned int za_fs_readdir(long long *out_count, void *entries,
+                                  unsigned int h, long long max)
+{
+    (void)entries; (void)h; (void)max;
+    if (out_count) *out_count = 0;   // 空目录
+    return 0;
+}
+static unsigned int za_fs_closedir(unsigned int h) { (void)h; return 0; }
+static unsigned int za_fs_dircount(long long *out, unsigned int h)
+{
+    (void)h;
+    if (out) *out = 0;
+    return 0;
+}
+
 // DirectoryEntryType: 0=Directory, 1=File（这里一律当文件）
 static unsigned int za_fs_getentrytype(unsigned int *out, const char *p)
 {
@@ -1907,9 +2017,39 @@ static unsigned int za_fs_openfile(void *out, const char *path, int mode)
         if (out) *(unsigned int *)out = h;
         return 0;
     }
-    ZLOGE("★ fs::OpenFile out=%p path=\"%s\" mode=%d ⇒ 未知文件，返回空文件（假句柄 1）",
-          out, tmp, mode);
-    if (out) *(unsigned int *)out = 1;
+    {
+        const char *rel = za_fs_rel(path);
+        if (rel && *rel && za_guest_strnlen(rel, 200) < 200)
+        {
+            char hp[256];
+            int hn = snprintf(hp, sizeof hp, "%s%s", ZA_FS_ROOT, rel);
+            if (hn > 0 && hn < (int)sizeof hp)
+            {
+                static int nreal;
+                int fd = open(hp, O_RDONLY | O_CLOEXEC);
+                if (fd >= 0)
+                {
+                    if (nreal++ < 16)
+                        ZLOGE("★ fs::OpenFile path=\"%s\" ⇒ 真实文件 %s（fd=%d）",
+                              tmp, hp, fd);
+                    if (out) *(unsigned int *)out = ZA_FS_HANDLE_BIT | (unsigned)fd;
+                    return 0;
+                }
+                if (nreal++ < 16)
+                    ZLOGE("★ fs::OpenFile path=\"%s\" ⇒ 宿主文件不存在：%s", tmp, hp);
+            }
+        }
+    }
+    {
+        static unsigned gi;
+        unsigned i = gi++ % ZA_FS_MAXH;
+        unsigned n = 0;
+        while (tmp[n] && n < sizeof za_fs_paths[i] - 1) { za_fs_paths[i][n] = tmp[n]; n++; }
+        za_fs_paths[i][n] = 0;
+        ZLOGE("★ fs::OpenFile out=%p path=\"%s\" mode=%d ⇒ 未知文件（句柄 %#x）",
+              out, tmp, mode, 0x40000000u | i);
+        if (out) *(unsigned int *)out = 0x40000000u | i;
+    }
     return 0;
 }
 
@@ -1939,6 +2079,18 @@ static const za_host_sym_t za_host_syms[] = {
     { "_ZN2nn2fs10DeleteFileEPKc", (void *)za_fs_deletefile },
     { "_ZN2nn2fs15CreateDirectoryEPKc", (void *)za_fs_createdir },
     { "_ZN2nn2fs12GetEntryTypeEPNS0_18DirectoryEntryTypeEPKc", (void *)za_fs_getentrytype },
+    { "_ZN2nn2fs13MountSaveDataEPKcRKNS_7account3UidE", (void *)za_fs_mount },
+    { "_ZN2nn2fs21MountSaveDataReadOnlyEPKcNS_13ApplicationIdERKNS_7account3UidE", (void *)za_fs_mount2 },
+    { "_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", (void *)za_fs_mount },
+    { "_ZN2nn2fs8MountRomEPKc", (void *)za_fs_mount },
+    { "_ZN2nn2fs8MountRomEPKcPvm", (void *)za_fs_mount_rom },
+    { "_ZN2nn2fs17MountAddOnContentEPKciPvm", (void *)za_fs_mount2 },
+    { "_ZN2nn2fs7UnmountEPKc", (void *)za_fs_unmount },
+    { "_ZN2nn2fs6CommitEPKc", (void *)za_fs_commit },
+    { "_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", (void *)za_fs_opendir },
+    { "_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandleEl", (void *)za_fs_readdir },
+    { "_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", (void *)za_fs_closedir },
+    { "_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", (void *)za_fs_dircount },
     { "_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", (void *)za_hid_noop },
     { "_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", (void *)za_hid_noop },
 
