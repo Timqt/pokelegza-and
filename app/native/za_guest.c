@@ -3398,6 +3398,11 @@ static void *za_sampler_watchdog(void *arg)
                 {
                     ZLOGE("★ 停摆快照（%lu svc/s 级别的静默）", cnt);
                     za_sync_dump();
+                    // 主线程最近 24 次 svc：它才是「游戏卡在哪」的直接答案。
+                    {
+                        extern void za_dump_ret_ring_for(long tid);
+                        if (za_guest_tid > 0) za_dump_ret_ring_for(za_guest_tid);
+                    }
                     za_nvn_dump_recent();   // 带客机 LR：最后几步 NVN 调用发生在哪
                 }
                 unsigned pk = za_sync_poke_all();
