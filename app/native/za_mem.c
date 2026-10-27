@@ -666,3 +666,111 @@ unsigned long long za_mem_query_memory(unsigned long long addr, unsigned long lo
     // 页信息：客机的包装函数会把这个值写进 *PageInfo。
     return 0;
 }
+
+// ── 客机可见的宿主数据区 ───────────────────────────────────────────────
+// ★ 2026-10-28 真机教训：客机会往「我们给它的内存」里写，而且是**越界写**。
+//   以前这些内存来自宿主 malloc（Scudo）——参数区、SDK 的 os 上下文对象、
+//   fs 读缓冲、每线程 TLS 块全都如此。客机写坏邻居的 Scudo chunk header 后，
+//   表现为：
+//     Scudo ERROR: corrupted chunk header at address 0x2… (Header Value: 0xb400006d…)
+//   以及 ART 的 arena 虚表被清零（Jit thread pool 崩在 MemMapArenaPool::TrimMaps）。
+//   所以客机可写的东西一律从这块**独立 mmap 区**里出，一个字节都不碰宿主堆。
+#define ZA_SHARE_BASE 0x4000000000ull       // 256GB：arm64 用户空间常见 39 位(512GB)，1TB 会 EPERM
+#define ZA_SHARE_CAP  0x40000000ull         // 1GB 虚拟（按需提交）
+
+typedef struct za_share_hdr {
+    struct za_share_hdr *next;              // 空闲链（仅空闲块用）
+    size_t size;                            // 本块总大小（含头）
+} za_share_hdr;
+
+static unsigned char *g_share;
+static size_t g_share_used;
+static za_share_hdr *g_share_free[40];      // 按 2 的幂分档
+static int g_share_warned;
+
+static int za_share_init(void)
+{
+    if (g_share) return 1;
+    void *m = mmap((void *)(uintptr_t)ZA_SHARE_BASE, (size_t)ZA_SHARE_CAP,
+                   PROT_READ | PROT_WRITE,
+                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
+    if (m == MAP_FAILED)
+        m = mmap(NULL, (size_t)ZA_SHARE_CAP, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) return 0;
+    g_share = (unsigned char *)m;
+    g_share_used = 0;
+    if ((uintptr_t)m != (uintptr_t)ZA_SHARE_BASE && !g_share_warned++) {
+        g_share_warned = 1;
+        ZLOGE("客机共享区没能落在 %#llx，改在 %p（功能不受影响）",
+              (unsigned long long)ZA_SHARE_BASE, m);
+    }
+    ZLOGI("客机共享区：%p + %#llx（客机可写的宿主数据都在这里）", m,
+          (unsigned long long)ZA_SHARE_CAP);
+    return 1;
+}
+
+static int za_share_class(size_t sz)
+{
+    int c = 0;
+    while (c < 39 && ((size_t)1 << c) < sz) c++;
+    return c;
+}
+
+// 客机可见的零初始化内存；align 必须是 2 的幂。返回 NULL 表示区域耗尽。
+void *za_mem_guest_alloc(size_t size, size_t align)
+{
+    if (!za_share_init()) return NULL;
+    if (align < 16) align = 16;
+    size_t need = (size ? size : 1) + sizeof(za_share_hdr);
+    need = (need + 15) & ~(size_t)15;
+    int c = za_share_class(need);
+    if (c > 39) return NULL;
+    pthread_mutex_lock(&g_lock);
+    za_share_hdr *h = g_share_free[c];
+    if (h) {
+        g_share_free[c] = h->next;
+    } else {
+        if (g_share_used + need > ZA_SHARE_CAP) {
+            pthread_mutex_unlock(&g_lock);
+            ZLOGE("客机共享区耗尽（已用 %#zx / %#llx）", g_share_used,
+                  (unsigned long long)ZA_SHARE_CAP);
+            return NULL;
+        }
+        h = (za_share_hdr *)(g_share + g_share_used);
+        h->size = need;
+        g_share_used += need;
+    }
+    pthread_mutex_unlock(&g_lock);
+    void *p = (void *)(h + 1);
+    // 复用的块必须清零（calloc 语义：客机假定拿到的是干净的）
+    memset(p, 0, h->size - sizeof *h);
+    if (align > 16) {
+        uintptr_t a = ((uintptr_t)p + align - 1) & ~(uintptr_t)(align - 1);
+        if (a != (uintptr_t)p) {
+            size_t pad = (size_t)(a - (uintptr_t)p);
+            if (h->size - sizeof *h < pad + size) return NULL;   // 放不下就放弃对齐
+            p = (void *)a;
+        }
+    }
+    return p;
+}
+
+int za_mem_guest_owns(const void *p)
+{
+    if (!g_share || !p) return 0;
+    uintptr_t v = (uintptr_t)p, b = (uintptr_t)g_share;
+    return v >= b && v < b + g_share_used;
+}
+
+void za_mem_guest_free(void *p)
+{
+    if (!za_mem_guest_owns(p)) return;
+    za_share_hdr *h = (za_share_hdr *)p - 1;
+    int c = za_share_class(h->size);
+    if (c > 39) return;
+    pthread_mutex_lock(&g_lock);
+    h->next = g_share_free[c];
+    g_share_free[c] = h;
+    pthread_mutex_unlock(&g_lock);
+}

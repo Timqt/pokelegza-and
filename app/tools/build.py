@@ -102,7 +102,8 @@ def build_native():
          ROOT / "native" / "za_mod.c", ROOT / "native" / "za_sdk.c",
          ROOT / "native" / "za_horizon.c",
          ROOT / "native" / "za_os.c", ROOT / "native" / "za_stubs.c",
-         ROOT / "native" / "za_mem.c", ROOT / "native" / "za_nvn.c",
+         ROOT / "native" / "za_mem.c", ROOT / "native" / "za_nvn.c", ROOT / "native" / "za_sync.c",
+         ROOT / "native" / "za_vi.c",
          "-llog", "-ldl", "-landroid"])
     print("  原生库已编译 -> %s (%.1f KB)" % (so, so.stat().st_size / 1024))
 

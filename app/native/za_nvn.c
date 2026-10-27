@@ -25,8 +25,12 @@
 #include <unistd.h>
 
 #include "za_common.h"
+#include "za_guest_info.h"
 #include "za_nvn.h"
 #include "za_nvn_names.h"
+
+extern unsigned char *za_guest_base;
+extern volatile unsigned long za_sdk_base, za_sdk_size;
 
 typedef uint64_t u64;
 typedef uint32_t u32;
@@ -70,7 +74,43 @@ enum {
     F_EXTRA = 0x78,
 };
 
-#define M_MAGIC 0x4e564e31u /* "NVN1" */
+#define M_MAGIC 0x4e564e31u /* "NVN1"（已不再写进客机内存，仅作历史标记保留） */
+
+// ★ 2026-10-28：对象有效性**不能**靠往客机对象的偏移 0 写魔数。
+//   真机崩溃证据：客机的哈希表把某个内存池对象（我们 init_obj 过）的第一个字
+//   当成链指针走，于是拿 0x4e564e31 当地址解引用 ⇒ SIGSEGV addr=0x4e564e39
+//   （= M_MAGIC+8，正好是 `ldr x8,[x20,#8]`）。
+//   客机对象对我们"不透明"这个假设是错的：至少内存池对象的前 8 字节客机自己
+//   在用。所以有效性改由**宿主侧登记表**判断，我们一个字都不写进对象。
+#define ZA_NVN_REG 4096
+static uintptr_t za_nvn_reg[ZA_NVN_REG];   // 0 = 空槽
+static void za_nvn_reg_add(const void *p)
+{
+    uintptr_t v = (uintptr_t)p;
+    if (!v) return;
+    unsigned h = (unsigned)((v >> 4) * 2654435761u) & (ZA_NVN_REG - 1);
+    for (unsigned i = 0; i < ZA_NVN_REG; i++) {
+        unsigned k = (h + i) & (ZA_NVN_REG - 1);
+        uintptr_t cur = __atomic_load_n(&za_nvn_reg[k], __ATOMIC_ACQUIRE);
+        if (cur == v) return;
+        if (!cur && __atomic_compare_exchange_n(&za_nvn_reg[k], &cur, v, 0,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            return;
+    }
+}
+static int za_nvn_reg_has(const void *p)
+{
+    uintptr_t v = (uintptr_t)p;
+    if (!v) return 0;
+    unsigned h = (unsigned)((v >> 4) * 2654435761u) & (ZA_NVN_REG - 1);
+    for (unsigned i = 0; i < ZA_NVN_REG; i++) {
+        uintptr_t cur = __atomic_load_n(&za_nvn_reg[(h + i) & (ZA_NVN_REG - 1)],
+                                        __ATOMIC_ACQUIRE);
+        if (!cur) return 0;
+        if (cur == v) return 1;
+    }
+    return 0;
+}
 
 static inline u64 ld64(const void *p, u32 off)
 {
@@ -86,7 +126,7 @@ static inline u32 ld32(const void *p, u32 off)
     return v;
 }
 static inline void st32(void *p, u32 off, u32 v) { memcpy((char *)p + off, &v, 4); }
-static inline int is_obj(const void *p) { return p && ld32(p, F_MAGIC) == M_MAGIC; }
+static inline int is_obj(const void *p) { return za_nvn_reg_has(p); }
 // 初始化 NVN 对象：**最多清 0x100 字节**。
 // ★ 2026-10-27：以前按参考头文件的尺寸 memset（device 0x3000 / queue 0x2000 …）。
 //   但这套 SDK 里的实际对象**比参考头文件小**（已证实：sampler builder 是 0x40
@@ -100,7 +140,7 @@ static void init_obj(void *p, u64 size)
 {
     if (size > 0x100) size = 0x100;
     memset(p, 0, size);
-    st32(p, F_MAGIC, M_MAGIC);
+    za_nvn_reg_add(p);
 }
 
 // 贴图行跨度：客机 SetStride(0) 表示「自动」，真 NVN 会按格式算出来。
@@ -187,17 +227,18 @@ void *za_nvn_lookup(const char *name)
 // ⚠ 带 guest_lr：客机调我们时 x30 就是「它下一步要执行的地方」。崩溃发生在
 //   某个 NVN 调用**返回之后**时，仅凭调用名看不出客机在做什么；有了 LR 就能
 //   直接反汇编那条 `blr` 后面的几条指令。
-static u64 za_nvn_call(int id, unsigned long guest_lr, u64 a0, u64 a1, u64 a2, u64 a3,
-                       u64 a4, u64 a5, u64 a6, u64 a7);
+static u64 za_nvn_call(int id, unsigned long guest_lr, u64 guest_fp, u64 a0, u64 a1, u64 a2,
+                       u64 a3, u64 a4, u64 a5, u64 a6, u64 a7);
 
 // 每个入口一个函数：地址稳定、名字可查（客机只会拿指针调用）。
 #define ZA_NVN_FN_DEF(n)                                                                 \
     static u64 za_nvn_fn_##n(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6,      \
                              u64 a7)                                                       \
     {                                                                                      \
-        unsigned long lr;                                                                   \
+        unsigned long lr, fp;                                                               \
         __asm__ __volatile__("mov %0, x30" : "=r"(lr));                                     \
-        return za_nvn_call(ZA_NVN_ID_##n, lr, a0, a1, a2, a3, a4, a5, a6, a7);             \
+        __asm__ __volatile__("mov %0, x29" : "=r"(fp));                                     \
+        return za_nvn_call(ZA_NVN_ID_##n, lr, fp, a0, a1, a2, a3, a4, a5, a6, a7);          \
     }
 ZA_NVN_ENUM(ZA_NVN_FN_DEF)
 #undef ZA_NVN_FN_DEF
@@ -285,10 +326,41 @@ static void za_nvn_tick_start(void)
 static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6,
                            u64 a7);
 
-static u64 za_nvn_call(int id, unsigned long guest_lr, u64 a0, u64 a1, u64 a2, u64 a3,
-                       u64 a4, u64 a5, u64 a6, u64 a7)
+// 沿着客机的 x29 链倒出调用栈。用途：某个 NVN 入口被反复调用时（例如贴图
+// 占位资源被无限重建），直接看是哪段客机代码在循环，而不是靠参数猜。
+// 只跟随「严格向高地址、且跨度合理」的帧，避免把野指针当帧指针解引用。
+static void za_nvn_dump_guest_stack(u64 fp0, const char *why)
+{
+    unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+    unsigned long long sb = (unsigned long long)za_sdk_base;
+    unsigned long long ss = (unsigned long long)za_sdk_size;
+    unsigned long long fp = fp0;
+    ZLOGI("★ NVN 循环诊断（%s）：客机调用栈", why);
+    for (int i = 0; i < 40; i++) {
+        if (!fp || (fp & 7u)) break;
+        unsigned long long nf = *(volatile unsigned long long *)(uintptr_t)fp;
+        unsigned long long lr = *(volatile unsigned long long *)(uintptr_t)(fp + 8);
+        if (lr >= mb && lr < mb + ZA_IMAGE_SIZE)
+            ZLOGI("    [%d] fp=%#llx lr=main+%#llx", i, fp, lr - mb);
+        else if (lr >= sb && lr < sb + ss)
+            ZLOGI("    [%d] fp=%#llx lr=sdk+%#llx", i, fp, lr - sb);
+        else
+            ZLOGI("    [%d] fp=%#llx lr=%#llx", i, fp, lr);
+        if (nf <= fp || nf - fp > 0x100000ull) break;
+        fp = nf;
+    }
+}
+
+static u64 za_nvn_call(int id, unsigned long guest_lr, u64 guest_fp, u64 a0, u64 a1, u64 a2,
+                       u64 a3, u64 a4, u64 a5, u64 a6, u64 a7)
 {
     u64 r = za_nvn_dispatch(id, a0, a1, a2, a3, a4, a5, a6, a7);
+    // 只对「被海量重复调用」的入口做栈诊断：第 400 次一次，之后每 4000 次一次，
+    // 避免刷爆日志。
+    if ((id == ZA_NVN_ID_nvnTextureInitialize || id == ZA_NVN_ID_nvnTexturePoolRegisterTexture ||
+         id == ZA_NVN_ID_nvnBufferInitialize) &&
+        (za_nvn_calls[id] == 400 || (za_nvn_calls[id] >= 4000 && (za_nvn_calls[id] % 4000) == 0)))
+        za_nvn_dump_guest_stack(guest_fp, za_nvn_name[id]);
     za_nvn_hist_t *h = &za_nvn_hist[za_nvn_hist_n % ZA_NVN_HIST];
     h->id = (unsigned)id;
     h->lr = guest_lr;
@@ -523,7 +595,7 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     //             0x20 numTextures / 0x24 presentInterval / 0x28 numActive
     case ZA_NVN_ID_nvnWindowBuilderSetDefaults:
         memset(o, 0, 0x40);
-        st32(o, F_MAGIC, M_MAGIC);
+        za_nvn_reg_add(o);
         st32(o, 0x24, 1);   // presentInterval
         st32(o, 0x28, 1);   // numActiveTextures
         return 0;
@@ -799,7 +871,7 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     //    Initialize 只认这两个字段，Get 系返回 0（客机只拿来回填 builder）。
     case ZA_NVN_ID_nvnSamplerBuilderSetDefaults:
         memset(o, 0, 0x40);
-        st32(o, F_MAGIC, M_MAGIC);
+        za_nvn_reg_add(o);
         return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetDevice:
         if (is_obj(o)) st64(o, F_DEVICE, a1);
@@ -834,7 +906,6 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
         init_obj(o, 0x30);
         if (is_obj((const void *)(uintptr_t)a1)) {
             st64(o, F_DEVICE, ld64((const void *)(uintptr_t)a1, F_DEVICE));
-            st32(o, F_MAGIC, M_MAGIC);
         }
         return 1;
     case ZA_NVN_ID_nvnSamplerFinalize:

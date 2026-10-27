@@ -38,6 +38,7 @@
 #include <android/log.h>
 
 #include "za_common.h"
+#include "za_mem.h"
 #include "za_guest_info.h"
 #include "za_imports.h"
 #include "za_romfs_embed.h"
@@ -752,6 +753,8 @@ static int za_va_plausible(unsigned long v)
 
 // 本 .so 的映射范围与「被顶掉的别人的处理器」（定义在下面的信号安装处）
 static unsigned long za_self_base, za_self_end;
+// libart.so 的装载区间（见 za_fatal_handler 里 ART TrimMaps 的受控修复）
+static unsigned long za_libart_base, za_libart_end;
 static struct sigaction za_fatal_prev[64];
 static volatile int za_fatal_prev_ok[64];
 static void za_segv_handler(int sig, siginfo_t *info, void *ctx);
@@ -779,6 +782,44 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
 {
     int zi = za_fatal_idx();
     if (za_fatal_dump_pool[zi]) siglongjmp(za_fatal_jmp_pool[zi], 1);   // dump 中二次 fault
+    // ★★ 受控修复：ART 自己的一个已知缺陷。
+    //   art::MemMapArenaPool::TrimMaps()+72（libart+0x795558）:
+    //       ldr x20,[x19,#0x18]    ; arena 链表头
+    //       ldr x8,[x20]           ; arena 的虚表指针
+    //       ldr x8,[x8,#0x10]      ; ← 虚表为 0 时 fault addr = 0x10
+    //   实测该链表里出现了一个**被清零过的 arena**（虚表=0），ART 没有判空直接虚调用，
+    //   于是整个进程被打死。我们没法在这里替 ART 修好那个 arena，但可以把链表头摘掉
+    //   （等价于"没有待裁剪的 arena"）并跳到解锁+返回处，让 JIT 继续工作。
+    //   ⚠ 必须指令字节校验通过才动手；任何一条不匹配就不碰，交给原来的流程。
+    if (ctx && za_libart_base && sig == SIGSEGV && info &&
+        (unsigned long long)(uintptr_t)info->si_addr == 0x10ull)
+    {
+        ucontext_t *uc = (ucontext_t *)ctx;
+        unsigned long pcv = (unsigned long)uc->uc_mcontext.pc;
+        unsigned long fix = za_libart_base + 0x795558ul;
+        if (pcv == fix && *(volatile unsigned int *)(uintptr_t)pcv == 0xf9400908u)
+        {
+            static int nfix;
+            unsigned long pool = (unsigned long)uc->uc_mcontext.regs[19];
+            unsigned long arena = (unsigned long)uc->uc_mcontext.regs[20];
+            *(volatile unsigned long long *)(uintptr_t)(pool + 0x18) = 0;
+            uc->uc_mcontext.pc = za_libart_base + 0x79553cul;   // → 解锁 + 返回
+            if (nfix++ < 20)
+            {
+                char b[160];
+                char *q = b;
+                q = za_put_str(q, "ZaGuest: ★ 修复 ART TrimMaps 空虚表（第 ");
+                q = za_put_dec(q, (unsigned long long)nfix);
+                q = za_put_str(q, " 次）arena=");
+                q = za_put_hex(q, (unsigned long long)arena);
+                q = za_put_str(q, " pool=");
+                q = za_put_hex(q, (unsigned long long)pool);
+                q = za_put_str(q, "\n");
+                za_fatal_write(b, (size_t)(q - b));
+            }
+            return;
+        }
+    }
     // ★★ 先判断这个故障是不是我们该管的：只有 **客机映像 / SDK 映像 / 本 .so**
     //   里的 PC 才是我们的责任。其余（ART 的隐式空指针检查、bionic 内部故障、
     //   JNI/UI 线程）一律交回**原来的处理器** —— 抢过来只会把宿主自己的
@@ -1495,12 +1536,49 @@ static void za_compute_self_range(void)
     za_self_base = bias + lo;
     za_self_end = bias + hi;
 }
+// ── libart.so 装载基址（只用于识别一类 ART 自身缺陷，见 za_fatal_handler）──
+// 在初始化时扫一次 /proc/self/maps（绝不能在信号处理器里扫）。
+static void za_probe_libart(void)
+{
+    if (za_libart_base) return;
+    int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    static char mbuf[512 * 1024];
+    ssize_t n = 0, r;
+    while (n < (ssize_t)sizeof mbuf - 1 &&
+           (r = read(fd, mbuf + n, sizeof mbuf - 1 - (size_t)n)) > 0)
+        n += r;
+    close(fd);
+    mbuf[n] = 0;
+    char *p = mbuf;
+    while (p && *p && !za_libart_base)
+    {
+        char *nl = p;
+        while (*nl && *nl != 10) nl++;
+        int had_nl = (*nl == 10);
+        if (had_nl) *nl = 0;
+        if (strstr(p, "/libart.so"))
+        {
+            // 形如 "6e00000000-6e08000000 r-xp 00000000 fd:00 123 /apex/.../libart.so"
+            unsigned long long a = 0, b = 0;
+            const char *q = p;
+            while (*q && *q != '-') { int c = *q++; if (c >= '0' && c <= '9') a = a * 16 + (unsigned)(c - '0'); else if (c >= 'a' && c <= 'f') a = a * 16 + (unsigned)(c - 'a' + 10); }
+            if (*q == '-') q++;
+            while (*q) { int c = *q; if (c >= '0' && c <= '9') { b = b * 16 + (unsigned)(c - '0'); q++; } else if (c >= 'a' && c <= 'f') { b = b * 16 + (unsigned)(c - 'a' + 10); q++; } else break; }
+            if (a && b > a) { za_libart_base = (unsigned long)a; za_libart_end = (unsigned long)b; }
+        }
+        if (!had_nl) break;
+        p = nl + 1;
+    }
+}
+
 // 装好致命信号的处理器（SIGSEGV/BUS/ILL/FPE/ABRT/SYS）。
 // ⚠ 必须每次 svc 后重装：SDK 初始化会**替换**掉我们装的 SIGSEGV 处理器
 //   ⇒ 客机崩了就没人接，直接被内核杀掉（连日志都没有）。
 void za_reinstall_signal_handlers(void)
 {
     za_install_altstack();
+    za_probe_libart();
     if (!za_self_base) za_compute_self_range();
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -2740,14 +2818,18 @@ static int za_fs_set_take(void *p)
 static void za_fs_guard_free(void *p, const char *who)
 {
     if (!p) return;
-    if (za_fs_set_take(p)) { free(p); return; }
+    if (za_fs_set_take(p)) {
+        if (za_mem_guest_owns(p)) za_mem_guest_free(p); else free(p);
+        return;
+    }
     if (za_fs_foreign_free++ < 6)
         ZLOGE("fs %s：%p 不是宿主分配器给的 ⇒ 跳过 free（防止写坏宿主堆）", who, p);
 }
 
 void *za_fs_alloc_host(unsigned long size)
 {
-    void *p = malloc(size ? (size_t)size : 1);
+    // ★ fs 读缓冲交给客机写 ⇒ 走客机共享区（宿主堆会被客机越界写坏）
+    void *p = za_mem_guest_alloc(size ? (size_t)size : 1, 16);
     if (p) za_fs_set_add(p);
     return p;
 }
@@ -3268,7 +3350,11 @@ static void *za_sampler_watchdog(void *arg)
         {
             if (++no_progress == 40)
             {
-                ZLOGE("★ 客机 200ms 无 svc 推进（count=%lu）", cnt);
+                // 只在每 10 秒（tick 2000）打一行：NVN 密集阶段本来就不发 svc，
+                // 200ms 一条会把 logcat 环形缓冲刷爆，崩溃现场的头部就被挤掉了。
+                if ((no_progress % 2000) == 40)
+                    ZLOGE("★ 客机 200ms 无 svc 推进（count=%lu，已持续 %d 秒）", cnt,
+                          no_progress / 40);
                 // ★ 2026-10-27：全体线程可能都睡在条件变量上（真机实测 16 个）。
                 //   ConditionVariable 允许伪唤醒，这里做一次**合法伪唤醒**：
                 //   游戏若因此继续推进 ⇒ 卡住的原因就是丢了一次唤醒；

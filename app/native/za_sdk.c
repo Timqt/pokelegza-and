@@ -448,7 +448,8 @@ static unsigned long long za_sdk_relocate_base(unsigned char *base)
 #define ZA_ARGDATA_TOTAL 0x9000u
 void *za_build_startup_info(void)
 {
-    unsigned char *p = (unsigned char *)calloc(1, ZA_ARGDATA_TOTAL);
+    // ★ 客机可写 ⇒ 必须来自客机共享区，不能用宿主 calloc（越界会写坏 Scudo）
+    unsigned char *p = (unsigned char *)za_mem_guest_alloc(ZA_ARGDATA_TOTAL, 16);
     if (!p) return NULL;
     const unsigned int A = 8;              // 字符串区大小（"main\0" + 对齐）
     *(unsigned int *)(p + 0x00) = ZA_ARGDATA_TOTAL;   // 分配空间总大小
@@ -1021,7 +1022,9 @@ int za_sdk_load(za_mod_t *sdk,
         // 8c) 「os 上下文」对象：SDK 的全局槽 [0xb74078] 指向它。
         //     nnosInitialize 在它上面构造 RngManager(+0)/AddressSpaceAllocator(+0x18)/
         //     ThreadManager(+0xf0)/TlsManager(+0x2e0)…（真机上由 OS 建好再交给 SDK）。
-        void *ctx = calloc(1, 0x800);
+        // ★ 客机可写（ThreadManager/TlsManager … 都在里面），必须离开宿主堆。
+        //   尺寸从 0x800 放大到 0x2000：客机构造子对象时会写到 0x800 之外。
+        void *ctx = za_mem_guest_alloc(0x2000, 16);
         *(void **)(base + 0xb74078) = ctx;
         za_sdk_ctx = ctx;
 

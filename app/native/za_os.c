@@ -19,6 +19,8 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 
+#include "za_mem.h"
+
 #include <sys/mman.h>
 #include "za_common.h"
 #include "za_os.h"
@@ -370,8 +372,9 @@ void *za_os_aligned_alloc(unsigned long alignment, unsigned long size)
     while (a < alignment && a < ((size_t)1 << 40)) a <<= 1;
     if ((alignment & (alignment - 1)) != 0 || size > (1ul << 30))
         ZLOGI("aligned_alloc 对齐/尺寸不寻常：align=%#lx size=%#lx", alignment, size);
-    void *p = NULL;
-    if (posix_memalign(&p, a, size ? (size_t)size : 1) != 0 || !p)
+    // ★ 客机可写 ⇒ 优先从客机共享区出（宿主堆会被越界写坏）
+    void *p = za_mem_guest_alloc(size ? (size_t)size : 1, a);
+    if (!p)
     {
         // 兜底：mmap 一块并手动对齐（宁可泄漏也不要给客机 NULL）
         size_t len = (size ? (size_t)size : 1);
@@ -406,11 +409,12 @@ void *za_os_alloc_thread_local(unsigned long size, unsigned long align)
         al = p2;
     }
     sz = (sz + al - 1) & ~(al - 1);
-    void *p = NULL;
-    int rc = posix_memalign(&p, al, sz);
-    if (rc != 0 || !p)
+    // ★ 客机**会写**这块 TLS 内存（每个 __thread 变量都在里面），
+    //   而且会越界 ⇒ 必须来自客机共享区，不能是宿主堆。
+    void *p = za_mem_guest_alloc(sz, al);
+    if (!p)
     {
-        ZLOGE("TLS 分配失败：size=%#zx align=%#lx（posix_memalign rc=%d）", sz, al, rc);
+        ZLOGE("TLS 分配失败：size=%#zx align=%#lx", sz, al);
         // 兜底：宁可给一块不对齐的内存，也不要给 NULL
         p = malloc(sz);
         if (!p) return NULL;
@@ -427,7 +431,8 @@ void *za_os_alloc_thread_local(unsigned long size, unsigned long align)
 void za_os_free_thread_local(void *p, unsigned long size)
 {
     (void)size;
-    free(p);
+    if (za_mem_guest_owns(p)) za_mem_guest_free(p);
+    else free(p);
 }
 
 // Switch 的 TLS 槽机制：AllocateTlsSlot 拿到一个槽号，Set/GetTlsValue 按槽存值。

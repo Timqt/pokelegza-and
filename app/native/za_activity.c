@@ -808,8 +808,23 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 256 * 1024 * 1024);
     pthread_t guest;
-    pthread_create(&guest, &attr, guest_thread, activity);
+    // 诊断开关：files 目录下存在 za_noguest 时**不启动客机**。
+    // 用来把「宿主/ART 自己的问题」与「客机把宿主搞坏」分开。
+    {
+        char p[512];
+        const char *d = activity->internalDataPath;
+        int skip = 0;
+        p[0] = 0;
+        if (d) {
+            snprintf(p, sizeof p, "%s/za_noguest", d);
+            skip = (access(p, F_OK) == 0);
+        }
+        if (skip) {
+            LOGI("★ 诊断开关生效：不启动客机（%s）", p);
+        } else if (pthread_create(&guest, &attr, guest_thread, activity) == 0) {
+            pthread_detach(guest);
+        }
+    }
     pthread_attr_destroy(&attr);
-    pthread_detach(guest);
     LOGI("ANativeActivity_onCreate 返回");
 }

@@ -26,6 +26,12 @@ int za_mem_unmap_shared(unsigned long long addr, unsigned long long size);
 // svc#44/#45 Map/UnmapPhysicalMemory 的登记：QueryMemory 据此把这块报成已映射/空闲。
 void za_mem_note_mapping(unsigned long long addr, unsigned long long size, int on);
 
+// 客机可见的宿主数据（客机会往这里**越界写**，所以绝不能来自宿主堆）。
+// 返回的内存是零初始化的。
+void *za_mem_guest_alloc(size_t size, size_t align);
+void za_mem_guest_free(void *p);
+int za_mem_guest_owns(const void *p);
+
 // 这段地址是否落在我们自己的预留区内（svc#44/#45 改权限前必须先问）
 int za_mem_owns(unsigned long long addr, unsigned long long size);
 // QueryMemory：填 MemoryInfo（base/size/state/attr/perm 六个字段），返回页信息（W1）。
