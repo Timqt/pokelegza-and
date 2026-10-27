@@ -318,6 +318,44 @@ void za_nvn_dump_recent(void)
 // ⚠ tick 线程**只碰宿主计数器**，不解引用任何客机对象 —— 那些对象可能已经被
 //   客机释放，从另一个线程解引用会随机炸（之前就吃过这种亏）。
 static volatile u64 za_nvn_submits, za_nvn_acquires, za_nvn_presents;
+
+// ── GPU 完成通知（提交 → 若干 tick 后置位 sync）──────────────────────────
+// Switch 上 nvnQueueFenceSync 把 sync 挂到队列上，随后 QueueSubmitCommands 让 GPU
+// 跑；GPU 跑完内核才把 sync 置为已触发。游戏（和 SDK 的异步资源系统）就靠这个
+// 判断「这一帧的命令真的执行完了」。
+// 我们没有任何真实 GPU 工作，所以这里**记账 + 延迟置位**：提交时把挂着的 sync
+// 记下来，帧驱动在自己的 60Hz tick 上（宿主侧，不解引用客机对象）把到期的 sync
+// 标成已触发。之前是 FenceSync 里立刻置位 —— 语义上「提交前就完成了」，
+// 依赖完成回调的异步流程会因此永远等不到那一步的通知。
+#define ZA_NVN_PEND 64
+typedef struct { void *sync; unsigned long long fence; int ticks; } za_nvn_pend_t;
+static za_nvn_pend_t za_nvn_pend[ZA_NVN_PEND];
+static volatile int za_nvn_pend_n;
+
+static void za_nvn_pend_arm(void *sync, unsigned long long fence)
+{
+    int i = __atomic_fetch_add(&za_nvn_pend_n, 1, __ATOMIC_ACQ_REL);
+    if (i >= ZA_NVN_PEND) { __atomic_store_n(&za_nvn_pend_n, ZA_NVN_PEND, __ATOMIC_RELEASE); return; }
+    za_nvn_pend[i].sync = sync;
+    za_nvn_pend[i].fence = fence;
+    za_nvn_pend[i].ticks = 2;          // ~33ms：给「GPU 执行」一点时间轴
+}
+
+// 帧驱动每 tick 调一次：到期的 sync 置成已触发。
+static void za_nvn_pend_tick(void)
+{
+    int n = __atomic_load_n(&za_nvn_pend_n, __ATOMIC_ACQUIRE);
+    if (n > ZA_NVN_PEND) n = ZA_NVN_PEND;
+    for (int i = 0; i < n; i++) {
+        za_nvn_pend_t *e = &za_nvn_pend[i];
+        if (!e->sync) continue;
+        if (--e->ticks > 0) continue;
+        // 只写宿主侧影子（st32/st64 对未登记指针是空操作，安全）。
+        st32(e->sync, F_FLAGS, 1);
+        st64(e->sync, F_SIZE, e->fence);
+        e->sync = 0;
+    }
+}
 static volatile u64 za_nvn_ticks;
 static volatile int za_nvn_tick_run;
 static pthread_t za_nvn_tick_th;
@@ -330,6 +368,17 @@ static void *za_nvn_tick_main(void *p)
         struct timespec ts = { 0, 16666667 };
         nanosleep(&ts, NULL);
         za_nvn_ticks++;
+        za_nvn_pend_tick();
+        // 每 4 tick（~66ms）把全部事件置位一次：判定客机是不是在等外部事件。
+        // 置位只会让等待者返回，游戏若不需要这些事件会自己 Reset（svc#23），
+        // 所以重复置位不会破坏语义，最多多几次唤醒。
+        if ((za_nvn_ticks & 3) == 0) {
+            extern int za_horizon_signal_all_events(void);
+            static unsigned long long sig_n;
+            int k = za_horizon_signal_all_events();
+            if (k && sig_n++ < 8)
+                ZLOGI("★ 已置位 %d 个事件句柄（外部事件实验）", k);
+        }
         // ★ 停摆侦测：NVN 进展（贴图/命令缓冲/提交/呈现）20 秒没变 ⇒ 主动给客机
         //   主线程发 SIGSEGV 让致命处理器把客机调用栈倒进 files/za_fatal.log。
         //   客机整体睡死时 svc 计数还在缓慢增长（条件变量分片返回），按 svc 判卡死
@@ -635,6 +684,9 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
         return 0;
     case ZA_NVN_ID_nvnQueueSubmitCommands:
         za_nvn_submits++;
+        // 提交点：队列上挂着的 fence 从这一刻开始「执行」。
+        ZLOGI("★ NVN 提交 #%llu：%llu 个命令缓冲（完成通知将在此后 2 tick 置位）",
+              (unsigned long long)za_nvn_submits, (unsigned long long)a1);
         if (za_nvn_submits <= 4 || (za_nvn_submits % 120) == 0)
             ZLOGI("★ NVN 提交命令缓冲 #%llu（本次 %llu 个）",
                   (unsigned long long)za_nvn_submits, (unsigned long long)a1);
@@ -650,8 +702,8 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
         u64 fence = is_obj(o) ? ld64(o, F_EXTRA) + 1 : 1;
         if (is_obj(o)) st64(o, F_EXTRA, fence);
         if (is_obj(sync)) {
-            st64(sync, F_SIZE, fence);
-            st32(sync, F_FLAGS, 1);
+            // 立刻置位是错的：游戏在 Submit 之后才等它。挂账，交给帧驱动完成。
+            za_nvn_pend_arm(sync, fence);
         }
         return 1;
     }

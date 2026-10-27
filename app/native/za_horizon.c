@@ -214,6 +214,24 @@ static int za_handle_alloc(int type)
     return id;
 }
 
+// ★ 实验/兜底：把所有「事件」句柄置为已触发并唤醒所有 svc#24 等待者。
+//   用途：客机整个睡在条件变量/事件上时，用来判定它是不是在等一个**外部事件**
+//   （典型就是 display 的 vsync）。真机上如果这一步让帧循环跑起来，说明缺的就是
+//   周期性 vsync；如果没反应，说明等待点在客机自己的逻辑里。
+int za_horizon_signal_all_events(void)
+{
+    int n = 0;
+    pthread_mutex_lock(&g_handles_mtx);
+    for (int i = 0; i < ZA_MAX_HANDLES; i++)
+    {
+        if (!g_handles[i].used || g_handles[i].type != ZA_H_EVENT) continue;
+        if (!g_handles[i].signaled) { g_handles[i].signaled = 1; n++; }
+    }
+    if (n) pthread_cond_broadcast(&g_handle_cond);
+    pthread_mutex_unlock(&g_handles_mtx);
+    return n;
+}
+
 static za_handle_t *za_handle_get(int h)
 {
     if (h <= 0 || h > ZA_MAX_HANDLES) return NULL;
