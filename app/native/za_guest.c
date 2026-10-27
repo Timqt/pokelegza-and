@@ -62,6 +62,7 @@
 
 // 客机全局状态（其它 .c 通过 extern 访问）
 unsigned char *za_guest_base = NULL;
+volatile int za_stage_m5;                 /* M5 之后才允许「别名句柄」CMIF 应答 */
 volatile unsigned long za_sdk_base = 0;
 volatile unsigned long za_sdk_size = 0;
 
@@ -2715,6 +2716,8 @@ static void za_rtld_module_inits_cb(void)
     if (set_argc) { ZLOGI("SetHostArgc(1)"); set_argc(1); }
     if (set_argv) { ZLOGI("SetHostArgv"); set_argv(argv); }
     ZLOGI("里程碑 M5: SetHostArgc/Argv 已设置（即将进 nnMain）");
+    extern volatile int za_stage_m5;
+    za_stage_m5 = 1;
 }
 
 static void za_rtld_fini_cb(void) {}

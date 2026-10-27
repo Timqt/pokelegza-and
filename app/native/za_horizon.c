@@ -1773,8 +1773,25 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                     }
                 }
                 za_write_cmif_reply(ro, (unsigned long long)a2, (unsigned long long)a4, hdr0, hdr1);
-                ZLOGI("  IPC CMIF 服务=\"%s\" session=%#x cmd=%#x hdr0=%#x hdr1=%#x -> reply written",
-                      za_fake_svc_name(sess), sess, cmd, hdr0, hdr1);
+                {
+                    // 把 CMIF 头里的**命令号**打出来（hdr0 只是类型）。
+                    unsigned cmdid = 0;
+                    if (ro)
+                    {
+                        for (unsigned off = 0; off < 0x100; off += 4)
+                        {
+                            unsigned int w = 0;
+                            memcpy(&w, (void *)(uintptr_t)(ro + off), 4);
+                            if (w == 0x49434653u)
+                            {
+                                memcpy(&cmdid, (void *)(uintptr_t)(ro + off + 8), 4);
+                                break;
+                            }
+                        }
+                    }
+                    ZLOGI("  IPC CMIF 服务=\"%s\" session=%#x type=%#x cmd=%#x hdr1=%#x -> reply written",
+                          za_fake_svc_name(sess), sess, cmd, cmdid, hdr1);
+                }
             }
         }
         else
@@ -1793,8 +1810,42 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                     ZLOGI("  未知会话 session=%#x cmd=%#x hdr0=%#x hdr1=%#x 前 8 字=%08x %08x %08x %08x %08x %08x %08x %08x",
                           sess, cmd, hdr0, hdr1, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
                 }
-                memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
-                memcpy((void *)(uintptr_t)(ro + 0xc), &zero, 4);
+                // ★ 克隆出来的小句柄（session 0x6/0x7）：SDK 的
+                //   CloneCurrentObject 控制请求拿到的「新句柄」其实是我们
+                //   应答里的 token，随后它就在这些小句柄上发 CMIF 请求。
+                //   限定条件（避免误伤 TIPC/早期控制会话）：
+                //     type ∈ {6,7}、SFCI 落在 16 字节对齐处、version == 1。
+                extern volatile int za_stage_m5;
+                int alias_cmif = 0;
+                if (za_stage_m5 && sess < 0x1000)
+                {
+                    unsigned int w0v = 0;
+                    memcpy(&w0v, (void *)(uintptr_t)ro, 4);
+                    unsigned int ty = w0v & 0xffffu;
+                    if (ty == 6 || ty == 7)
+                    {
+                        for (unsigned off = 0; off < 0x100 && !alias_cmif; off += 16)
+                        {
+                            unsigned int w = 0, ver = 0;
+                            memcpy(&w, (void *)(uintptr_t)(ro + off), 4);
+                            if (w != 0x49434653u) continue;
+                            memcpy(&ver, (void *)(uintptr_t)(ro + off + 4), 4);
+                            if (ver == 1) alias_cmif = 1;
+                        }
+                    }
+                }
+                if (alias_cmif)
+                {
+                    za_write_cmif_reply(ro, (unsigned long long)a2, (unsigned long long)a4,
+                                        hdr0, hdr1);
+                    ZLOGI("  IPC CMIF(别名句柄) session=%#x type=%#x -> reply written",
+                          sess, cmd);
+                }
+                else
+                {
+                    memcpy((void *)(uintptr_t)(ro + 8), &zero, 4);
+                    memcpy((void *)(uintptr_t)(ro + 0xc), &zero, 4);
+                }
             }
         }
         ZLOGI("svc#33 SendSyncRequest session=%#x sm.cnt=%u sm.sess=%#x hdr0=%#x hdr1=%#x",
