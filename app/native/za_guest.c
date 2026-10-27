@@ -656,7 +656,10 @@ void za_dump_svc_trace(void);
 // 客机 PC 采样环形轨迹（定义在后面；fatal handler 在它之前）
 #define ZA_PC_RING 16
 volatile unsigned long za_disp_count;   // svc 派发计数（看门狗判卡死用）
+// 按服务号分桶的计数：卡住时能看出「只剩下哪几个 svc 在动」。
+volatile unsigned long za_svc_nr_count[64];
 void za_disp_count_bump(void) { za_disp_count++; }
+void za_svc_nr_count_bump(unsigned nr) { if (nr < 64) __atomic_add_fetch(&za_svc_nr_count[nr], 1, __ATOMIC_RELAXED); }
 volatile unsigned long za_pc_ring[ZA_PC_RING];
 extern volatile unsigned long za_pc_ring_pos;
 static void za_dump_pc_ring(void)
@@ -3346,6 +3349,36 @@ static void *za_sampler_watchdog(void *arg)
         static unsigned long last_count;
         static int no_progress;
         unsigned long cnt = za_disp_count;
+        /* ★ 2026-10-28：真正有用的「停摆」判据 —— 客机整体睡在条件变量上时，
+         *   svc 计数仍在缓慢增长（我们在 svc#28 里按 20ms 分片返回，客机每片
+         *   都重新发一次），所以「计数没变」永远不成立。改成看**速率**：
+         *   连续 30 秒每秒新增 svc 少于 100 次 ⇒ 主线程几乎不动 ⇒ 倒一次栈。 */
+        {
+            static unsigned long long win_ns;
+            static unsigned long long win_cnt;
+            static int slow_secs, dumped;
+            struct timespec tsv;
+            clock_gettime(CLOCK_MONOTONIC, &tsv);
+            unsigned long long now = (unsigned long long)tsv.tv_sec * 1000000000ull +
+                                     (unsigned long long)tsv.tv_nsec;
+            if (now - win_ns >= 1000000000ull)
+            {
+                unsigned long rate = (unsigned long)(cnt - win_cnt);
+                win_ns = now;
+                win_cnt = cnt;
+                if (rate < 100) {
+                    if (++slow_secs == 30 && !dumped) {
+                        dumped = 1;
+                        ZLOGE("★ 客机 30 秒几乎不动（%lu svc/s）⇒ 倒客机栈（tid=%ld）",
+                              rate, za_guest_tid);
+                        if (za_guest_tid > 0)
+                            syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, 11);
+                    }
+                } else {
+                    slow_secs = 0;
+                }
+            }
+        }
         if (cnt == last_count)
         {
             if (++no_progress == 40)
@@ -3359,16 +3392,18 @@ static void *za_sampler_watchdog(void *arg)
                 //   ConditionVariable 允许伪唤醒，这里做一次**合法伪唤醒**：
                 //   游戏若因此继续推进 ⇒ 卡住的原因就是丢了一次唤醒；
                 //   若没反应 ⇒ 它在等真正的外部事件（vsync/GPU 完成等）。
-                unsigned pk = za_sync_poke_all();
-                if (pk && (no_progress % 2000) == 40)
+                // ★ 先 dump 再 poke：poke 会把这些槽位的 kind 清 0，
+                //   紧跟着 dump 就只会看到「0 个线程」（踩过一次）。
+                if ((no_progress % 2000) == 40)
                 {
-                    ZLOGE("   已对 %u 个条件变量等待者做伪唤醒（累计 %d 次）", pk,
-                          no_progress / 40);
-                    // 每 10 秒（2000 tick）倒一次等待表 + 每个等待者的客机调用链，
-                    // 这是「主线程到底卡在哪个游戏函数」最直接的证据。
+                    ZLOGE("★ 停摆快照（%lu svc/s 级别的静默）", cnt);
                     za_sync_dump();
                     za_nvn_dump_recent();   // 带客机 LR：最后几步 NVN 调用发生在哪
                 }
+                unsigned pk = za_sync_poke_all();
+                if (pk && (no_progress % 2000) == 40)
+                    ZLOGE("   已对 %u 个条件变量等待者做伪唤醒（累计 %d 次）", pk,
+                          no_progress / 40);
             }
             // ★ 2026-10-27：阈值 2000 → 12000。客人有**合法的长 memset**
             //   （sdk+0x56e450 就是 memset 的内层循环，初始化几百 MB 内存池时

@@ -68,7 +68,7 @@ static void za_sync_dump_guest_chain(unsigned long long sp, unsigned long long p
           (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? pc - mb
               : (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? pc - za_sdk_base : pc);
     int hits = 0;
-    for (int k = 0; k < 96 && hits < 4; k++) {
+    for (int k = 0; k < 512 && hits < 12; k++) {
         unsigned long long v = 0;
         if (!za_sync_read(&v, sp + (unsigned long)k * 8, 8)) break;
         if (v >= mb && v < mb + ZA_IMAGE_SIZE) { ZLOGI("        main+%#llx", v - mb); hits++; }
@@ -225,6 +225,24 @@ unsigned long za_sync_arbitrate_lock(unsigned int owner, unsigned long long addr
             zs_unlock();
             return 0;
         }
+        // ★ 2026-10-28 真机：主线程卡在 word=0x656c6261（ASCII "able"）的「锁」上
+        //   —— 客机把一段文本缓冲当成 mutex 传进来了。这种字永远不会有人 unlock，
+        //   永久阻塞就等于整条线死掉。Horizon 的 tag 是线程句柄（小整数，实测
+        //   ≤ 0x13），所以 owner 超出合理范围就当成「未被占用」，直接取走。
+        if (cur == 0) {
+            __atomic_store_n(lock, tag, __ATOMIC_RELEASE);
+            zs_unlock();
+            return 0;
+        }
+        if ((cur & ~ZA_WAITERS_BIT) > 0xffffu) {
+            static int nbad;
+            if (nbad++ < 6)
+                ZLOGE("svc#26 锁字不可信 lock=%p word=%#x ⇒ 直接取走（不阻塞）",
+                      (void *)lock, cur);
+            __atomic_store_n(lock, tag, __ATOMIC_RELEASE);
+            zs_unlock();
+            return 0;
+        }
         if (cur != (owner | ZA_WAITERS_BIT)) {
             zs_unlock();
             return 0;
@@ -233,6 +251,28 @@ unsigned long za_sync_arbitrate_lock(unsigned int owner, unsigned long long addr
         w->addr = addr;
         w->tag = tag;
         __atomic_store_n(&w->granted, 0, __ATOMIC_RELEASE);
+        // ★ 诊断：锁字的高位像 ASCII 的可打印字符 ⇒ 这把「锁」其实是一段文本。
+        //   真机实测 word=0x656c6261 = "able"，指向客机栈上的字符串缓冲，
+        //   说明客机把某个结构体当成锁在用（或者栈上的锁被文本覆盖了）。
+        //   把这 0x100 字节按文本倒出来，就能直接看到那条消息。
+        if ((cur >> 24) >= 0x20u && (cur >> 24) <= 0x7eu) {
+            static int n;
+            if (n < 4) {
+                n++;
+                ZLOGE("★ 锁字像 ASCII：lock=%p word=%#x，附近 0x100 字节：", (void *)lock, cur);
+                const char *p2 = (const char *)lock - 0x40;
+                for (int i = 0; i < 0x100; i += 0x40) {
+                    char line[160];
+                    int k = 0;
+                    for (int j = 0; j < 0x40 && k < (int)sizeof line - 2; j++) {
+                        unsigned char c = (unsigned char)p2[i + j];
+                        line[k++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
+                    }
+                    line[k] = 0;
+                    ZLOGE("    +%#04x |%s|", i - 0x40, line);
+                }
+            }
+        }
     }
     zs_unlock();
     {

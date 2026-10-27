@@ -1285,6 +1285,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         long long timeout = a3;      // 纳秒，-1 = 无限
         unsigned long long deadline = timeout >= 0 ? za_now_ns() + (unsigned long long)timeout : 0;
         int idx = -1;
+        unsigned long long last_log = 0;
         pthread_mutex_lock(&g_handles_mtx);
         for (;;)
         {
@@ -1296,6 +1297,30 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             }
             if (idx >= 0) break;
             if (timeout == 0) break;              // 不等待
+            // ★ 诊断：无限等待时每 2 秒把「到底在等谁」打出来。
+            //   客机整体停摆的第一手证据就在这里 —— 等的事件没人 signal，
+            //   整个进程就会静默（所有线程 futex 睡眠、svc 计数不涨）。
+            if (timeout < 0)
+            {
+                unsigned long long now = za_now_ns();
+                if (now - last_log > 2000000000ull)
+                {
+                    last_log = now;
+                    char lb[256];
+                    int n = snprintf(lb, sizeof lb, "svc#24 无限等待 %d 个句柄:", num);
+                    for (int i = 0; i < num && n > 0 && n < (int)sizeof lb - 48; i++)
+                    {
+                        za_handle_t *h = za_handle_get((int)hs[i]);
+                        const char *ty = !h ? "无效" : h->type == ZA_H_EVENT ? "事件"
+                                         : h->type == ZA_H_THREAD ? "线程" : "其他";
+                        const char *st2 = "";
+                        if (h && h->type == ZA_H_EVENT) st2 = h->signaled ? "·已信号" : "·未信号";
+                        else if (h && h->type == ZA_H_THREAD) st2 = h->exited ? "·已退出" : "·在跑";
+                        n += snprintf(lb + n, sizeof lb - (size_t)n, " #%u(%s%s)", hs[i], ty, st2);
+                    }
+                    ZLOGE("%s", lb);
+                }
+            }
             if (timeout >= 0)
             {
                 unsigned long long now = za_now_ns();
@@ -1334,6 +1359,19 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     case 28: // WaitProcessWideKeyAtomic(lockaddr=x0, condkey=x1, tag=w2, timeout=x3)
         za_sync_note_guest((unsigned long long)za_horizon_regs[ZA_REG_SP],
                            (unsigned long long)za_horizon_regs[ZA_REG_PC]);
+        // 诊断：高频重复等待时把参数打出来（每秒最多 8 行），
+        // 用来区分「timeout=0 的空转」和「真的在睡」。
+        {
+            static unsigned long long win_start, nl;
+            unsigned long long now = za_now_ns();
+            if (now - win_start > 1000000000ull) { win_start = now; nl = 0; }
+            if (nl < 8) {
+                nl++;
+                ZLOGI("svc#28 lock=%#llx key=%#llx tag=%#x timeout=%lld",
+                      (unsigned long long)a0, (unsigned long long)a1,
+                      (unsigned)a2, (long long)a3);
+            }
+        }
         return (long)za_sync_wait_key((unsigned long long)a0, (unsigned long long)a1,
                                       (unsigned int)a2, (long long)a3);
     case 29: // SignalProcessWideKey(condkey=x0, count=w1)
@@ -2138,6 +2176,7 @@ static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
         }
     }
     za_disp_count_bump();
+    za_svc_nr_count_bump((unsigned)nr);
     long res = za_horizon_dispatch(a0, a1, a2, a3, a4, a5, a6, a7, nr);
     // 返回值也记进轨迹：客机多数 svc 包装函数是
     //   svc #N ; <收尾> ; ret     —— 返回值直接进 x0/w0

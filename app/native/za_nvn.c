@@ -20,9 +20,11 @@
 // 我们的字段一律放在对象前 0x80 字节内，绝不会越过最小对象尺寸。
 #include <pthread.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 #include "za_common.h"
 #include "za_guest_info.h"
@@ -328,6 +330,24 @@ static void *za_nvn_tick_main(void *p)
         struct timespec ts = { 0, 16666667 };
         nanosleep(&ts, NULL);
         za_nvn_ticks++;
+        // ★ 停摆侦测：NVN 进展（贴图/命令缓冲/提交/呈现）20 秒没变 ⇒ 主动给客机
+        //   主线程发 SIGSEGV 让致命处理器把客机调用栈倒进 files/za_fatal.log。
+        //   客机整体睡死时 svc 计数还在缓慢增长（条件变量分片返回），按 svc 判卡死
+        //   永远不会触发，只能按「真正有用的进展」判。
+        {
+            static u64 last_prog;
+            static unsigned long long last_change;
+            u64 prog = za_nvn_calls[ZA_NVN_ID_nvnTextureInitialize] +
+                       za_nvn_calls[ZA_NVN_ID_nvnCommandBufferBeginRecording] +
+                       za_nvn_calls[ZA_NVN_ID_nvnQueueSubmitCommands] + za_nvn_presents;
+            if (prog != last_prog) { last_prog = prog; last_change = za_nvn_ticks; }
+            else if (za_nvn_ticks - last_change == 1800) {   // 30 秒
+                extern volatile long za_guest_tid;
+                ZLOGE("★ NVN 30 秒无进展 ⇒ 倒客机栈（tid=%ld）", za_guest_tid);
+                if (za_guest_tid > 0)
+                    syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, 11);
+            }
+        }
         if ((za_nvn_ticks % 300) == 0)
             ZLOGI("★ NVN 帧驱动：%llu tick，submit=%llu acquire=%llu present=%llu"
                   " tex=%llu buf=%llu cmd=%llu",
@@ -336,6 +356,24 @@ static void *za_nvn_tick_main(void *p)
                   (unsigned long long)za_nvn_calls[ZA_NVN_ID_nvnTextureInitialize],
                   (unsigned long long)za_nvn_calls[ZA_NVN_ID_nvnBufferInitialize],
                   (unsigned long long)za_nvn_calls[ZA_NVN_ID_nvnCommandBufferBeginRecording]);
+        {
+            extern volatile unsigned long za_svc_nr_count[64];
+            static unsigned long prev[64];
+            char lb[256];
+            int n = snprintf(lb, sizeof lb, "   svc 增量:");
+            int changed = 0;
+            for (int i = 0; i < 64; i++) {
+                unsigned long c = za_svc_nr_count[i];
+                if (c != prev[i]) {
+                    if (n > 0 && n < (int)sizeof lb - 24) {
+                        n += snprintf(lb + n, sizeof lb - (size_t)n, " #%d+%lu", i, c - prev[i]);
+                        changed = 1;
+                    }
+                    prev[i] = c;
+                }
+            }
+            if (changed) ZLOGI("%s", lb);
+        }
     }
     return NULL;
 }

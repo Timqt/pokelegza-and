@@ -77,6 +77,7 @@ unsigned long za_svc_count_peek(long nr);
 void za_svc41_count(long id);
 unsigned long long za_host_tick_hook(void);   // 客机 CNTPCT_EL0 的宿主替身
 void za_disp_count_bump(void);               // svc 派发计数（看门狗判卡死）
+void za_svc_nr_count_bump(unsigned nr);         // 按服务号分桶计数（诊断卡点）
 unsigned long za_svc41_peek(long id);
 // #41 调用点轨迹（最近 32 次的 调用点PC + id）
 void za_svc41_trace(unsigned long pc, long id);
