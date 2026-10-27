@@ -1362,17 +1362,29 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 default: wait = (cur != v); break;  // NotEqual：等到 == value
             }
             if (!wait) return 0xFA01u;              // InvalidState ⇒ 调用方用新值重试
-            struct timespec ts, *tsp = NULL;
+            struct timespec ts;
             if (ns >= 0)
             {
                 ts.tv_sec = (time_t)(ns / 1000000000LL);
                 ts.tv_nsec = (long)(ns % 1000000000LL);
-                tsp = &ts;
             }
-            int rc = (int)syscall(SYS_futex, (int *)p, FUTEX_WAIT_PRIVATE, (int)cur, tsp, NULL, 0);
+            else
+            {
+                // ★ 2026-10-27：无限等待也必须**有界**。
+                //   这条 svc 不在我们的等待表里（za_sync 只管 #26/#28），
+                //   而写方可以只在用户态改值、不调 svc#53 ⇒ futex 唤醒丢失，
+                //   等待者就永久睡死；看门狗的伪唤醒也够不着它。
+                //   真机实测：卡住时等待表里只有 1 个线程，其余 15 个都不在
+                //   #26/#28 —— 就是睡在这里。
+                //   20ms 分片 + 重判条件是安全的：调用方本来就循环重试。
+                ts.tv_sec = 0;
+                ts.tv_nsec = 20 * 1000 * 1000;
+            }
+            int rc = (int)syscall(SYS_futex, (int *)p, FUTEX_WAIT_PRIVATE, (int)cur, &ts, NULL, 0);
             if (rc == 0) return 0;                  // 被唤醒
             if (errno == EAGAIN || errno == EINTR) continue;   // 值变了/被信号打断 ⇒ 重判
-            return 0xEA01u;                         // 超时等
+            if (ns < 0) continue;                   // 分片到期 ⇒ 重判条件（伪唤醒）
+            return 0xEA01u;                         // 真超时
         }
     }
     case 54: // SynchronizeToAddress / 慢路径让出 CPU（SDK 临界区忙等里调）

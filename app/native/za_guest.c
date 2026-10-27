@@ -852,10 +852,14 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 {
                     unsigned long long v = 0;
                     if (!za_read_bytes(spx + (unsigned long)k * 8, &v, 8)) break;
-                    int in_main = za_guest_base &&
-                                  v >= (unsigned long long)(uintptr_t)za_guest_base &&
-                                  v < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE;
-                    int in_sdk = za_sdk_base && v >= za_sdk_base && v < za_sdk_base + za_sdk_size;
+                    // ⚠ 只认**4 字节对齐、且落在 text 段内**的值：栈上经常躺着
+                    //   0x100000001（= main+1）这种数据，会被误判成返回地址，
+                    //   把 ART 自己的故障抢过来挂起（真机实测 libart+0x791558
+                    //   addr=0x10 就是这么被误认的）。
+                    unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+                    int in_main = mb && (v & 3) == 0 && v > mb && v < mb + ZA_TEXT_SIZE;
+                    int in_sdk = za_sdk_base && (v & 3) == 0 && v > za_sdk_base &&
+                                 v < za_sdk_base + 0x64e230ull;
                     if (in_main || in_sdk)
                     {
                         char b2[200];
@@ -947,7 +951,15 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 {
                     if (o->sa_sigaction && o->sa_sigaction != za_segv_handler)
                     {
-                        o->sa_sigaction(sig, info, ctx);
+                        // ★ 不要**直接调用**原处理器：ART 的处理器要经 libsigchain
+                        //   的每线程状态（Self、implicit-check 标记）才能正确工作，
+                        //   直接调会让它把状态搞坏（真机实测 ART 的 "Jit thread pool"
+                        //   线程随后在 libart+0x791558 上解引用 null+0x10 崩掉）。
+                        //   正确做法：把原处理器**装回去**再返回 —— 我们没改出错指令，
+                        //   内核会立刻重新投递同一个信号，这次由 ART 自己按正常路径处理。
+                        struct sigaction back = *o;
+                        back.sa_flags &= ~SA_SIGINFO;
+                        sigaction(sig, o, NULL);
                         return;
                     }
                 }
@@ -957,7 +969,7 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
                 else if (o->sa_handler && o->sa_handler != SIG_DFL)
                 {
-                    o->sa_handler(sig);
+                    sigaction(sig, o, NULL);
                     return;
                 }
             }
@@ -1517,11 +1529,14 @@ void za_install_rt_catch(void)
     sa.sa_sigaction = za_rt_catch;
     sa.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_NODEFER;
     sigemptyset(&sa.sa_mask);
-    for (int s = 32; s <= 62; s++)
-    {
-        if (s == SIGRTMIN) continue;
+    // ⚠ 只接 **40..62**。低位实时信号是宿主自己的：
+    //   32 = SIGRTMIN（bionic debuggerd）、33 = BIONIC_SIGNAL_PROFILER（simpleperf）、
+    //   34.. = ART 的线程挂起/检查点信号。
+    //   以前从 32 开始一路装到 62，把 ART 的挂起信号处理器也抢了 ⇒
+    //   ART 的 JIT/挂起机制坏掉，真机表现为 "Jit thread pool" 线程在
+    //   libart+0x791558 上解引用 null+0x10 崩溃、进程被带走。
+    for (int s = 40; s <= 62; s++)
         sigaction(s, &sa, NULL);
-    }
 }
 
 // 启动时装一次（渲染线程比客机线程先跑，它的崩溃也得有人兜底）

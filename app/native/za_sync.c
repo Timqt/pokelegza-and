@@ -399,6 +399,23 @@ void za_sync_dump(void)
         if (kind[i] == 2) za_dump_ret_ring_for(tid[i]);   // 它最后几条 svc
         // 客机侧调用链：x30 + 从 sp 往上扫到的前 4 个映像内返回地址
         if (kind[i] == 2 && i < 4 && gsp[i]) za_sync_dump_guest_chain(gsp[i], gpc[i]);
+        // ★ 锁对象前后的内存：nn::os 的 EventType 是「若干状态字节 + 计数器 +
+        //   临界区 + 两个条件变量」，cs/cv 的相对位置固定。把它打出来才能找到
+        //   `signaled` 那一字节 —— 如果它一直是 0，就说明游戏在等一个
+        //   永远不会被信号的事件（最可疑：vi 的 vsync）。
+        if (kind[i] == 2 && i < 2 && addr[i]) {
+            unsigned char raw[0x60];
+            if (za_sync_read(raw, addr[i] - 0x20, sizeof raw)) {
+                for (int r = 0; r < 6; r++)
+                    ZLOGI("      lock%+03x: %02x %02x %02x %02x %02x %02x %02x %02x"
+                          "  %02x %02x %02x %02x %02x %02x %02x %02x",
+                          r * 16 - 0x20,
+                          raw[r * 16 + 0], raw[r * 16 + 1], raw[r * 16 + 2], raw[r * 16 + 3],
+                          raw[r * 16 + 4], raw[r * 16 + 5], raw[r * 16 + 6], raw[r * 16 + 7],
+                          raw[r * 16 + 8], raw[r * 16 + 9], raw[r * 16 + 10], raw[r * 16 + 11],
+                          raw[r * 16 + 12], raw[r * 16 + 13], raw[r * 16 + 14], raw[r * 16 + 15]);
+            }
+        }
     }
 }
 
