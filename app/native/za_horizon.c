@@ -1095,6 +1095,17 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             ZLOGI("svc#%ld Map/Unmap 参数为空 addr=%#lx size=%#lx", nr, addr, size);
             return 0;
         }
+        // ★ 只允许动**我们预留区**里的地址。客机偶尔会给出区外的地址
+        //   （野指针 / 我们报给它的地址空间与实际预留不一致），那时 mprotect
+        //   会打到 ART/libc 的映射上 —— 宿主随后必崩，而且现场完全指不到我们。
+        if (!za_mem_owns(addr, size))
+        {
+            static int nbad;
+            if (nbad++ < 12)
+                ZLOGE("svc#%ld 拒绝：addr=%#lx size=%#lx 不在预留区内（不动宿主映射）",
+                      nr, addr, size);
+            return (long)0xD401;
+        }
         if (nr == 44)
         {
             /* 已映射就只改权限；没映射就真 mmap 到这个地址。

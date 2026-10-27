@@ -379,13 +379,17 @@ int za_mem_map_shared(unsigned long long addr, unsigned long long size)
     }
     else
     {
-        // 声明区内、实际预留外：现场映射（NORESERVE，页面按需落地）
+        // 声明区内、实际预留外：现场映射（NORESERVE，页面按需落地）。
+        // ⚠ 2026-10-27：**去掉 mprotect 兜底**。这段地址可能已经是宿主
+        //   （ART/libc/我们自己 .so）的映射，MAP_FIXED_NOREPLACE 失败正说明
+        //   有人占了；那时再 mprotect 就是把宿主的只读段改成可写。
+        //   直接返回失败，让客机分配器换一个地址。
         void *p = mmap((void *)(uintptr_t)addr, (size_t)size, PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED_NOREPLACE, -1, 0);
-        if (p == MAP_FAILED &&
-            mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_READ | PROT_WRITE) != 0)
+        if (p == MAP_FAILED)
         {
-            ZLOGE("MapSharedMemory 现场映射失败（%#llx+%#llx）：%s", addr, size, strerror(errno));
+            ZLOGE("MapSharedMemory 现场映射失败（%#llx+%#llx，地址已被占）：%s",
+                  addr, size, strerror(errno));
             return 0;
         }
     }
@@ -401,15 +405,40 @@ int za_mem_unmap_shared(unsigned long long addr, unsigned long long size)
     if (addr < lo || addr + size > lo + ZA_MEM_ASLR_DECL)
         return 0;
     if (addr < lo + ZA_MEM_RESERVE)
+    {
         mprotect((void *)(uintptr_t)addr, (size_t)size, PROT_NONE);  // 收回成预留态
+    }
     else
-        munmap((void *)(uintptr_t)addr, (size_t)size);               // 现场映射的直接摘除
+    {
+        // ⚠ 2026-10-27：预留区外**只有我们自己映射过的**才能 munmap。
+        //   以前无条件 munmap(客机给的地址)：那段可能是 ART/libc 的映射，
+        //   摘掉之后 ART 再碰它就 SIGSEGV（真机实测 "Jit thread pool" 崩在
+        //   art::MemMapArenaPool::TrimMaps，寄存器里全是客机堆指针）。
+        if (za_mem_map_find(addr))
+            munmap((void *)(uintptr_t)addr, (size_t)size);
+        else
+            ZLOGE("UnmapSharedMemory 拒绝：%#llx+%#llx 不是我们映射的（不动宿主）", addr, size);
+    }
     za_mem_map_add(addr, 0, 0, 0);      /* size=0 ⇒ za_mem_map_find 当成没占用 */
     return 1;
 }
 
 // svc#44/#45 的登记：让 QueryMemory 把这块报成已映射（0x0B），
 // 否则客机分配器可能把同一段地址再分给别人。
+// 这段地址是不是**我们自己的预留区**里的。
+// ★ 2026-10-27 必需：svc#44/#45 以前在 MAP_FIXED_NOREPLACE 失败后无条件
+//   mprotect(客机给的地址)。如果那段地址其实是 ART / libc / 我们自己 .so 的
+//   映射，就等于把宿主的只读段改成可写、甚至（#45）改成 PROT_NONE ⇒
+//   ART 随后碰自己的代码/数据就 SIGSEGV（真机实测 "Jit thread pool" 线程
+//   在 libart+0x791558 解引用 null+0x10，进程被带走）。
+int za_mem_owns(unsigned long long addr, unsigned long long size)
+{
+    if (!g_as || !size) return 0;
+    unsigned long long lo = (unsigned long long)(uintptr_t)g_as;
+    unsigned long long hi = lo + ZA_MEM_RESERVE;
+    return addr >= lo && addr + size <= hi && addr + size >= addr;
+}
+
 void za_mem_note_mapping(unsigned long long addr, unsigned long long size, int on)
 {
     if (!g_as || !addr || !size) return;

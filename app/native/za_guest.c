@@ -1524,6 +1524,12 @@ void za_reinstall_signal_handlers(void)
 // 接管 32..62（63 留给 PC 采样器；SIGRTMIN=42 是 bionic 内部定时器，不抢）
 void za_install_rt_catch(void)
 {
+    // ★ sigaction 是**进程级**的，装一次就够；以前每次 svc 都重装一遍
+    //   （每秒上千次），和 ART 自己装/查处理器抢，真机上 ART 的
+    //   "Jit thread pool" 线程随后崩在 art::MemMapArenaPool::TrimMaps。
+    //   需要每次 svc 重做的只有**线程级**的信号掩码（SDK 会把实时信号段全屏蔽）。
+    static volatile int rt_installed;
+    if (__atomic_exchange_n(&rt_installed, 1, __ATOMIC_ACQ_REL)) return;
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
     sa.sa_sigaction = za_rt_catch;
@@ -3208,12 +3214,21 @@ static void za_pc_sample_handler(int sig, siginfo_t *info, void *ctx)
 // 每次 svc 之后重装采样信号（SDK 会把实时信号段全屏蔽掉）
 void za_reinstall_sampler_handler(void)
 {
-    struct sigaction sa;
-    memset(&sa, 0, sizeof sa);
-    sa.sa_sigaction = za_pc_sample_handler;
-    sa.sa_flags = SA_SIGINFO | SA_RESTART;
-    sigemptyset(&sa.sa_mask);
-    sigaction(ZA_SAMPLER_SIG, &sa, NULL);
+    // 同上：sigaction 只装一次（进程级），掩码每线程放行一次。
+    static volatile int sampler_installed;
+    static volatile unsigned char mask_done[128];
+    if (!__atomic_exchange_n(&sampler_installed, 1, __ATOMIC_ACQ_REL))
+    {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = za_pc_sample_handler;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&sa.sa_mask);
+        sigaction(ZA_SAMPLER_SIG, &sa, NULL);
+    }
+    int mi = (int)((unsigned long)syscall(SYS_gettid) % 128u);
+    if (mask_done[mi]) return;
+    mask_done[mi] = 1;
     sigset_t m;
     sigemptyset(&m);
     sigaddset(&m, ZA_SAMPLER_SIG);
