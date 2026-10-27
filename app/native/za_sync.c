@@ -237,8 +237,17 @@ unsigned long za_sync_arbitrate_lock(unsigned int owner, unsigned long long addr
     zs_unlock();
     {
         int slices = 0;
+        unsigned int first_word = __atomic_load_n(lock, __ATOMIC_ACQUIRE);
         for (;;) {
             if (zs_wait_granted(w, ZS_SLICE_NS)) break;
+            // ★ 陈旧持有者兜底：锁字 1 秒都没变过 ⇒ 持有者已经退出、或者它自己
+            //   卡在别的等待里（实测：等锁线程 tag=0x9，锁字 0x40000045，
+            //   持有者 tag 0x45 在等待表里根本不存在）。强制取得并报一次，
+            //   宁可短暂破坏互斥也不能让整条线永久停摆。
+            {
+                unsigned int cur = __atomic_load_n(lock, __ATOMIC_ACQUIRE);
+                if (cur != first_word) { first_word = cur; slices = 0; }
+            }
             // 分片超时：持有者可能走了用户态快路径直接清零（不发 svc#27）。
             // 这种情况我们自己抢下来，否则会永久睡死。
             {
@@ -369,6 +378,7 @@ void za_sync_dump(void)
     zs_lock();
     for (int i = 0; i < ZS_MAX; i++) {
         if (!__atomic_load_n(&zs_slots[i].tid, __ATOMIC_RELAXED)) continue;
+        if (zs_slots[i].kind == 0) continue;   // 已经不在等了（stale 槽位）
         tid[n] = zs_slots[i].tid;
         kind[n] = zs_slots[i].kind;
         granted[n] = zs_slots[i].granted;

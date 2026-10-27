@@ -3244,7 +3244,15 @@ static void *za_sampler_watchdog(void *arg)
                 //   游戏若因此继续推进 ⇒ 卡住的原因就是丢了一次唤醒；
                 //   若没反应 ⇒ 它在等真正的外部事件（vsync/GPU 完成等）。
                 unsigned pk = za_sync_poke_all();
-                if (pk && (no_progress % 2000) == 40) ZLOGE("   已对 %u 个条件变量等待者做伪唤醒", pk);
+                if (pk && (no_progress % 2000) == 40)
+                {
+                    ZLOGE("   已对 %u 个条件变量等待者做伪唤醒（累计 %d 次）", pk,
+                          no_progress / 40);
+                    // 每 10 秒（2000 tick）倒一次等待表 + 每个等待者的客机调用链，
+                    // 这是「主线程到底卡在哪个游戏函数」最直接的证据。
+                    za_sync_dump();
+                    za_nvn_dump_recent();   // 带客机 LR：最后几步 NVN 调用发生在哪
+                }
             }
             // ★ 2026-10-27：阈值 2000 → 12000。客人有**合法的长 memset**
             //   （sdk+0x56e450 就是 memset 的内层循环，初始化几百 MB 内存池时
