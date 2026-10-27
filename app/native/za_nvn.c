@@ -18,9 +18,11 @@
 // window 0x180 / texture 0xC0 / commandBuffer 0xA0 / memoryPool 0x100 / program 0xC0 /
 // sync 0x40 / event 0x40 / buffer 0x30 / sampler 0x30 / 各种 builder 0x40~0x80。
 // 我们的字段一律放在对象前 0x80 字节内，绝不会越过最小对象尺寸。
+#include <pthread.h>
 #include <stdint.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "za_common.h"
 #include "za_nvn.h"
@@ -231,6 +233,45 @@ void za_nvn_dump_recent(void)
     }
 }
 
+// ── 60Hz 帧驱动 + 帧循环计数 ─────────────────────────────────────────
+// 目的：① 给「GPU 侧会完成」一个真实的时间轴（同步对象/呈现计数随时间推进）；
+//       ② 用 submit/acquire/present 的计数直接判断游戏有没有进入帧循环。
+// ⚠ tick 线程**只碰宿主计数器**，不解引用任何客机对象 —— 那些对象可能已经被
+//   客机释放，从另一个线程解引用会随机炸（之前就吃过这种亏）。
+static volatile u64 za_nvn_submits, za_nvn_acquires, za_nvn_presents;
+static volatile u64 za_nvn_ticks;
+static volatile int za_nvn_tick_run;
+static pthread_t za_nvn_tick_th;
+static int za_nvn_tick_started;
+
+static void *za_nvn_tick_main(void *p)
+{
+    (void)p;
+    while (za_nvn_tick_run) {
+        struct timespec ts = { 0, 16666667 };
+        nanosleep(&ts, NULL);
+        za_nvn_ticks++;
+        if ((za_nvn_ticks % 300) == 0)
+            ZLOGI("★ NVN 帧驱动：%llu tick，submit=%llu acquire=%llu present=%llu",
+                  (unsigned long long)za_nvn_ticks, (unsigned long long)za_nvn_submits,
+                  (unsigned long long)za_nvn_acquires, (unsigned long long)za_nvn_presents);
+    }
+    return NULL;
+}
+
+static void za_nvn_tick_start(void)
+{
+    if (za_nvn_tick_started) return;
+    za_nvn_tick_started = 1;
+    za_nvn_tick_run = 1;
+    if (pthread_create(&za_nvn_tick_th, NULL, za_nvn_tick_main, NULL) != 0) {
+        za_nvn_tick_run = 0;
+        ZLOGE("NVN 帧驱动线程创建失败");
+    } else {
+        ZLOGI("★ NVN 帧驱动线程已启动（60Hz）");
+    }
+}
+
 static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6,
                            u64 a7);
 
@@ -420,6 +461,7 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     case ZA_NVN_ID_nvnQueueBuilderGetMemory:
         return is_obj(o) ? ld64(o, F_DEVICE) : 0;
     case ZA_NVN_ID_nvnQueueInitialize: {
+        za_nvn_tick_start();
         const void *b = (const void *)(uintptr_t)a1;
         init_obj(o, 0x2000);
         if (is_obj(b)) {
@@ -430,15 +472,22 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
         }
         return 1;
     }
+    case ZA_NVN_ID_nvnQueuePresentTexture:
+        za_nvn_presents++;
+        if (za_nvn_presents <= 4 || (za_nvn_presents % 120) == 0)
+            ZLOGI("★ NVN 呈现 #%llu", (unsigned long long)za_nvn_presents);
+        return 0;
     case ZA_NVN_ID_nvnQueueFinalize:
     case ZA_NVN_ID_nvnQueueFlush:
     case ZA_NVN_ID_nvnQueueFinish:
-    case ZA_NVN_ID_nvnQueuePresentTexture:
     case ZA_NVN_ID_nvnQueueGetError:
     case ZA_NVN_ID_nvnQueueResetMemoryUsageCounts:
         return 0;
     case ZA_NVN_ID_nvnQueueSubmitCommands:
-        ZLOGI("★ NVN 提交命令缓冲：%llu 个", (unsigned long long)a1);
+        za_nvn_submits++;
+        if (za_nvn_submits <= 4 || (za_nvn_submits % 120) == 0)
+            ZLOGI("★ NVN 提交命令缓冲 #%llu（本次 %llu 个）",
+                  (unsigned long long)za_nvn_submits, (unsigned long long)a1);
         return 0;
     case ZA_NVN_ID_nvnQueueGetTotalCommandMemoryUsed:
         return is_obj(o) ? ld64(o, F_MEMORY) : 0;
@@ -519,6 +568,9 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
         return 0;
     case ZA_NVN_ID_nvnWindowAcquireTexture: {
         // 结果 0 = SUCCESS（原实现返回 1 = NATIVE_ERROR，客机会当成失败）
+        za_nvn_acquires++;
+        if (za_nvn_acquires <= 4 || (za_nvn_acquires % 120) == 0)
+            ZLOGI("★ NVN 取帧贴图 #%llu", (unsigned long long)za_nvn_acquires);
         void *idx = (void *)(uintptr_t)a2;
         u32 ntex = is_obj(o) ? ld32(o, 0x20) : 0;
         u32 cur = is_obj(o) ? ld32(o, 0x2c) : 0;
