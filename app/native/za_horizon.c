@@ -2107,6 +2107,40 @@ void za_dump_ret_ring_for(long tid)
     }
 }
 
+// ★ 把所有线程的 svc 环形记录都倒出来（停摆诊断用）。
+//   za_dump_ret_ring_for(tid) 需要先知道 tid，而停摆时我们只知道「哪个 tag 在等」，
+//   所以直接遍历槽位：每个线程最近 4 条 svc 连着打，主线程一眼能认出来。
+void za_dump_all_ret_rings(void)
+{
+    int shown = 0;
+    for (unsigned i = 0; i < ZA_RR_SLOTS; i++)
+    {
+        za_rr_slot_t *s = &za_rr_slots[i];
+        long t = __atomic_load_n(&s->tid, __ATOMIC_ACQUIRE);
+        if (!t) continue;
+        unsigned h = __atomic_load_n(&s->head, __ATOMIC_RELAXED);
+        if (!h) continue;
+        int any = 0;
+        for (int k = 0; k < 4; k++)
+        {
+            int j = (int)((h - 1 - k + ZA_RR * 2) % ZA_RR);
+            if (s->e[j].nr || s->e[j].pc) { any = 1; break; }
+        }
+        if (!any) continue;
+        if (shown++ >= 24) break;
+        for (int k = 0; k < 4; k++)
+        {
+            int j = (int)((h - 1 - k + ZA_RR * 2) % ZA_RR);
+            za_rr_t *e = &s->e[j];
+            if (!e->pc && !e->nr) continue;
+            ZLOGI("    tid=%ld svc#%ld ret=%s%#lx pc=%#llx a0=%#llx a1=%#llx", t, e->nr,
+                  e->ret == 0xdeadL ? "(未返回)" : "", (unsigned long)e->ret, e->pc, e->a0,
+                  e->a1);
+        }
+    }
+    if (!shown) ZLOGI("    （没有任何线程的 svc 记录）");
+}
+
 void za_dump_ret_ring(void)
 {
     za_rr_slot_t *s = za_rr_cur();
