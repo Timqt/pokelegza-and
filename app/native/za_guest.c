@@ -941,6 +941,43 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
             }
         }
+        // main 的单例缓存槽（0x3d99000+0x3e0/0x3e8，guard 0x3f0）：
+        // 崩溃点 main+0x11ce34 是对 [obj+0x10] 的虚调用，obj 的 vtable 为 0。
+        {
+            extern unsigned char *za_guest_base;
+            if (za_guest_base)
+            {
+                unsigned long long g = (unsigned long long)(uintptr_t)za_guest_base + 0x3d99000ull;
+                unsigned long long a = 0, b = 0;
+                unsigned char flag = 0;
+                memcpy(&a, (const void *)(uintptr_t)(g + 0x3e0), 8);
+                memcpy(&b, (const void *)(uintptr_t)(g + 0x3e8), 8);
+                memcpy(&flag, (const void *)(uintptr_t)(g + 0x3f0), 1);
+                char *p = buf;
+                p = za_put_str(p, "ZaGuest: GUARD 0x3d99000: [+3e0]=");
+                p = za_put_hex(p, a);
+                p = za_put_str(p, " [+3e8]=");
+                p = za_put_hex(p, b);
+                p = za_put_str(p, " flag=");
+                p = za_put_hex(p, flag);
+                if (b)
+                {
+                    unsigned long long v0 = 0, v1 = 0;
+                    memcpy(&v0, (const void *)(uintptr_t)b, 8);
+                    memcpy(&v1, (const void *)(uintptr_t)(b + 8), 8);
+                    p = za_put_str(p, " obj[0]=");
+                    p = za_put_hex(p, v0);
+                    p = za_put_str(p, " obj[8]=");
+                    p = za_put_hex(p, v1);
+                }
+                {
+                    const char nl[2] = { 10, 0 };
+                    p = za_put_str(p, nl);
+                }
+                za_fatal_write(buf, (size_t)(p - buf));
+            }
+        }
+
         // 宿主 PC 附近的机器码：宿主库里崩了也能看出是哪条指令
         if (pc >= 0x10000)
         {
