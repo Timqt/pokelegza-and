@@ -870,6 +870,7 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                         if (!za_read_bytes(spx + (unsigned long)k * 8, &v, 8)) break;
                         ZLOGE("    sp+%#x = %#llx", k * 8, v);
                     }
+                    za_nvn_dump_recent();   /* 最后一次 NVN 调用的客机 LR 就在这里 */
                     for (int k = 0; k < 31; k++)
                         ZLOGE("    x%d = %#llx", k,
                               (unsigned long long)((ucontext_t *)ctx)->uc_mcontext.regs[k]);

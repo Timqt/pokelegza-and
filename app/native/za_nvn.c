@@ -160,14 +160,20 @@ void *za_nvn_lookup(const char *name)
 }
 
 // ── 派发 ──────────────────────────────────────────────────────────────
-static u64 za_nvn_call(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7);
+// ⚠ 带 guest_lr：客机调我们时 x30 就是「它下一步要执行的地方」。崩溃发生在
+//   某个 NVN 调用**返回之后**时，仅凭调用名看不出客机在做什么；有了 LR 就能
+//   直接反汇编那条 `blr` 后面的几条指令。
+static u64 za_nvn_call(int id, unsigned long guest_lr, u64 a0, u64 a1, u64 a2, u64 a3,
+                       u64 a4, u64 a5, u64 a6, u64 a7);
 
 // 每个入口一个函数：地址稳定、名字可查（客机只会拿指针调用）。
 #define ZA_NVN_FN_DEF(n)                                                                 \
     static u64 za_nvn_fn_##n(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6,      \
                              u64 a7)                                                       \
     {                                                                                      \
-        return za_nvn_call(ZA_NVN_ID_##n, a0, a1, a2, a3, a4, a5, a6, a7);                 \
+        unsigned long lr;                                                                   \
+        __asm__ __volatile__("mov %0, x30" : "=r"(lr));                                     \
+        return za_nvn_call(ZA_NVN_ID_##n, lr, a0, a1, a2, a3, a4, a5, a6, a7);             \
     }
 ZA_NVN_ENUM(ZA_NVN_FN_DEF)
 #undef ZA_NVN_FN_DEF
@@ -194,6 +200,7 @@ static u64 za_nvn_unknown_impl(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
 #define ZA_NVN_HIST 64
 typedef struct {
     unsigned id;
+    unsigned long lr;     /* 客机侧返回地址（= 客机那条 blr 的下一条） */
     u64 a0, a1, ret;
 } za_nvn_hist_t;
 static za_nvn_hist_t za_nvn_hist[ZA_NVN_HIST];
@@ -206,20 +213,22 @@ void za_nvn_dump_recent(void)
     for (unsigned k = 0; k < n; k++) {
         unsigned i = (za_nvn_hist_n - n + k) % ZA_NVN_HIST;
         const za_nvn_hist_t *h = &za_nvn_hist[i];
-        ZLOGI("    %s(a0=%#llx a1=%#llx) -> %#llx", za_nvn_name[h->id],
+        ZLOGI("    %s(a0=%#llx a1=%#llx) -> %#llx  lr=%#lx", za_nvn_name[h->id],
               (unsigned long long)h->a0, (unsigned long long)h->a1,
-              (unsigned long long)h->ret);
+              (unsigned long long)h->ret, h->lr);
     }
 }
 
 static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6,
                            u64 a7);
 
-static u64 za_nvn_call(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7)
+static u64 za_nvn_call(int id, unsigned long guest_lr, u64 a0, u64 a1, u64 a2, u64 a3,
+                       u64 a4, u64 a5, u64 a6, u64 a7)
 {
     u64 r = za_nvn_dispatch(id, a0, a1, a2, a3, a4, a5, a6, a7);
     za_nvn_hist_t *h = &za_nvn_hist[za_nvn_hist_n % ZA_NVN_HIST];
     h->id = (unsigned)id;
+    h->lr = guest_lr;
     h->a0 = a0;
     h->a1 = a1;
     h->ret = r;
@@ -437,102 +446,106 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     }
 
     // ── 窗口 ──────────────────────────────────────────────────────────
+    // ⚠ NVNwindowBuilder 也是 0x40 字节、且客机常放在栈上（与 sampler builder
+    //   同一类风险：写超过 0x40 会改掉保存的 x29/x30 ⇒ ret 跳飞）。
+    //   紧凑布局：0x00 magic / 0x08 device / 0x10 nativeWindow / 0x18 textures
+    //             0x20 numTextures / 0x24 presentInterval / 0x28 numActive
     case ZA_NVN_ID_nvnWindowBuilderSetDefaults:
-        init_obj(o, 0x40);
-        st32(o, F_LEVELS, 1);  // numActiveTextures 默认 1
-        st32(o, F_SAMPLES, 1); // presentInterval 默认 1
+        memset(o, 0, 0x40);
+        st32(o, F_MAGIC, M_MAGIC);
+        st32(o, 0x24, 1);   // presentInterval
+        st32(o, 0x28, 1);   // numActiveTextures
         return 0;
     case ZA_NVN_ID_nvnWindowBuilderSetDevice:
-        if (is_obj(o)) st64(o, F_DEVICE, a1);
+        if (is_obj(o)) st64(o, 0x08, a1);
         return 0;
     case ZA_NVN_ID_nvnWindowBuilderSetNativeWindow:
-        if (is_obj(o)) st64(o, F_MEMORY, a1);
+        if (is_obj(o)) st64(o, 0x10, a1);
         return 0;
     case ZA_NVN_ID_nvnWindowBuilderSetTextures:
         if (is_obj(o)) {
-            st64(o, F_POOL, a1);
-            st32(o, F_FLAGS2, (u32)a2);
+            st64(o, 0x18, a1);
+            st32(o, 0x20, (u32)a2);
         }
         return 0;
     case ZA_NVN_ID_nvnWindowBuilderSetPresentInterval:
-        if (is_obj(o)) st32(o, F_SAMPLES, (u32)a1);
+        if (is_obj(o)) st32(o, 0x24, (u32)a1);
         return 0;
     case ZA_NVN_ID_nvnWindowBuilderSetNumActiveTextures:
-        if (is_obj(o)) st32(o, F_LEVELS, (u32)a1);
+        if (is_obj(o)) st32(o, 0x28, (u32)a1);
         return 0;
     case ZA_NVN_ID_nvnWindowBuilderGetDevice:
-        return is_obj(o) ? ld64(o, F_DEVICE) : 0;
+        return is_obj(o) ? ld64(o, 0x08) : 0;
     case ZA_NVN_ID_nvnWindowBuilderGetNumTextures:
-        return is_obj(o) ? ld32(o, F_FLAGS2) : 0;
+        return is_obj(o) ? ld32(o, 0x20) : 0;
     case ZA_NVN_ID_nvnWindowBuilderGetTexture: {
         u64 base;
         if (!is_obj(o)) return 0;
-        base = ld64(o, F_POOL);
+        base = ld64(o, 0x18);
         return base ? ld64((const void *)(uintptr_t)base, (u32)(a1 * 8)) : 0;
     }
     case ZA_NVN_ID_nvnWindowBuilderGetNativeWindow:
-        return is_obj(o) ? ld64(o, F_MEMORY) : 0;
+        return is_obj(o) ? ld64(o, 0x10) : 0;
     case ZA_NVN_ID_nvnWindowBuilderGetPresentInterval:
-        return is_obj(o) ? ld32(o, F_SAMPLES) : 1;
+        return is_obj(o) ? ld32(o, 0x24) : 1;
     case ZA_NVN_ID_nvnWindowBuilderGetNumActiveTextures:
-        return is_obj(o) ? ld32(o, F_LEVELS) : 1;
+        return is_obj(o) ? ld32(o, 0x28) : 1;
     case ZA_NVN_ID_nvnWindowInitialize: {
         const void *b = (const void *)(uintptr_t)a1;
         init_obj(o, 0x180);
         if (is_obj(b)) {
-            st64(o, F_DEVICE, ld64(b, F_DEVICE));
-            st64(o, F_MEMORY, ld64(b, F_MEMORY));
-            st64(o, F_POOL, ld64(b, F_POOL));
-            st32(o, F_FLAGS2, ld32(b, F_FLAGS2));
-            st32(o, F_LEVELS, ld32(b, F_LEVELS));
-            st32(o, F_SAMPLES, ld32(b, F_SAMPLES));
+            st64(o, 0x08, ld64(b, 0x08));          // device
+            st64(o, 0x10, ld64(b, 0x10));          // nativeWindow
+            st64(o, 0x18, ld64(b, 0x18));          // textures
+            st32(o, 0x20, ld32(b, 0x20));          // numTextures
+            st32(o, 0x24, ld32(b, 0x24));          // presentInterval
+            st32(o, 0x28, ld32(b, 0x28));          // numActiveTextures
         }
         return 1;
     }
     case ZA_NVN_ID_nvnWindowFinalize:
         return 0;
     case ZA_NVN_ID_nvnWindowAcquireTexture: {
-        // 原型：NVNwindowAcquireTextureResult nvnWindowAcquireTexture(NVNwindow*, NVNsync*, int*)
-        // 结果 0 = SUCCESS（之前返回 1 = NATIVE_ERROR，客机会当成取图失败）。
+        // 结果 0 = SUCCESS（原实现返回 1 = NATIVE_ERROR，客机会当成失败）
         void *idx = (void *)(uintptr_t)a2;
-        u32 ntex = is_obj(o) ? ld32(o, F_FLAGS2) : 0;
-        u32 cur = is_obj(o) ? ld32(o, F_W) : 0;
+        u32 ntex = is_obj(o) ? ld32(o, 0x20) : 0;
+        u32 cur = is_obj(o) ? ld32(o, 0x2c) : 0;
         if (idx) st32(idx, 0, ntex ? (cur % ntex) : 0);
-        if (is_obj(o)) st32(o, F_W, cur + 1);
+        if (is_obj(o)) st32(o, 0x2c, cur + 1);
         return 0;
     }
     case ZA_NVN_ID_nvnWindowGetNativeWindow:
-        return is_obj(o) ? ld64(o, F_MEMORY) : 0;
+        return is_obj(o) ? ld64(o, 0x10) : 0;
     case ZA_NVN_ID_nvnWindowGetPresentInterval:
-        return is_obj(o) ? ld32(o, F_SAMPLES) : 1;
+        return is_obj(o) ? ld32(o, 0x24) : 1;
     case ZA_NVN_ID_nvnWindowSetPresentInterval:
-        if (is_obj(o)) st32(o, F_SAMPLES, (u32)a1);
+        if (is_obj(o)) st32(o, 0x24, (u32)a1);
         return 0;
     case ZA_NVN_ID_nvnWindowSetCrop:
         if (is_obj(o)) {
-            st32(o, F_H, (u32)a1);
-            st32(o, F_D, (u32)a2);
-            st32(o, F_W, (u32)a3);
-            st32(o, F_FORMAT, (u32)a4);
+            st32(o, 0x30, (u32)a1);
+            st32(o, 0x34, (u32)a2);
+            st32(o, 0x38, (u32)a3);
+            st32(o, 0x3c, (u32)a4);
         }
         return 0;
     case ZA_NVN_ID_nvnWindowGetCrop: {
         void *r = (void *)(uintptr_t)a1;
         if (is_obj(o) && r) {
-            st32(r, 0, ld32(o, F_H));
-            st32(r, 4, ld32(o, F_D));
-            st32(r, 8, ld32(o, F_W));
-            st32(r, 12, ld32(o, F_FORMAT));
+            st32(r, 0, ld32(o, 0x30));
+            st32(r, 4, ld32(o, 0x34));
+            st32(r, 8, ld32(o, 0x38));
+            st32(r, 12, ld32(o, 0x3c));
         }
         return 0;
     }
     case ZA_NVN_ID_nvnWindowSetNumActiveTextures:
-        if (is_obj(o)) st32(o, F_LEVELS, (u32)a1);
+        if (is_obj(o)) st32(o, 0x28, (u32)a1);
         return 0;
     case ZA_NVN_ID_nvnWindowGetNumActiveTextures:
-        return is_obj(o) ? ld32(o, F_LEVELS) : 1;
+        return is_obj(o) ? ld32(o, 0x28) : 1;
     case ZA_NVN_ID_nvnWindowGetNumTextures:
-        return is_obj(o) ? ld32(o, F_FLAGS2) : 0;
+        return is_obj(o) ? ld32(o, 0x20) : 0;
 
     // ── 纹理 ──────────────────────────────────────────────────────────
     case ZA_NVN_ID_nvnTextureBuilderSetDefaults:
@@ -704,54 +717,30 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     }
 
     // ── 采样器 ────────────────────────────────────────────────────────
+    // ★★ NVNsamplerBuilder 在这套 SDK 里只有 **0x40 字节**，而且客机把它放在
+    //    栈上：`sub sp,#0x90; stp x29,x30,[sp,#0x50]; ... add x0,sp,#0x10`
+    //    ⇒ builder 占 sp+0x10..sp+0x4f，往 0x40 之外写会直接改掉保存的
+    //    x29/x30/x24/x23（真机实测：写 0x60 字节后 ret 跳到 pc=0）。
+    //    所以这里**只保留 magic + device**，其余 setter 一律不落盘：
+    //    Initialize 只认这两个字段，Get 系返回 0（客机只拿来回填 builder）。
     case ZA_NVN_ID_nvnSamplerBuilderSetDefaults:
-        init_obj(o, 0x60);
+        memset(o, 0, 0x40);
+        st32(o, F_MAGIC, M_MAGIC);
         return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetDevice:
         if (is_obj(o)) st64(o, F_DEVICE, a1);
         return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetMinMagFilter:
-        if (is_obj(o)) st32(o, F_FLAGS, (u32)a1);
-        return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetWrapMode:
-        if (is_obj(o)) {
-            st32(o, F_FLAGS2, (u32)a1);
-            st32(o, F_W, (u32)a2);
-            st32(o, F_H, (u32)a3);
-        }
-        return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetLodClamp:
-        if (is_obj(o)) {
-            st32(o, F_D, (u32)a1);
-            st32(o, F_LEVELS, (u32)a2);
-        }
-        return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetLodBias:
-        st64(o, F_OFFSET, a1); // float 位模式，原样存
-        return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetCompare:
-        if (is_obj(o)) st32(o, F_FORMAT, (u32)a1);
-        return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetBorderColor:
-        if (is_obj(o)) memcpy((char *)o + F_SAMPLES, (const void *)(uintptr_t)a1, 16);
-        return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetBorderColori:
     case ZA_NVN_ID_nvnSamplerBuilderSetBorderColorui:
-        if (is_obj(o)) {
-            st32(o, F_SAMPLES, (u32)a1);
-            st32(o, F_SAMPLES + 4, (u32)a2);
-            st32(o, F_SAMPLES + 8, (u32)a3);
-            st32(o, F_SAMPLES + 12, (u32)a4);
-        }
-        return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetMaxAnisotropy:
-        st64(o, F_ADDR, a1);
-        return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetReductionFilter:
-        if (is_obj(o)) st32(o, F_TARGET, (u32)a1);
-        return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetLodSnap:
-        st64(o, F_EXTRA, a1);
         return 0;
     case ZA_NVN_ID_nvnSamplerBuilderGetDevice:
     case ZA_NVN_ID_nvnSamplerBuilderGetMinMagFilter:
@@ -765,13 +754,14 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     case ZA_NVN_ID_nvnSamplerBuilderGetMaxAnisotropy:
     case ZA_NVN_ID_nvnSamplerBuilderGetReductionFilter:
     case ZA_NVN_ID_nvnSamplerBuilderGetLodSnap:
-        // 采样器 getter 用不到，返回 0 即可（客机只会拿它回填另一个 builder）。
-        return 0;
+        return is_obj(o) ? ld64(o, F_DEVICE) : 0;
     case ZA_NVN_ID_nvnSamplerInitialize:
+        // NVNsampler = 0x30 字节（客机给的是堆对象，尺寸够）
         init_obj(o, 0x30);
-        if (is_obj((const void *)(uintptr_t)a1))
-            memcpy(o, (const void *)(uintptr_t)a1, 0x30);
-        st32(o, F_MAGIC, M_MAGIC);
+        if (is_obj((const void *)(uintptr_t)a1)) {
+            st64(o, F_DEVICE, ld64((const void *)(uintptr_t)a1, F_DEVICE));
+            st32(o, F_MAGIC, M_MAGIC);
+        }
         return 1;
     case ZA_NVN_ID_nvnSamplerFinalize:
         return 0;
@@ -784,30 +774,31 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
         if (is_obj(o)) st64(o, F_DEVICE, a1);
         return 0;
     case ZA_NVN_ID_nvnBufferBuilderSetStorage:
+        // 紧凑布局（NVNbufferBuilder = 0x40，同样可能是栈对象）
         if (is_obj(o)) {
-            st64(o, F_POOL, a1);
-            st64(o, F_POOLOFF, a2);
-            st64(o, F_SIZE, a3);
+            st64(o, 0x10, a1);   // memoryPool
+            st64(o, 0x18, a2);   // offset
+            st64(o, 0x20, a3);   // size
         }
         return 0;
     case ZA_NVN_ID_nvnBufferBuilderGetDevice:
         return is_obj(o) ? ld64(o, F_DEVICE) : 0;
     case ZA_NVN_ID_nvnBufferBuilderGetMemoryPool:
-        return is_obj(o) ? ld64(o, F_POOL) : 0;
+        return is_obj(o) ? ld64(o, 0x10) : 0;
     case ZA_NVN_ID_nvnBufferBuilderGetMemoryOffset:
-        return is_obj(o) ? ld64(o, F_POOLOFF) : 0;
+        return is_obj(o) ? ld64(o, 0x18) : 0;
     case ZA_NVN_ID_nvnBufferBuilderGetSize:
-        return is_obj(o) ? ld64(o, F_SIZE) : 0;
+        return is_obj(o) ? ld64(o, 0x20) : 0;
     case ZA_NVN_ID_nvnBufferInitialize: {
         const void *b = (const void *)(uintptr_t)a1;
         u64 pool, off;
         init_obj(o, 0x30);
         if (!is_obj(b)) return 1;
-        pool = ld64(b, F_POOL);
-        off = ld64(b, F_POOLOFF);
+        pool = ld64(b, 0x10);
+        off = ld64(b, 0x18);
         st64(o, F_POOL, pool);
         st64(o, F_POOLOFF, off);
-        st64(o, F_SIZE, ld64(b, F_SIZE));
+        st64(o, F_SIZE, ld64(b, 0x20));
         st32(o, F_FLAGS, ld32(b, F_FLAGS));
         st64(o, F_ADDR, is_obj((const void *)(uintptr_t)pool)
                             ? ld64((const void *)(uintptr_t)pool, F_ADDR) + off
