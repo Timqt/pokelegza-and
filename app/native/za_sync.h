@@ -17,6 +17,9 @@ unsigned long za_sync_signal_key(unsigned long long key, int count);
 // 对所有条件变量等待者做一次合法伪唤醒；返回被唤醒的线程数。
 unsigned za_sync_poke_all(void);
 
+// 记录进 svc#28 时的客机 sp / x30（等待点调用链用）
+void za_sync_note_guest(unsigned long long sp, unsigned long long pc);
+
 // 打印等待表快照（诊断用）
 void za_sync_dump(void);
 

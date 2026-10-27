@@ -1,3 +1,9 @@
+// process_vm_readv 要 _GNU_SOURCE（bionic 的 <sys/uio.h> 才声明它）
+// ⚠ 必须在任何系统头文件之前定义
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+
 // Horizon 的「锁交接 + 条件变量」内核模拟（svc#26/#27/#28/#29）。
 //
 // 为什么独立成文件、且**不用 pthread 锁/条件变量**：
@@ -33,8 +39,42 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <sys/uio.h>
+
 #include "za_common.h"
 #include "za_sync.h"
+#include "za_guest_info.h"
+
+// za_guest.c / za_sdk.c：客机映像的范围（用来把地址翻译成 main+0x… / sdk+0x…）
+extern unsigned char *za_guest_base;
+extern volatile unsigned long za_sdk_base, za_sdk_size;
+
+static int za_sync_read(void *dst, unsigned long long addr, size_t len)
+{
+    struct iovec l = { dst, len }, r = { (void *)(uintptr_t)addr, len };
+    return process_vm_readv((pid_t)syscall(SYS_getpid), &l, 1, &r, 1, 0) == (ssize_t)len;
+}
+
+// 从客机 sp 往上扫，打印前 4 个落在 main/sdk 映像里的返回地址。
+// 这是「主线程到底卡在哪个游戏函数」最直接的证据：x29 我们拿不到
+// （svc 门只存 x8..x18/x30），但帧里的返回地址一定在栈上。
+static void za_sync_dump_guest_chain(unsigned long long sp, unsigned long long pc)
+{
+    extern unsigned char *za_guest_base;
+    unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+    ZLOGI("      客机等待点 x30=%s%#llx",
+          (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? "main+" :
+          (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? "sdk+" : "",
+          (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? pc - mb
+              : (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? pc - za_sdk_base : pc);
+    int hits = 0;
+    for (int k = 0; k < 96 && hits < 4; k++) {
+        unsigned long long v = 0;
+        if (!za_sync_read(&v, sp + (unsigned long)k * 8, 8)) break;
+        if (v >= mb && v < mb + ZA_IMAGE_SIZE) { ZLOGI("        main+%#llx", v - mb); hits++; }
+        else if (v >= za_sdk_base && v < za_sdk_base + za_sdk_size) { ZLOGI("        sdk+%#llx", v - za_sdk_base); hits++; }
+    }
+}
 
 // za_horizon.c：按 tid 倒出 svc 环形记录（阻塞中的那条 ret 是哨兵 0xdead）
 void za_dump_ret_ring_for(long tid);
@@ -61,6 +101,7 @@ typedef struct {
     unsigned long long addr;      // 锁地址
     unsigned long long key;       // 条件键地址
     unsigned int tag;             // 我的 tag
+    unsigned long long gsp, gpc;  // 进 svc#28 时的客机 sp / x30（等待点调用链用）
 } zs_slot_t;
 
 static zs_slot_t zs_slots[ZS_MAX];
@@ -309,12 +350,21 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
 }
 
 // 等待表快照（看门狗/崩溃诊断用）：谁在等哪把锁/哪个条件键。
+// 记录「进等待时的客机 sp / x30」——等待表里据此扫栈找客机返回地址。
+void za_sync_note_guest(unsigned long long sp, unsigned long long pc)
+{
+    zs_slot_t *w = zs_self();
+    w->gsp = sp;
+    w->gpc = pc;
+}
+
 void za_sync_dump(void)
 {
     long tid[ZS_MAX];
     int kind[ZS_MAX], granted[ZS_MAX];
     unsigned long long addr[ZS_MAX], key[ZS_MAX];
     unsigned int tag[ZS_MAX], word[ZS_MAX];
+    unsigned long long gsp[ZS_MAX], gpc[ZS_MAX];
     int n = 0;
     zs_lock();
     for (int i = 0; i < ZS_MAX; i++) {
@@ -326,6 +376,8 @@ void za_sync_dump(void)
         key[n] = zs_slots[i].key;
         tag[n] = zs_slots[i].tag;
         word[n] = addr[n] ? __atomic_load_n((unsigned int *)(uintptr_t)addr[n], __ATOMIC_RELAXED) : 0;
+        gsp[n] = zs_slots[i].gsp;
+        gpc[n] = zs_slots[i].gpc;
         n++;
     }
     zs_unlock();
@@ -335,6 +387,8 @@ void za_sync_dump(void)
         ZLOGI("    tid=%ld kind=%d granted=%d lock=%#llx(word=%#x) key=%#llx tag=%#x",
               tid[i], kind[i], granted[i], addr[i], word[i], key[i], tag[i]);
         if (kind[i] == 2) za_dump_ret_ring_for(tid[i]);   // 它最后几条 svc
+        // 客机侧调用链：x30 + 从 sp 往上扫到的前 4 个映像内返回地址
+        if (kind[i] == 2 && i < 4 && gsp[i]) za_sync_dump_guest_chain(gsp[i], gpc[i]);
     }
 }
 

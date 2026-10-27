@@ -1321,6 +1321,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     case 27: // ArbitrateUnlock(lockaddr=x0)
         return (long)za_sync_arbitrate_unlock((unsigned long long)a0);
     case 28: // WaitProcessWideKeyAtomic(lockaddr=x0, condkey=x1, tag=w2, timeout=x3)
+        za_sync_note_guest((unsigned long long)za_horizon_regs[ZA_REG_SP],
+                           (unsigned long long)za_horizon_regs[ZA_REG_PC]);
         return (long)za_sync_wait_key((unsigned long long)a0, (unsigned long long)a1,
                                       (unsigned int)a2, (long long)a3);
     case 29: // SignalProcessWideKey(condkey=x0, count=w1)
@@ -2087,8 +2089,11 @@ static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
     //   （SIGALRM 定时器）会被挡掉 ⇒ 崩溃时拿不到客机真正的 PC。
     //   ⇒ 每次 svc 调用时把采样信号重新放行（一次 sigprocmask，代价可忽略）。
     {
-        static __thread int last_mask = -1;
-        if (last_mask != 1)
+        // ⚠ 不用 `__thread`（emutls 的每线程块要靠 realloc，真机上被写坏过
+        //   ⇒ scudo realloc 报 chunk header 损坏）。按 tid 取模记一个布尔。
+        static volatile unsigned char last_mask_done[128];
+        int lm_idx = (int)((unsigned long)syscall(SYS_gettid) % 128u);
+        if (!last_mask_done[lm_idx])
         {
             sigset_t m;
             sigemptyset(&m);
@@ -2096,7 +2101,7 @@ static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
             sigaddset(&m, SIGUSR1); sigaddset(&m, SIGRTMIN);
             sigaddset(&m, SIGTERM); sigaddset(&m, 63);
             pthread_sigmask(SIG_UNBLOCK, &m, NULL);
-            last_mask = 1;
+            last_mask_done[lm_idx] = 1;
         }
         // ★ SDK 初始时会把自己的信号拜码设成「忇以换捉」
         //   ⇒ 每次 svc 都重新装一遍 32..62 的捕获器，并把整个实时信号段放行。

@@ -333,13 +333,18 @@ const char **za_os_get_host_argv(void) { return (const char **)za_os_argv_storag
 // 所以这个符号会落到自动桩 —— 桩返回 NULL ⇒ 客机拿 NULL 当 errno 指针去写
 // ⇒ 崩在「对 NULL 对象调虚函数」那种地方。
 //
-// 这里自己实现：每线程一个 errno 槽（__thread 在我们这儿是安全的，
-// 因为我们不再改 TPIDR_EL0，bionic 的 TLS 完好）。
-static __thread int za_errno_slot;
+// 这里自己实现：每线程一个 errno 槽。
+// ⚠ 不用 `__thread`：本工程 .so 的 `__thread` 走 **emutls**
+//   （__emutls_get_address），每次访问都要 malloc/realloc 一块每线程存储，
+//   而那块表的表项在真机上被写坏过 ⇒ scudo_realloc 报 chunk header 损坏
+//   （backtrace: __emutls_get_address → realloc → abort）。改成按 tid 取模的数组。
+#define ZA_ERRNO_SLOTS 128
+static int za_errno_slots[ZA_ERRNO_SLOTS];
 
 void *za_os_errno_location(void)
 {
-    return &za_errno_slot;
+    long tid = syscall(SYS_gettid);
+    return &za_errno_slots[(unsigned long)tid % ZA_ERRNO_SLOTS];
 }
 
 // Switch 的 musl DSO 初始化：宿主侧已经提供了 libc 与 TLS，
