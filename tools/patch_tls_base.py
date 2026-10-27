@@ -94,6 +94,12 @@ def main():
     # 所有写 TPIDR_EL0 的地方一律 NOP（SDK 与 main 分开成两张表，方便各自应用）
     sdk_write_patch = sorted((off, NOP) for off, _ in sdk_writes)
     main_write_patch = sorted((off, NOP) for off, _ in main_writes)
+    # ★ 2026-10-27：nn::os::SetThreadLocalStoragePointer（sdk+0x99218）除了写寄存器，
+    #   还把参数存进 [TPIDRRO+0x1f0]。那个槽我们当成「本线程 TPIDR_EL0」，由宿主
+    #   写成自备零区（TP-0x18 是 fs 模块的每线程链表头）。客机把它改回 bionic 的 TP
+    #   后，链表头就落进 bionic TCB ⇒ 插入时写坏 TLS/只读页 ⇒ 崩在 libc
+    #   （真机实测 addr=0x70abea8fe0）。⇒ 这条 store（str x22,[x8,#0x1f0]）也 NOP。
+    sdk_write_patch = sorted(sdk_write_patch + [(0x99220, NOP)])
 
     with open(OUT_H, "w", encoding="utf-8", newline="\n") as o:
         o.write("// 自动生成：tools/patch_tls_base.py —— 别手改\n")

@@ -53,6 +53,7 @@
 #include "za_guest_api.h"
 #include "za_os.h"
 #include "za_nvn.h"
+#include "za_sync.h"
 #include "za_vi.h"
 
 // ── 客机映像布局（来自 za_guest_info.h，实测值）────────────────────────
@@ -828,6 +829,42 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 q = za_put_str(q, "（交回原处理器）\n");
                 za_fatal_write(b, (size_t)(q - b));
             }
+            // ★ 2026-10-27：pc=0 / x30=0 / addr=0 —— 这是一个**线程从地址 0 开始执行**
+            //   的特征（线程入口为空），不是普通空指针调用。它没有客机描述符，
+            //   以前直接交回 SIG_DFL 把整个进程带走，什么都看不到。
+            //   这里补上 sp / TP / [TP+0x40]，然后**挂起**该线程而不是杀掉进程：
+            //   其余线程还能继续跑，便于继续观察游戏走到哪一步。
+            if (ctx)
+            {
+                unsigned long pcx = (unsigned long)((ucontext_t *)ctx)->uc_mcontext.pc;
+                unsigned long spx = (unsigned long)((ucontext_t *)ctx)->uc_mcontext.sp;
+                unsigned long lrx = (unsigned long)((ucontext_t *)ctx)->uc_mcontext.regs[30];
+                if (pcx == 0 && lrx == 0)
+                {
+                    unsigned long tpx = 0;
+                    unsigned long long slot = 0;
+                    __asm__ __volatile__("mrs %0, TPIDR_EL0" : "=r"(tpx));
+                    if (tpx > 0x10000) memcpy(&slot, (void *)(uintptr_t)(tpx + 0x40), 8);
+                    {
+                        char b[200];
+                        char *q = b;
+                        q = za_put_str(q, "ZaGuest: 线程从 0 开始执行 tid=");
+                        q = za_put_dec(q, (unsigned long long)syscall(SYS_gettid));
+                        q = za_put_str(q, " sp=");
+                        q = za_put_hex(q, (unsigned long long)spx);
+                        q = za_put_str(q, " tp=");
+                        q = za_put_hex(q, (unsigned long long)tpx);
+                        q = za_put_str(q, " desc=");
+                        q = za_put_hex(q, slot);
+                        q = za_put_str(q, " ⇒ 挂起该线程（不杀进程）\n");
+                        za_fatal_write(b, (size_t)(q - b));
+                    }
+                    ZLOGE("★ 线程从 0 开始执行（tid=%ld sp=%#lx tp=%#lx desc=%#llx）"
+                          " ⇒ 挂起，保住进程",
+                          (long)syscall(SYS_gettid), spx, tpx, slot);
+                    for (;;) pause();
+                }
+            }
             if (sig > 0 && sig < 64 && za_fatal_prev_ok[sig])
             {
                 struct sigaction *o = &za_fatal_prev[sig];
@@ -866,6 +903,13 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
     {
         static const char tag[] = "ZaGuest: FATAL-ENTER\n";
         za_fatal_write(tag, sizeof tag - 1);
+    }
+    // ★ NVN 调用历史：NVN 入口平时每种只记前两次，崩在 NVN 初始化中段时
+    //   没有这份记录就只能靠猜最后走到哪一步。这里用宿主日志（非信号安全
+    //   路径里已经这么干过），且只打一次。
+    {
+        static int nvn_dumped;
+        if (!nvn_dumped) { nvn_dumped = 1; za_nvn_dump_recent(); }
     }
     unsigned long off = pc;
     const char *rel = "?";
@@ -1756,6 +1800,21 @@ void za_os_install_tls_descriptor(void)
         for (unsigned i = 0; i < sizeof ptr_slots / sizeof ptr_slots[0]; i++)
             *(unsigned long long *)(ro + ptr_slots[i]) = p2;
         *(unsigned long long *)(ro + 0x1f0) = (unsigned long long)(uintptr_t)b;
+        // ★★ [ro+0x1f0] 是「本线程 TPIDR_EL0」。`msr TPIDR_EL0` 的站点已全部
+        //   NOP 掉（见 za_tlsbase_patch.h），所以这个槽**只作为数据**被 SDK 读。
+        //   关键是 fs 模块拿它算 `TP - 0x18` 当每线程链表头：
+        //     sdk+0x98344: mrs x8,TPIDRRO_EL0 / ldr x8,[x8,#0x1f0]
+        //                  sub x0,x8,#0x18 / bl 97940   ← 往链表插入
+        //   以前这里放的是 bionic 的 TP ⇒ 链表头落进 bionic TCB，插入时把
+        //   bionic TLS 写坏，崩在 libc（pc=syscall+0x28，x20=TP-0x18）。
+        //   ⇒ 给客机一块**自己的** 0x200 字节零区，TP 指向它的 +0x18：
+        //     TP-0x18 = 块基址（可写、每线程、与 bionic 无关）。
+        {
+            unsigned char *tpblk = (unsigned char *)hdr + 0x800;
+            memset(tpblk, 0, 0x200);
+            *(unsigned long long *)(ro + 0x1f0) =
+                (unsigned long long)(uintptr_t)(tpblk + 0x18);
+        }
         // owner_id 必须非 0，且要和 svc#37 GetThreadId 同源（用宿主 tid 目前自洽）
         *(unsigned int *)(ro2 + 0x1b0) = (unsigned int)syscall(SYS_gettid);
         st->ro = ro;
@@ -2460,6 +2519,15 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
             }
             patched++;
         }
+        // ★ 2026-10-27：main+0x11ce04 把 [TP+0xa0] 当「每线程分配器对象」用：
+        //     x22 = [TP+0xa0]；非 0 ⇒ ldr x8,[x22]; blr [x8+0x10]（虚调用）
+        //   NULL ⇒ 回退到全局分配器 main+0x3d993e8（nn::init 已建好）。
+        //   我们的 mrs 桩返回 TLS **变量区 A**，[A+0xa0] 是客机的一个普通 TLS
+        //   变量（真机实测值 0x80000），当对象指针解引用 ⇒ 崩在 `ldr x8,[x22]`
+        //   （pc=main+0x11ce24, addr=0x80000）。
+        //   ⇒ 这条 load 直接换成 `movz x22,#0`，强制走「全局分配器」回退分支。
+        //      （原指令 ldr x22,[x8,#0xa0] = 0xf9405116）
+        *(unsigned int *)(base + 0x11ce04) = 0xD2800016u;   // movz x22, #0
         ZLOGI("TLS 自检 0x11cdf4=%08x 0x11cdf8=%08x 0x11cdfc=%08x 0x11ce00=%08x",
               *(const unsigned int *)(base + 0x11cdf4),
               *(const unsigned int *)(base + 0x11cdf8),
@@ -3067,9 +3135,14 @@ static void *za_sampler_watchdog(void *arg)
         {
             if (++no_progress == 200)
                 ZLOGE("★ 客机 1 秒无 svc 推进（count=%lu）", cnt);
-            if (no_progress == 2000)
+            // ★ 2026-10-27：阈值 2000 → 12000。客人有**合法的长 memset**
+            //   （sdk+0x56e450 就是 memset 的内层循环，初始化几百 MB 内存池时
+            //   要跑很久且不发 svc）⇒ 10 秒就开枪会把正常进度当卡死，
+            //   SIGSEGV 打到正常线程上，整个进程被带走。
+            if (no_progress == 12000)
             {
-                ZLOGE("★ 卡死 10 秒：向客机线程发 SIGSEGV 倒现场");
+                ZLOGE("★ 卡死 60 秒：向客机线程发 SIGSEGV 倒现场");
+                za_sync_dump();
                 syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, 11);
             }
         }

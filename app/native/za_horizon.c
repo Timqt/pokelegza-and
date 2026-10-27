@@ -53,6 +53,7 @@
 #include "za_mem.h"
 #include "za_os.h"
 #include "za_nvn.h"
+#include "za_sync.h"
 
 // SDK 映像基址/大小（定义在 za_guest.c）：崩溃与断言回溯时用来把地址换算成模块偏移
 extern volatile unsigned long za_sdk_base;
@@ -337,19 +338,15 @@ static void *za_thread_trampoline(void *p)
     // ★ 每个客机线程都要有自己的影子 TLS 描述符：mrs 桩内联读 [tp16+0x98]
     //   来算客机 TLS 区；不装的话读到的是 bionic 的 DTV 指针 ⇒ 野地址。
     za_os_install_tls_descriptor();
-    // ★★ 只读 TLS 页的 +0x1f0 在 Horizon 上是「本线程的 TPIDR」：
-    //   SDK 的线程入口 sdk+0x144a50 会 `ldr x8,[tpidrro+0x1f0] ; msr tpidr_el0,x8`。
-    //   我们的 RO 页是**全局一张**，启动时填的是启动线程的 bionic TP。
-    //   新线程若不动它 ⇒ 整个线程把自己的 TPIDR 改成别人的 bionic TLS
-    //   ⇒ 之后它调宿主代码（日志/分配器）全都在用别人的 TLS
-    //   ⇒ 实测新线程栈上出现格式化文本、ret 到 ASCII（pc=0x39323561336436）。
-    //   ⇒ 每线程启动时写回自己的 bionic TPIDR（保留 bionic 语义；客机 TLS
-    //     读取已经全部走 V 常数，不依赖 TPIDR）。
-    {
-        unsigned long tp = 0;
-        __asm__ __volatile__("mrs %0, TPIDR_EL0" : "=r"(tp));
-        za_sdk_set_ro_tls_tpidr(tp);
-    }
+    // ★★ 2026-10-27：这里原来每线程把**自己的 bionic TP** 写进 [ro+0x1f0]
+    //   （当时 RO 页还是全局一张，靠这招防止线程用别人的 TLS）。现在：
+    //     · RO 页已经是每线程一份（za_os_install_tls_descriptor 里建）；
+    //     · `msr TPIDR_EL0` 的站点全部 NOP 了（za_tlsbase_patch.h），
+    //       这个槽不再需要承载真 TP；
+    //     · SDK 的 fs 模块反而把它当「本线程 TPIDR」算 `TP-0x18` 做每线程链表头
+    //       （sdk+0x98344 → bl 97940）。写回 bionic TP 会让链表头落进 bionic
+    //       TCB ⇒ 插入时写坏 TLS/只读页 ⇒ 崩在 libc。
+    //   ⇒ 保留 install 时写入的自备 TP 块，这里不再覆盖。
     za_thread_start_t *ts = (za_thread_start_t *)p;
     void (*entry)(void *) = ts->entry;
     void *arg = ts->arg;
@@ -1310,210 +1307,19 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         pthread_mutex_unlock(&g_handles_mtx);
         return 0;
     }
-    case 26: // ArbitrateLock(cur_handle=x0, ptr=x1, req_handle=w2) → 返回 0 表示拿到锁
-    case 27: // ArbitrateUnlock(ptr=x0)
-        // ★★ 2026-10-25：这里原来直接 `return 0`，**从不操作锁字** —— 这是错的。
-        //
-        //   SDK 的临界区（sdk+0x145fe0）自己实现了 futex 快路径：
-        //       ldxr w9,[x0]        ; 读锁字
-        //       cmp  w9, w8         ; 和 owner_id 比
-        //       b.eq 快速解锁（stlxr w9,wzr,[x0]）
-        //       b.ne → svc #0x1b（ArbitrateUnlock）  ← **期望内核真的解锁**
-        //   我们返回 0 却不改锁字 ⇒ 锁永远是「别人持有」
-        //   ⇒ 后续每次进入临界区都走慢路径、越积越多 ⇒ 最终走到 abort（实测 pc=0）。
-        //
-        //   正确语义（照 Horizon 内核）：
-        //     ArbitrateLock  : 锁字是 0（空闲）⇒ 写成本线程 owner_id，返回 0（拿到）
-        //                      否则 ⇒ 返回 1（没拿到，调用方去 WaitProcessWideKey）
-        //     ArbitrateUnlock: 把锁字清零（无论当前是谁持有）
-        //   owner_id 取自 [TPIDRRO_EL0 + 0x1f8] + 0x1b0（我们已填成 1）。
-        if (nr == 27)
-        {
-            // ArbitrateUnlock(ptr = x0)
-            {
-                static int n27;
-                if (n27 < 12)
-                {
-                    n27++;
-                    unsigned int cur = a0 ? *(unsigned int *)(uintptr_t)a0 : 0;
-                    ZLOGI("svc#27 ArbitrateUnlock lock=%p before=%#x owner=%u",
-                          (void *)(uintptr_t)a0, cur, za_current_owner_id());
-                }
-            }
-            if (a0)
-            {
-                __atomic_store_n((unsigned int *)(uintptr_t)a0, 0u, __ATOMIC_RELEASE);
-                // 唤醒在 svc#26 里阻塞的等待者（快速路径不加这个唤醒，
-                // 但快速路径只在「无等待者」时才会走）。
-                syscall(SYS_futex, (int *)(uintptr_t)a0, FUTEX_WAKE_PRIVATE,
-                        0x7fffffff, NULL, NULL, 0);
-            }
-            return 0;
-        }
-        {
-            // ArbitrateLock(old_owner = x0, ptr = x1, my_id = w2)
-            //
-            // ★★ 2026-10-26 修正语义：**必须阻塞到拿到锁，然后返回 0**。
-            //   SDK 的 InternalCriticalSection::Enter（sdk+0x145efc）慢路径：
-            //       145f38: orr  w9,w8,#0x40000000 ; stlxr   ; 先置「有等待者」位
-            //       145f50: bl   svc#26(old_owner, lock, my_id)
-            //       145f58: cbnz w0, abort                   ; ★ 非 0 直接 Abort
-            //   以前这里「别人持有时返回 1」⇒ Enter 立刻 Abort(Result=1)。
-            //   真机语义：内核让调用者睡眠，等持有者释放后把锁字写成本线程 id。
-            //
-            //   唤醒配对：Leave 的快速路径只在锁字没有 0x40000000 位时走
-            //   （即「没有等待者」）；有等待者时 Enter 已经置了该位，
-            //   Leave 必然走 svc#27（慢路径）⇒ 我们在那里 futex_wake 即可。
-            unsigned int *lock = (unsigned int *)(uintptr_t)a1;
-            unsigned int me = (unsigned int)a2;
-            if (!lock || !me) return 0;
-            {
-                static int n26;
-                if (n26 < 12)
-                {
-                    n26++;
-                    ZLOGI("svc#26 ArbitrateLock lock=%p before=%#x me=%u host_tid=%u",
-                          (void *)lock, __atomic_load_n(lock, __ATOMIC_RELAXED), me,
-                          (unsigned)syscall(SYS_gettid));
-                }
-            }
-            for (;;)
-            {
-                unsigned int expect = 0;
-                if (__atomic_compare_exchange_n(lock, &expect, me, 0,
-                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-                    return 0;                       // 拿到（顺带清掉 0x40000000）
-                {
-                    unsigned int owner = expect & 0xbfffffffu;
-                    if (owner == me) return 0;      // 已经是自己
-                    // ★ 陈旧/损坏的锁字恢复：owner 必须是一个**线程句柄**
-                    //   （SDK 写的是 [self+0x1b0]，本工程里是 1..7 这种小值）。
-                    //   实测栈上的局部 mutex 曾出现 0x40696d45（bit30|0x696d45），
-                    //   既不是句柄也不可能再被释放 ⇒ 永远等不到唤醒。
-                    //   这里强制夺取并记录，避免整条线死等（watchdog 会开枪）。
-                    if (owner >= 0x100000u)
-                    {
-                        static int nforce;
-                        if (nforce++ < 8)
-                            ZLOGE("svc#26 陈旧锁字 %#x（owner 不像线程句柄）⇒ 强制取得",
-                                  expect);
-                        __atomic_store_n(lock, me, __ATOMIC_RELEASE);
-                        return 0;
-                    }
-                }
-                // 等持有者释放：锁字变化就重试。
-                // ⚠ 必须**有界**：SDK 的 Leave 在「锁字没有 0x40000000 位」时
-                //   走快速路径（直接 CAS 成 0），**不会** svc#27 ⇒ 不会 futex_wake。
-                //   如果我们在它读到锁字之后、CAS 之前进入无限等待，就永远
-                //   收不到唤醒（实测：线程卡死在 svc#26，10 秒后看门狗发
-                //   SIGSEGV 倒现场，看起来像崩溃）。2ms 轮询既安全又便宜。
-                struct timespec ts = { 0, 2 * 1000 * 1000 };
-                syscall(SYS_futex, (int *)lock, FUTEX_WAIT_PRIVATE, (int)expect,
-                        &ts, NULL, 0);
-            }
-        }
-    case 28: // WaitProcessWideKeyAtomic(addr=x0, key=x1, tag=w2, timeout=x3)
-    {
-        // Horizon 内核语义：
-        //   ① 若 *addr != tag ⇒ 条件已变，直接返回（不等待）
-        //   ② 否则原子地 *addr = *key，然后在 *key 上睡眠
-        //   ③ 被唤醒后把 *addr 恢复成 tag
-        // SDK 的用户态事件/信号量就靠它（InitializeEvent 是纯用户态初始化）。
-        unsigned int *p = (unsigned int *)(uintptr_t)a0;
-        unsigned int *key = (unsigned int *)(uintptr_t)a1;
-        unsigned int tag = (unsigned int)a2;
-        long long ns = (long long)a3;
-        // ⚠ 实测：SDK 的 InternalConditionVariable 在这条 svc 后面是
-        //   `cbnz w0 → throw/abort`（sdk+0x145934 → 0x14594c）。
-        //   我们之前对「参数异常」返回 0xFA01，一试就直接把游戏 abort 掉。
-        //   ⇒ 除真正的超时外，一律返回 0（让调用方按自己的循环重判）。
-        if (!p || !key) return 0;
-        unsigned int expect = tag;
-        unsigned int kval = __atomic_load_n(key, __ATOMIC_ACQUIRE);
-        if (!__atomic_compare_exchange_n(p, &expect, kval, 0,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            return 0;                       // 值已变（别人先动手）⇒ 不需要等
-        // ★★ CV 字必须 **加 1 登记等待者**：
-        //   SDK 的 SignalConditionVariable（sdk+0x1458c0）是
-        //       ldr w8,[cv] ; cbz w8, ret ; svc#29(cv, ±1)
-        //   即「*cv == 0 就什么都不发」。我们以前从不让 *cv 变非 0
-        //   ⇒ 信号方永远跳过 ⇒ 所有等待者无限睡眠（实测一轮里 0 次 svc#29）。
-        unsigned int wval = __atomic_add_fetch(key, 1u, __ATOMIC_ACQ_REL);
-        if (ns == 0)
-        {
-            // 不等待：把锁字恢复成 tag，并把刚才登记的等待者计数撤掉
-            __atomic_store_n(p, tag, __ATOMIC_RELEASE);
-            __atomic_fetch_sub(key, 1u, __ATOMIC_RELEASE);
-            return 0xEA01u;
-        }
-        struct timespec ts, *tsp = NULL;
-        if (ns > 0)
-        {
-            ts.tv_sec = (time_t)(ns / 1000000000LL);
-            ts.tv_nsec = (long)(ns % 1000000000LL);
-            tsp = &ts;
-        }
-        else
-        {
-            // ★ 无限等待也退化成 20ms 轮询：
-            //   SDK 的信号方是「先读 *cv，为 0 就直接返回不发 svc#29」，
-            //   等待方随后才把计数加 1 —— 存在固有竞态（signal 先于 wait 登记）。
-            //   内核靠等待队列避免，我们用户态近似做不到，只能靠有界等待兜底。
-            //   CV 允许伪唤醒，调用方会重新检查条件，所以轮询是安全的。
-            ts.tv_sec = 0;
-            ts.tv_nsec = 20 * 1000 * 1000;
-            tsp = &ts;
-        }
-        {
-            static int nw;
-            if (nw++ < 24)
-                ZLOGI("svc#28 WaitKey cs=%p cv=%p tag=%u keyval=%u timeout=%lld",
-                      (void *)p, (void *)key, tag, kval, ns);
-        }
-        int rc;
-        do {
-            rc = (int)syscall(SYS_futex, (int *)key, FUTEX_WAIT_PRIVATE,
-                              (int)wval, tsp, NULL, 0);
-        } while (rc == -1 && errno == EINTR);
-        int timedout = (rc == -1 && errno == ETIMEDOUT);
-        // ★ 轮询超时**不能**返回 0xEA01：SDK 的 Wait（sdk+0x145934）是
-        //   `cbnz w0 → Abort`，任何非 0 都会直接终止进程。这里把有界等待的
-        //   超时当成「伪唤醒」处理（CV 允许），返回 0 让调用方重判条件。
-        {
-            static int nr2;
-            if (nr2++ < 24)
-                ZLOGI("svc#28 WaitKey 返回 rc=%d errno=%d timedout=%d keyval=%u",
-                      rc, rc ? errno : 0, timedout,
-                      __atomic_load_n(key, __ATOMIC_RELAXED));
-        }
-        __atomic_store_n(p, tag, __ATOMIC_RELEASE);   // 唤醒后恢复 tag
-        (void)timedout;
-        return 0;
-    }
-    case 29: // SignalProcessWideKey(key=x0, count=w1)
-    {
-        // ★★ Horizon 语义：**先把 key 字加 count，再唤醒**。
-        //   我们以前只 FUTEX_WAKE、不改 key：等待者在 signal 之后才进入
-        //   futex_wait 时读到的是旧值 ⇒ 永远等不到下一次唤醒（丢唤醒）。
-        //   实测卡死在 svc#28（cv=0xb400006f3b1150fc），10 秒后看门狗开枪。
-        unsigned int *key = (unsigned int *)(uintptr_t)a0;
-        int n = (int)a1;
-        if (key)
-        {
-            unsigned int before = __atomic_load_n(key, __ATOMIC_RELAXED);
-            if (n > 0)
-                __atomic_fetch_add(key, (unsigned int)n, __ATOMIC_RELEASE);
-            syscall(SYS_futex, (int *)key, FUTEX_WAKE_PRIVATE,
-                    n > 0 ? n : 0x7fffffff, NULL, NULL, 0);
-            {
-                static int nsig;
-                if (nsig++ < 24)
-                    ZLOGI("svc#29 SignalKey key=%p n=%d: %u -> %u", (void *)key, n,
-                          before, __atomic_load_n(key, __ATOMIC_RELAXED));
-            }
-        }
-        return 0;
-    }
+    case 26: // ArbitrateLock(owner=x0, lockaddr=x1, tag=w2)
+        // 语义见 za_sync.c：锁字仍是 `owner|等待者位` 就睡眠等交接，否则立刻返回。
+        // 以前这里是「阻塞 CAS + 陈旧锁强制夺取」，会让两个线程同时「持有」同一把
+        // 锁 ⇒ SDK 的 owner 记账被破坏 ⇒ WaitConditionVariable 断言失败后 Panic。
+        return (long)za_sync_arbitrate_lock((unsigned int)a0, (unsigned long long)a1,
+                                            (unsigned int)a2);
+    case 27: // ArbitrateUnlock(lockaddr=x0)
+        return (long)za_sync_arbitrate_unlock((unsigned long long)a0);
+    case 28: // WaitProcessWideKeyAtomic(lockaddr=x0, condkey=x1, tag=w2, timeout=x3)
+        return (long)za_sync_wait_key((unsigned long long)a0, (unsigned long long)a1,
+                                      (unsigned int)a2, (long long)a3);
+    case 29: // SignalProcessWideKey(condkey=x0, count=w1)
+        return (long)za_sync_signal_key((unsigned long long)a0, (int)a1);
 
     // ── 地址等待/唤醒（nn::os 的用户态 futex 算法）──────────────────
     // 实测（SDK+0x13b2xx，nn::os 的 mutex/条件变量实现）：

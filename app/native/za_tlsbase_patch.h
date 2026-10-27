@@ -11,7 +11,7 @@
 #define ZA_SDK_TLSTAB_OFF   0xf11000ul   /* 动态 TLS 表 */
 #define ZA_SDK_TLSTAB_SIZE 0x1000ul
 #define ZA_TLSBASE_READ_COUNT  2
-#define ZA_TLSBASE_SDK_WRITE_COUNT  3
+#define ZA_TLSBASE_SDK_WRITE_COUNT  4
 #define ZA_TLSBASE_MAIN_WRITE_COUNT 1
 
 typedef struct { unsigned int off; unsigned int w; } za_tlsbase_patch_t;
@@ -22,6 +22,7 @@ static const za_tlsbase_patch_t za_tlsbase_reads[] = {
 };
 
 static const za_tlsbase_patch_t za_tlsbase_sdk_writes[] = {
+    {0x99220u, 0xd503201fu},
     {0x99224u, 0xd503201fu},
     {0x144620u, 0xd503201fu},
     {0x144a90u, 0xd503201fu},
