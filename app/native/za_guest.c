@@ -829,6 +829,41 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 q = za_put_str(q, "（交回原处理器）\n");
                 za_fatal_write(b, (size_t)(q - b));
             }
+            // ★ 客机 -> 宿主库（libc++/libc）里崩的情况：pc 和 x30 都在宿主库，
+            //   但**栈上**还留着客机的返回地址。扫一遍栈，找到就按客机故障处理
+            //   （否则又是一例「进程被带走、连是谁调的都看不到」）。
+            if (ctx)
+            {
+                unsigned long spx = (unsigned long)((ucontext_t *)ctx)->uc_mcontext.sp;
+                extern unsigned char *za_guest_base;
+                extern volatile unsigned long za_sdk_base, za_sdk_size;
+                for (int k = 0; k < 64 && spx; k++)
+                {
+                    unsigned long long v = 0;
+                    if (!za_read_bytes(spx + (unsigned long)k * 8, &v, 8)) break;
+                    int in_main = za_guest_base &&
+                                  v >= (unsigned long long)(uintptr_t)za_guest_base &&
+                                  v < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE;
+                    int in_sdk = za_sdk_base && v >= za_sdk_base && v < za_sdk_base + za_sdk_size;
+                    if (in_main || in_sdk)
+                    {
+                        char b2[200];
+                        char *q = b2;
+                        q = za_put_str(q, "ZaGuest: 栈上有客机返回地址 sp+");
+                        q = za_put_hex(q, (unsigned long long)(k * 8));
+                        q = za_put_str(q, "=");
+                        q = za_put_hex(q, v);
+                        q = za_put_str(q, in_main ? " main+" : " sdk+");
+                        q = za_put_hex(q, in_main
+                                              ? v - (unsigned long long)(uintptr_t)za_guest_base
+                                              : v - za_sdk_base);
+                        q = za_put_str(q, " ⇒ 按客机故障处理\n");
+                        za_fatal_write(b2, (size_t)(q - b2));
+                        ours = 1;
+                        break;
+                    }
+                }
+            }
             // ★ 2026-10-27：pc=0 / x30=0 / addr=0 —— 这是一个**线程从地址 0 开始执行**
             //   的特征（线程入口为空），不是普通空指针调用。它没有客机描述符，
             //   以前直接交回 SIG_DFL 把整个进程带走，什么都看不到。
@@ -877,6 +912,25 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     for (;;) pause();
                 }
             }
+            // ★ 2026-10-27：致命信号（SEGV/BUS/ILL/FPE）**不转交**给原处理器。
+            //   原来链给 ART 的 libsigchain，它会当成 ART 自己的故障直接终止
+            //   进程（真机：命令缓冲录制后、pc/x30 都在 libc 的一个故障，现场全丢）。
+            //   这类故障多半只在一个线程上 ⇒ 改成挂起该线程，其余线程继续跑。
+            //   非致命信号（SIGQUIT/SIGUSR…）仍按原样转交。
+            // ★ 2026-10-27：致命信号（SEGV/BUS/ILL/FPE）不再 `signal(SIG_DFL)` 让
+            //   内核把整个进程带走 —— 那会丢掉全部现场，而且这类故障多半只发生
+            //   在某一个线程上（实测：命令缓冲录制后，一个宿主库里的空对象调用，
+            //   pc/x30 都在 libc、栈上没有任何客机地址）。改成**挂起该线程**，
+            //   其余线程继续跑；日志里已经留下了 pc/addr/x30/tid。
+            //   非致命信号（SIGQUIT/SIGUSR…）仍按默认处理。
+            if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE)
+            {
+                char b2[120];
+                char *q = b2;
+                q = za_put_str(q, "ZaGuest: 致命信号无处理器 ⇒ 挂起该线程（不杀进程）\n");
+                za_fatal_write(b2, (size_t)(q - b2));
+                for (;;) pause();
+            }
             if (sig > 0 && sig < 64 && za_fatal_prev_ok[sig])
             {
                 struct sigaction *o = &za_fatal_prev[sig];
@@ -898,7 +952,7 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     return;
                 }
             }
-            // 没有可转交的处理器 ⇒ 恢复默认行为后返回（内核会按默认动作重投递）
+            // 没有可转交的处理器。
             signal(sig, SIG_DFL);
             return;
         }
