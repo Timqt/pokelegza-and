@@ -431,6 +431,15 @@ int za_mem_unmap_shared(unsigned long long addr, unsigned long long size)
 //   映射，就等于把宿主的只读段改成可写、甚至（#45）改成 PROT_NONE ⇒
 //   ART 随后碰自己的代码/数据就 SIGSEGV（真机实测 "Jit thread pool" 线程
 //   在 libart+0x791558 解引用 null+0x10，进程被带走）。
+// 原始版：不加 TBI 标记处理，直接判断是否在我们的客机地址空间预留区内。
+int za_mem_owns_raw(unsigned long long addr, unsigned long long size)
+{
+    if (!g_as) za_mem_init();
+    if (!g_as) return 0;
+    unsigned long long s = (unsigned long long)(uintptr_t)g_as;
+    return addr >= s && size <= ZA_MEM_RESERVE && addr + size <= s + ZA_MEM_RESERVE;
+}
+
 int za_mem_owns(unsigned long long addr, unsigned long long size)
 {
     if (!g_as || !size) return 0;

@@ -76,71 +76,97 @@ enum {
 
 #define M_MAGIC 0x4e564e31u /* "NVN1"（已不再写进客机内存，仅作历史标记保留） */
 
-// ★ 2026-10-28：对象有效性**不能**靠往客机对象的偏移 0 写魔数。
-//   真机崩溃证据：客机的哈希表把某个内存池对象（我们 init_obj 过）的第一个字
-//   当成链指针走，于是拿 0x4e564e31 当地址解引用 ⇒ SIGSEGV addr=0x4e564e39
-//   （= M_MAGIC+8，正好是 `ldr x8,[x20,#8]`）。
-//   客机对象对我们"不透明"这个假设是错的：至少内存池对象的前 8 字节客机自己
-//   在用。所以有效性改由**宿主侧登记表**判断，我们一个字都不写进对象。
-#define ZA_NVN_REG 4096
-static uintptr_t za_nvn_reg[ZA_NVN_REG];   // 0 = 空槽
-static void za_nvn_reg_add(const void *p)
+// ════════════════════════════════════════════════════════════════════════
+// 影子状态表：**NVN 对象的所有字段都存在宿主内存里，一个字节都不写客机对象**
+// ════════════════════════════════════════════════════════════════════════
+// 真机证据链（2026-10-28）：
+//   ① 崩溃地址 0x4e564e39 = 我们在对象偏移 0 写的魔数 0x4e564e31+8 ——
+//      客机的哈希表把对象第一个字当链指针走，魔数被当地址解引用。
+//   ② /proc/self/maps 显示客机传进来的 NVN 对象（0x6f3b11ebc8 /
+//      0x6e2b11b290 / 0x6f1b1024e0 …）**全部落在 [anon:scudo:primary]**：
+//      客机的分配器和宿主共用一个堆。
+//   ③ 这套 SDK 的 NVN 对象比参考头文件小（已证实 sampler builder 是 0x40）。
+//      init_obj 以前无条件 memset 0x100 字节 ⇒ 越过对象尾部写坏相邻块：
+//      实测把 ART 的 JIT arena（同一 Scudo 区，只差 0x90 字节）虚表清零
+//      ⇒ "Jit thread pool" 崩在 MemMapArenaPool::TrimMaps；也见过
+//      'Scudo ERROR: corrupted chunk header'。
+//   ⇒ 对象状态全放这里，客机对象**一个字节都不写**（builder 同样：以前
+//     memset 0x40 踩过栈上保存的 x29/x30）。
+#define ZA_NVN_SHADOW_N 8192
+#define ZA_NVN_SHADOW_SZ 0x100
+static unsigned char za_nvn_shadow_mem[ZA_NVN_SHADOW_N][ZA_NVN_SHADOW_SZ];
+static uintptr_t za_nvn_shadow_key[ZA_NVN_SHADOW_N];   // 0 = 空槽
+
+static int za_nvn_shadow_idx(const void *p)
 {
     uintptr_t v = (uintptr_t)p;
-    if (!v) return;
-    unsigned h = (unsigned)((v >> 4) * 2654435761u) & (ZA_NVN_REG - 1);
-    for (unsigned i = 0; i < ZA_NVN_REG; i++) {
-        unsigned k = (h + i) & (ZA_NVN_REG - 1);
-        uintptr_t cur = __atomic_load_n(&za_nvn_reg[k], __ATOMIC_ACQUIRE);
-        if (cur == v) return;
-        if (!cur && __atomic_compare_exchange_n(&za_nvn_reg[k], &cur, v, 0,
-                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-            return;
+    if (!v) return -1;
+    unsigned h = (unsigned)((v >> 4) * 2654435761u) & (ZA_NVN_SHADOW_N - 1);
+    for (unsigned i = 0; i < ZA_NVN_SHADOW_N; i++) {
+        unsigned k = (h + i) & (ZA_NVN_SHADOW_N - 1);
+        uintptr_t cur = __atomic_load_n(&za_nvn_shadow_key[k], __ATOMIC_ACQUIRE);
+        if (cur == v) return (int)k;
+        if (!cur) return -1;
     }
+    return -1;
 }
-static int za_nvn_reg_has(const void *p)
+
+static unsigned char *za_nvn_shadow_mut(const void *p)
 {
     uintptr_t v = (uintptr_t)p;
-    if (!v) return 0;
-    unsigned h = (unsigned)((v >> 4) * 2654435761u) & (ZA_NVN_REG - 1);
-    for (unsigned i = 0; i < ZA_NVN_REG; i++) {
-        uintptr_t cur = __atomic_load_n(&za_nvn_reg[(h + i) & (ZA_NVN_REG - 1)],
-                                        __ATOMIC_ACQUIRE);
-        if (!cur) return 0;
-        if (cur == v) return 1;
+    if (!v) return NULL;
+    unsigned h = (unsigned)((v >> 4) * 2654435761u) & (ZA_NVN_SHADOW_N - 1);
+    for (unsigned i = 0; i < ZA_NVN_SHADOW_N; i++) {
+        unsigned k = (h + i) & (ZA_NVN_SHADOW_N - 1);
+        uintptr_t cur = __atomic_load_n(&za_nvn_shadow_key[k], __ATOMIC_ACQUIRE);
+        if (cur == v) return za_nvn_shadow_mem[k];
+        if (!cur) {
+            if (__atomic_compare_exchange_n(&za_nvn_shadow_key[k], &cur, v, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                return za_nvn_shadow_mem[k];
+            if (cur == v) return za_nvn_shadow_mem[k];
+        }
     }
-    return 0;
+    static int warned;
+    if (!warned++) ZLOGE("★ NVN 影子表已满（%d 个对象）", ZA_NVN_SHADOW_N);
+    return NULL;
 }
 
 static inline u64 ld64(const void *p, u32 off)
 {
+    int k = za_nvn_shadow_idx(p);
     u64 v;
-    memcpy(&v, (const char *)p + off, 8);
+    if (k >= 0) memcpy(&v, za_nvn_shadow_mem[k] + off, 8);
+    else memcpy(&v, (const char *)p + off, 8);
     return v;
 }
-static inline void st64(void *p, u32 off, u64 v) { memcpy((char *)p + off, &v, 8); }
 static inline u32 ld32(const void *p, u32 off)
 {
+    int k = za_nvn_shadow_idx(p);
     u32 v;
-    memcpy(&v, (const char *)p + off, 4);
+    if (k >= 0) memcpy(&v, za_nvn_shadow_mem[k] + off, 4);
+    else memcpy(&v, (const char *)p + off, 4);
     return v;
 }
-static inline void st32(void *p, u32 off, u32 v) { memcpy((char *)p + off, &v, 4); }
-static inline int is_obj(const void *p) { return za_nvn_reg_has(p); }
-// 初始化 NVN 对象：**最多清 0x100 字节**。
-// ★ 2026-10-27：以前按参考头文件的尺寸 memset（device 0x3000 / queue 0x2000 …）。
-//   但这套 SDK 里的实际对象**比参考头文件小**（已证实：sampler builder 是 0x40
-//   而不是 0x60，按 0x60 清会把栈上保存的 x29/x30 抹掉 ⇒ ret 跳飞）。
-//   客机的 C++ 对象走 libc++（宿主 Scudo 堆）⇒ 清多了就会覆盖相邻堆块的
-//   chunk header，表现为：
-//     'Scudo ERROR: corrupted chunk header ... (Header Value: 0xb400006d…)'
-//   NVN 对象对客机是不透明的，它的字段我们自己只用前 0x80 字节，
-//   所以只清我们真正会用到的那一段就够了。
+// 写：只写影子。没有影子的指针（没 init 过的）直接忽略 —— 往一个来路不明
+// 的地址写字节以前把宿主堆写坏过，宁可什么也不做。
+static inline void st64(void *p, u32 off, u64 v)
+{
+    int k = za_nvn_shadow_idx(p);
+    if (k >= 0) memcpy(za_nvn_shadow_mem[k] + off, &v, 8);
+}
+static inline void st32(void *p, u32 off, u32 v)
+{
+    int k = za_nvn_shadow_idx(p);
+    if (k >= 0) memcpy(za_nvn_shadow_mem[k] + off, &v, 4);
+}
+static inline int is_obj(const void *p) { return za_nvn_shadow_idx(p) >= 0; }
 static void init_obj(void *p, u64 size)
 {
-    if (size > 0x100) size = 0x100;
-    memset(p, 0, size);
-    za_nvn_reg_add(p);
+    unsigned char *s2 = za_nvn_shadow_mut(p);
+    if (!s2) return;
+    if (size > ZA_NVN_SHADOW_SZ) size = ZA_NVN_SHADOW_SZ;
+    memset(s2, 0, (size_t)size);
 }
 
 // 贴图行跨度：客机 SetStride(0) 表示「自动」，真 NVN 会按格式算出来。
@@ -303,9 +329,13 @@ static void *za_nvn_tick_main(void *p)
         nanosleep(&ts, NULL);
         za_nvn_ticks++;
         if ((za_nvn_ticks % 300) == 0)
-            ZLOGI("★ NVN 帧驱动：%llu tick，submit=%llu acquire=%llu present=%llu",
+            ZLOGI("★ NVN 帧驱动：%llu tick，submit=%llu acquire=%llu present=%llu"
+                  " tex=%llu buf=%llu cmd=%llu",
                   (unsigned long long)za_nvn_ticks, (unsigned long long)za_nvn_submits,
-                  (unsigned long long)za_nvn_acquires, (unsigned long long)za_nvn_presents);
+                  (unsigned long long)za_nvn_acquires, (unsigned long long)za_nvn_presents,
+                  (unsigned long long)za_nvn_calls[ZA_NVN_ID_nvnTextureInitialize],
+                  (unsigned long long)za_nvn_calls[ZA_NVN_ID_nvnBufferInitialize],
+                  (unsigned long long)za_nvn_calls[ZA_NVN_ID_nvnCommandBufferBeginRecording]);
     }
     return NULL;
 }
@@ -359,7 +389,7 @@ static u64 za_nvn_call(int id, unsigned long guest_lr, u64 guest_fp, u64 a0, u64
     // 避免刷爆日志。
     if ((id == ZA_NVN_ID_nvnTextureInitialize || id == ZA_NVN_ID_nvnTexturePoolRegisterTexture ||
          id == ZA_NVN_ID_nvnBufferInitialize) &&
-        (za_nvn_calls[id] == 400 || (za_nvn_calls[id] >= 4000 && (za_nvn_calls[id] % 4000) == 0)))
+        (za_nvn_calls[id] == 60 || (za_nvn_calls[id] % 2000) == 0))
         za_nvn_dump_guest_stack(guest_fp, za_nvn_name[id]);
     za_nvn_hist_t *h = &za_nvn_hist[za_nvn_hist_n % ZA_NVN_HIST];
     h->id = (unsigned)id;
@@ -594,8 +624,7 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     //   紧凑布局：0x00 magic / 0x08 device / 0x10 nativeWindow / 0x18 textures
     //             0x20 numTextures / 0x24 presentInterval / 0x28 numActive
     case ZA_NVN_ID_nvnWindowBuilderSetDefaults:
-        memset(o, 0, 0x40);
-        za_nvn_reg_add(o);
+        init_obj(o, 0x40);
         st32(o, 0x24, 1);   // presentInterval
         st32(o, 0x28, 1);   // numActiveTextures
         return 0;
@@ -870,8 +899,7 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     //    所以这里**只保留 magic + device**，其余 setter 一律不落盘：
     //    Initialize 只认这两个字段，Get 系返回 0（客机只拿来回填 builder）。
     case ZA_NVN_ID_nvnSamplerBuilderSetDefaults:
-        memset(o, 0, 0x40);
-        za_nvn_reg_add(o);
+        init_obj(o, 0x40);
         return 0;
     case ZA_NVN_ID_nvnSamplerBuilderSetDevice:
         if (is_obj(o)) st64(o, F_DEVICE, a1);

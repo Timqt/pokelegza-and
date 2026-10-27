@@ -34,6 +34,7 @@ int za_mem_guest_owns(const void *p);
 
 // 这段地址是否落在我们自己的预留区内（svc#44/#45 改权限前必须先问）
 int za_mem_owns(unsigned long long addr, unsigned long long size);
+int za_mem_owns_raw(unsigned long long addr, unsigned long long size);
 // QueryMemory：填 MemoryInfo（base/size/state/attr/perm 六个字段），返回页信息（W1）。
 unsigned long long za_mem_query_memory(unsigned long long addr, unsigned long long *mi);
 
