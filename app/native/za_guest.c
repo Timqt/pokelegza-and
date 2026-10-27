@@ -791,11 +791,43 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             pc0 < (unsigned long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE) ours = 1;
         if (pc0 && za_sdk_base && pc0 >= za_sdk_base && pc0 < za_sdk_base + za_sdk_size) ours = 1;
         if (pc0 && za_self_base && pc0 >= za_self_base && pc0 < za_self_end) ours = 1;
+        // ★ 返回地址也在映像里 ⇒ 是客机调进来的（例：客机 `blr` 到 NULL，
+        //   pc=0 不在任何映像内，但 x30 指向客机代码）。不看 x30 的话这种
+        //   最典型的空指针调用会被判成「非客机线程」，直接链给 SIG_DFL 把
+        //   整个进程带走，连现场都留不下来（实测 tid 572 pc=0 addr=0）。
+        if (!ours && ctx)
+        {
+            unsigned long x30 = (unsigned long)((ucontext_t *)ctx)->uc_mcontext.regs[30];
+            if (x30 && za_guest_base && x30 >= (unsigned long)(uintptr_t)za_guest_base &&
+                x30 < (unsigned long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE)
+                ours = 1;
+            if (x30 && za_sdk_base && x30 >= za_sdk_base && x30 < za_sdk_base + za_sdk_size)
+                ours = 1;
+        }
         // 客机线程上：即使 PC 在宿主 libc（客机 import 的 abort/assert/memcpy），
         // 也是我们的责任；非客机线程（ART/JNI）才交回原处理器。
         if (!ours && za_is_guest_thread()) ours = 1;
         if (!ours)
         {
+            // ★ 诊断：交回原处理器前先留一行（异步信号安全）。以前这里静默
+            //   链走，进程直接死掉、连崩在哪个线程都看不到（实测 tid 29814
+            //   在 addr=0x0 上 SEGV_MAPERR，日志里没有任何痕迹）。
+            {
+                char b[160];
+                char *q = b;
+                q = za_put_str(q, "ZaGuest: 非客机线程故障 sig=");
+                q = za_put_dec(q, (unsigned long long)sig);
+                q = za_put_str(q, " pc=");
+                q = za_put_hex(q, (unsigned long long)(ctx ? (unsigned long)((ucontext_t *)ctx)->uc_mcontext.pc : 0));
+                q = za_put_str(q, " addr=");
+                q = za_put_hex(q, (unsigned long long)(info ? (unsigned long long)(uintptr_t)info->si_addr : 0));
+                q = za_put_str(q, " x30=");
+                q = za_put_hex(q, (unsigned long long)(ctx ? (unsigned long)((ucontext_t *)ctx)->uc_mcontext.regs[30] : 0));
+                q = za_put_str(q, " tid=");
+                q = za_put_dec(q, (unsigned long long)syscall(SYS_gettid));
+                q = za_put_str(q, "（交回原处理器）\n");
+                za_fatal_write(b, (size_t)(q - b));
+            }
             if (sig > 0 && sig < 64 && za_fatal_prev_ok[sig])
             {
                 struct sigaction *o = &za_fatal_prev[sig];
