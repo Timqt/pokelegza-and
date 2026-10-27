@@ -2440,6 +2440,32 @@ void za_stub_hit(unsigned index)
 
 // 客机的 C++ 运行时要 libc++；Android 的 libc++ 与 NSO 用**同一套 Itanium mangling**，
 // 所以那 400 多个符号能直接 dlsym 命中，只有 nn::* 需要自己实现。
+// 诊断：C++ 的 new/delete 解析到哪里（决定客机对象在哪个堆上）。
+void za_log_cpp_alloc_syms(void)
+{
+    // ★ 2026-10-27：C++ 的 new/delete 落到哪里直接决定客机对象在**哪个堆**上。
+    //   落到 libc++_shared ⇒ 宿主 Scudo 堆；落到 SDK/main 的导出 ⇒ 客机自己的
+    //   musl 堆。宿主堆被客机写坏一个 chunk header 就会 SIGABRT（Scudo 报错），
+    //   所以这里把三个关键符号的解析结果打出来。
+    {
+        static const char *sym[] = { "_Znwm", "_Znam", "_ZdlPv", "_ZnwmRKSt9nothrow_t" };
+        for (int i = 0; i < 4; i++) {
+            void *f = za_resolve_host(sym[i]);
+            const char *where = "?";
+            if (!f) where = "无";
+            else if (za_sdk_base && (unsigned long long)(uintptr_t)f >= za_sdk_base &&
+                     (unsigned long long)(uintptr_t)f < za_sdk_base + za_sdk_size) where = "SDK";
+            else if (za_guest_base && (unsigned long long)(uintptr_t)f >=
+                                           (unsigned long long)(uintptr_t)za_guest_base &&
+                     (unsigned long long)(uintptr_t)f <
+                         (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE)
+                where = "main";
+            else where = "宿主";
+            ZLOGI("C++ 分配符号 %-24s -> %p（%s）", sym[i], f, where);
+        }
+    }
+}
+
 static void za_load_host_libs(void)
 {
     static const char *libs[] = { "libc++_shared.so", "libm.so", "libz.so", NULL };
@@ -2947,6 +2973,7 @@ int za_guest_mod_init(unsigned char *base, const unsigned char *exp_bin, size_t 
     if (za_mod_from_exports(&za_main_mod, base, exp_bin, exp_len) != 0) return -1;
     za_guest_main_base = base;
     ZLOGI("main 导出符号 %u 个（基址 %p）", za_main_mod.export_count, (void *)base);
+    za_log_cpp_alloc_syms();
     return 0;
 }
 // ════════════════════════════════════════════════════════════════
