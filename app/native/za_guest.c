@@ -826,7 +826,18 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 q = za_put_hex(q, (unsigned long long)(ctx ? (unsigned long)((ucontext_t *)ctx)->uc_mcontext.regs[30] : 0));
                 q = za_put_str(q, " tid=");
                 q = za_put_dec(q, (unsigned long long)syscall(SYS_gettid));
-                q = za_put_str(q, "（交回原处理器）\n");
+                q = za_put_str(q, "（交回原处理器）");
+                {
+                    // 这些 pc/x30 到底是哪个模块：自己的 .so 报 libza+offset，否则宿主
+                    unsigned long pcv = ctx ? (unsigned long)((ucontext_t *)ctx)->uc_mcontext.pc : 0;
+                    if (pcv && za_self_base && pcv >= za_self_base && pcv < za_self_end) {
+                        q = za_put_str(q, " 模块=libza+");
+                        q = za_put_hex(q, (unsigned long long)(pcv - za_self_base));
+                    } else {
+                        q = za_put_str(q, " 模块=宿主");
+                    }
+                }
+                q = za_put_str(q, "\n");
                 za_fatal_write(b, (size_t)(q - b));
             }
             // ★ 客机 -> 宿主库（libc++/libc）里崩的情况：pc 和 x30 都在宿主库，
@@ -3201,7 +3212,15 @@ static void *za_sampler_watchdog(void *arg)
         if (cnt == last_count)
         {
             if (++no_progress == 200)
+            {
                 ZLOGE("★ 客机 1 秒无 svc 推进（count=%lu）", cnt);
+                // ★ 2026-10-27：全体线程可能都睡在条件变量上（真机实测 16 个）。
+                //   ConditionVariable 允许伪唤醒，这里做一次**合法伪唤醒**：
+                //   游戏若因此继续推进 ⇒ 卡住的原因就是丢了一次唤醒；
+                //   若没反应 ⇒ 它在等真正的外部事件（vsync/GPU 完成等）。
+                unsigned pk = za_sync_poke_all();
+                if (pk) ZLOGE("   已对 %u 个条件变量等待者做伪唤醒", pk);
+            }
             // ★ 2026-10-27：阈值 2000 → 12000。客人有**合法的长 memset**
             //   （sdk+0x56e450 就是 memset 的内层循环，初始化几百 MB 内存池时
             //   要跑很久且不发 svc）⇒ 10 秒就开枪会把正常进度当卡死，

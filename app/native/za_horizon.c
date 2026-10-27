@@ -2006,6 +2006,26 @@ static za_rr_slot_t *za_rr_cur(void)
     }
     return &za_rr_slots[h & (ZA_RR_SLOTS - 1)];   // 表满：退化（诊断用，可接受）
 }
+// 按 tid 倒出某个线程的 svc 环形记录（看门狗在等待表里用）。
+// ret == 0xdead 表示这条 svc **还没返回**（线程正阻塞在里面）。
+void za_dump_ret_ring_for(long tid)
+{
+    za_rr_slot_t *s = NULL;
+    for (unsigned i = 0; i < ZA_RR_SLOTS; i++)
+        if (__atomic_load_n(&za_rr_slots[i].tid, __ATOMIC_ACQUIRE) == tid) { s = &za_rr_slots[i]; break; }
+    if (!s) { ZLOGI("    (tid=%ld 没有 svc 记录)", tid); return; }
+    unsigned h = __atomic_load_n(&s->head, __ATOMIC_RELAXED);
+    for (int k = 0; k < 4; k++)
+    {
+        int i = (int)((h - 1 - k + ZA_RR * 2) % ZA_RR);
+        za_rr_t *e = &s->e[i];
+        if (!e->pc && !e->nr) continue;
+        ZLOGI("      svc#%ld ret=%s%#lx pc=%#llx a0=%#llx a1=%#llx",
+              e->nr, e->ret == 0xdeadL ? "(未返回)" : "", (unsigned long)e->ret,
+              e->pc, e->a0, e->a1);
+    }
+}
+
 void za_dump_ret_ring(void)
 {
     za_rr_slot_t *s = za_rr_cur();
@@ -2023,18 +2043,20 @@ void za_dump_ret_ring(void)
 long za_horizon_svc(long a0, long a1, long a2, long a3,
                     long a4, long a5, long a6, long a7, long nr)
 {
+    // ★ 2026-10-27：**入口就记一条**（ret = 哨兵 0xdead）。
+    //   以前只在 svc 返回后记录 ⇒ 阻塞在 svc#28 里的线程在环形记录里
+    //   完全不可见，看门狗倒现场时根本不知道它在等什么。
+    za_rr_slot_t *rr = za_rr_cur();
+    int rri = (int)(__atomic_fetch_add(&rr->head, 1, __ATOMIC_RELAXED) % ZA_RR);
+    rr->e[rri].nr  = nr;
+    rr->e[rri].ret = 0xdeadL;
+    rr->e[rri].a0  = (unsigned long long)a0;
+    rr->e[rri].a1  = (unsigned long long)a1;
+    rr->e[rri].a2  = (unsigned long long)a2;
+    rr->e[rri].a3  = (unsigned long long)a3;
+    rr->e[rri].pc  = (unsigned long long)za_horizon_regs[ZA_REG_PC];
     long r = za_horizon_svc_impl(a0, a1, a2, a3, a4, a5, a6, a7, nr);
-    {
-        za_rr_slot_t *s = za_rr_cur();
-        int i = (int)(__atomic_fetch_add(&s->head, 1, __ATOMIC_RELAXED) % ZA_RR);
-        s->e[i].nr  = nr;
-        s->e[i].ret = r;
-        s->e[i].a0  = (unsigned long long)a0;
-        s->e[i].a1  = (unsigned long long)a1;
-        s->e[i].a2  = (unsigned long long)a2;
-        s->e[i].a3  = (unsigned long long)a3;
-        s->e[i].pc  = (unsigned long long)za_horizon_regs[ZA_REG_PC];
-    }
+    rr->e[rri].ret = r;
     if (nr == 24 || nr == 28 || nr == 52 || nr == 53 || nr == 54)
     {
         za_dbg_last_wait_nr = nr;

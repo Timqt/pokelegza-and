@@ -14,6 +14,9 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key,
 // svc#29 SignalProcessWideKey(key, count)
 unsigned long za_sync_signal_key(unsigned long long key, int count);
 
+// 对所有条件变量等待者做一次合法伪唤醒；返回被唤醒的线程数。
+unsigned za_sync_poke_all(void);
+
 // 打印等待表快照（诊断用）
 void za_sync_dump(void);
 

@@ -91,6 +91,18 @@ static void init_obj(void *p, u64 size)
     st32(p, F_MAGIC, M_MAGIC);
 }
 
+// 贴图行跨度：客机 SetStride(0) 表示「自动」，真 NVN 会按格式算出来。
+// 我们以前一律返回 0 ⇒ 客机拿 0 去算上传大小/循环条件会卡住。
+// 常见格式按 4 字节/纹素算（0x25 = RGBA8），行对齐 64 字节（Tegra 的要求）。
+static u64 za_nvn_tex_stride(const void *o)
+{
+    u32 w = ld32(o, F_W);
+    u32 stride = ld32(o, F_STRIDE);
+    if (stride) return stride;
+    if (!w) return 64;
+    return ((u64)w * 4 + 63) & ~63ull;
+}
+
 // 贴图存储量估算：客机拿它给自己的内存池定尺寸，稍微给大一点是安全的。
 static u64 za_nvn_tex_bytes(const void *b)
 {
@@ -99,7 +111,7 @@ static u64 za_nvn_tex_bytes(const void *b)
     u64 d = ld32(b, F_D) ? ld32(b, F_D) : 1;
     u64 lv = ld32(b, F_LEVELS) ? ld32(b, F_LEVELS) : 1;
     u64 sm = ld32(b, F_SAMPLES) ? ld32(b, F_SAMPLES) : 1;
-    u64 bytes = w * h * d * 4 * sm;
+    u64 bytes = (u64)(((w * 4 + 63) & ~63ull)) * h * d * sm;
     if (lv > 1) bytes *= 2;
     return (bytes + 0xfff) & ~0xfffull;
 }
@@ -645,7 +657,7 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     case ZA_NVN_ID_nvnTextureBuilderGetDepthStencilMode:
         return is_obj(o) ? ld32(o, F_DSM) : 0;
     case ZA_NVN_ID_nvnTextureBuilderGetStride:
-        return is_obj(o) ? ld32(o, F_STRIDE) : 0;
+        return is_obj(o) ? za_nvn_tex_stride(o) : 0;
     case ZA_NVN_ID_nvnTextureBuilderGetPackagedTextureData:
         return is_obj(o) ? ld64(o, F_MEMORY) : 0;
     case ZA_NVN_ID_nvnTextureBuilderGetMemoryPool:
@@ -698,7 +710,7 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     case ZA_NVN_ID_nvnTextureGetDepthStencilMode:
         return is_obj(o) ? ld32(o, F_DSM) : 0;
     case ZA_NVN_ID_nvnTextureGetStride:
-        return is_obj(o) ? ld32(o, F_STRIDE) : 0;
+        return is_obj(o) ? za_nvn_tex_stride(o) : 0;
     case ZA_NVN_ID_nvnTextureGetFlags:
         return is_obj(o) ? ld32(o, F_FLAGS) : 0;
     case ZA_NVN_ID_nvnTextureGetStorageSize:

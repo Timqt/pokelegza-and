@@ -36,6 +36,9 @@
 #include "za_common.h"
 #include "za_sync.h"
 
+// za_horizon.c：按 tid 倒出 svc 环形记录（阻塞中的那条 ret 是哨兵 0xdead）
+void za_dump_ret_ring_for(long tid);
+
 #ifndef FUTEX_WAIT_PRIVATE
 #define FUTEX_WAIT_PRIVATE 128
 #endif
@@ -45,7 +48,10 @@
 
 #define ZA_WAITERS_BIT 0x40000000u
 #define ZS_MAX 64                 // 同时等待的线程上限
-#define ZS_SLICE_NS 5000000L      // 5ms 分片
+#define ZS_SLICE_NS 5000000L      // 5ms 分片（等锁用）
+// 条件变量的「无限等待」分片：返回越频繁，SDK 重判条件的开销越大；
+// 太长又会拖慢丢唤醒的恢复。20ms 是旧实现验证过的值。
+#define ZS_CV_SLICE_NS 20000000L  // 20ms
 
 typedef struct {
     volatile long tid;            // 0 = 空闲槽
@@ -238,8 +244,12 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
     if (!addr || !key) return 0;
     w = zs_self();
     zs_lock();
-    // ① 先登记条件键：SDK 的 SignalConditionVariable 看到 *cv == 0 就不发 svc#29
-    __atomic_store_n(cond, 1u, __ATOMIC_RELEASE);
+    // ① 先登记条件键。★ *cv 是**等待者计数**，不是布尔量：
+    //    SDK 的 SignalConditionVariable 先读 *cv，为 0 就整条 svc#29 都不发。
+    //    以前这里 store 写 1 ⇒ 同一键上有两个等待者时计数永远是 1，信号唤醒
+    //    一个就把 *cv 清 0，剩下的等待者再也收不到信号
+    //    （真机现象：每秒都要靠看门狗伪唤醒才往前走一步）。
+    __atomic_add_fetch(cond, 1u, __ATOMIC_ACQ_REL);
     w->kind = 2;
     w->addr = addr;
     w->key = key;
@@ -256,7 +266,7 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
             deadline = (long long)now.tv_sec * 1000000000LL + now.tv_nsec + ns;
         }
         for (;;) {
-            long long slice = ZS_SLICE_NS;
+            long long slice = (ns < 0) ? ZS_CV_SLICE_NS : ZS_SLICE_NS;
             if (ns >= 0) {
                 struct timespec now;
                 long long left;
@@ -266,16 +276,34 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
                 if (left < slice) slice = left;
             }
             if (zs_wait_granted(w, slice)) break;
-            // 有超时的调用超时即返回；无限等待则继续分片等（伪唤醒，调用方重判）
+            // ★ 2026-10-27：**无限等待也按分片返回**（不是一直睡下去）。
+            //   根因：SDK 的信号方在用户态先读 `*cv`，为 0 就直接返回、不发
+            //   svc#29；而等待方把 `*cv = 1` 是在进入 svc#28 之后。两者之间存在
+            //   「信号早于登记」的窗口 ⇒ 这次唤醒永久丢失。
+            //   （实测：16 个线程全睡死，对它们做一次伪唤醒后游戏立刻继续建纹理。）
+            //   内核靠等待队列原子性避免了这个窗口，用户态近似做不到；
+            //   返回后 SDK 会重判条件，所以**有界等待 + 伪唤醒**是安全的。
             if (ns >= 0) {
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 if (deadline <= (long long)now.tv_sec * 1000000000LL + now.tv_nsec) break;
             }
+            // 无限等待：继续睡（保持正确交接）。丢唤醒由看门狗的「伪唤醒」兜底
+            // —— 实测每 1 秒无 svc 推进时对全部等待者伪唤醒一次即可让游戏继续。
         }
     }
     zs_lock();
-    w->kind = 0;
+    {
+        // 自己退出（超时/被伪唤醒）时撤销登记；被信号唤醒的那条路径已经减过
+        // （它先把 kind 置 0）。不撤销会让 *cv 只增不减，SDK 也会跟着空转。
+        int was_cv = (w->kind == 2);
+        w->kind = 0;
+        if (was_cv && cond) {
+            unsigned cur = __atomic_load_n(cond, __ATOMIC_RELAXED);
+            while (cur && !__atomic_compare_exchange_n(cond, &cur, cur - 1, 0,
+                                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) { }
+        }
+    }
     zs_unlock();
     return 0;
 }
@@ -303,8 +331,35 @@ void za_sync_dump(void)
     zs_unlock();
     ZLOGI("sync 等待表（%d 个线程）：", n);
     for (int i = 0; i < n; i++)
+    {
         ZLOGI("    tid=%ld kind=%d granted=%d lock=%#llx(word=%#x) key=%#llx tag=%#x",
               tid[i], kind[i], granted[i], addr[i], word[i], key[i], tag[i]);
+        if (kind[i] == 2) za_dump_ret_ring_for(tid[i]);   // 它最后几条 svc
+    }
+}
+
+
+// 对所有条件变量等待者做一次**合法伪唤醒**（ConditionVariable 本来就允许
+// 伪唤醒，调用方会重判条件）。用途：
+//   · 诊断：如果游戏在伪唤醒后继续推进，说明卡住的原因是「丢了一次唤醒」；
+//   · 兜底：真机上所有线程都睡死时，不让整个进程永久停摆。
+// 做法与 svc#29 相同：先把条件键置 1（SDK 的信号方按 *cv != 0 才发 svc），
+// 再把锁交给等待者。
+unsigned za_sync_poke_all(void)
+{
+    unsigned n = 0;
+    zs_lock();
+    for (int i = 0; i < ZS_MAX; i++) {
+        zs_slot_t *w = &zs_slots[i];
+        if (__atomic_load_n(&w->tid, __ATOMIC_RELAXED) == 0) continue;
+        if (w->kind != 2) continue;
+        if (w->key) __atomic_store_n((unsigned int *)(uintptr_t)w->key, 1u, __ATOMIC_RELEASE);
+        w->kind = 0;
+        zs_acquire_for_locked(w, w->addr, w->tag);
+        n++;
+    }
+    zs_unlock();
+    return n;
 }
 
 unsigned long za_sync_signal_key(unsigned long long key, int count)
@@ -316,6 +371,11 @@ unsigned long za_sync_signal_key(unsigned long long key, int count)
         zs_slot_t *w = zs_pick(2, key);
         if (!w) break;
         w->kind = 0;                       // 不再是条件等待者（可能变成锁等待）
+        {   // *cv 是等待者计数：每唤醒一个减一
+            unsigned cur = __atomic_load_n(cond, __ATOMIC_RELAXED);
+            while (cur && !__atomic_compare_exchange_n(cond, &cur, cur - 1, 0,
+                                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) { }
+        }
         zs_acquire_for_locked(w, w->addr, w->tag);
     }
     if (!zs_pick(2, key))
