@@ -52,6 +52,7 @@
 #include "za_sdk.h"
 #include "za_guest_api.h"
 #include "za_os.h"
+#include "za_nvn.h"
 
 // ── 客机映像布局（来自 za_guest_info.h，实测值）────────────────────────
 //   text   0x0000000 .. 0x2fc7250
@@ -1808,11 +1809,12 @@ static void *za_trap_alloc(const char *name)
     return za_trap_page;
 }
 
-// NVN 图形入口：客机给它函数名，它回函数地址（图形层未接 ⇒ 回陷阱桩）
+// NVN 图形入口：客机给它函数名，它回函数地址。
+// 实现在 za_nvn.c：main 用 (device=NULL, 名字) 调 nvnDeviceGetProcAddress 批量解析 534 个
+// 入口，所以这里和那条路径必须共用同一张表。
 static void *za_nvn_bootstrap_loader(const char *name)
 {
-    ZLOGI("★ NVN: 客机要取 %s —— 图形层未接", name ? name : "(null)");
-    return za_trap_alloc(name);
+    return za_nvn_bootstrap(name);
 }
 
 // loader 提供的「runtime object file」= 映像里 MOD0 头的地址
