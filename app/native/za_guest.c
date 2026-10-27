@@ -953,6 +953,24 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 memcpy(&a, (const void *)(uintptr_t)(g + 0x3e0), 8);
                 memcpy(&b, (const void *)(uintptr_t)(g + 0x3e8), 8);
                 memcpy(&flag, (const void *)(uintptr_t)(g + 0x3f0), 1);
+                {
+                    unsigned long long m = (unsigned long long)(uintptr_t)za_guest_base;
+                    unsigned int a0 = *(const unsigned int *)(uintptr_t)(m + 0x11cdf4);
+                    unsigned int a1 = *(const unsigned int *)(uintptr_t)(m + 0x11cdf8);
+                    unsigned int a2 = *(const unsigned int *)(uintptr_t)(m + 0x11cdfc);
+                    char *q = buf;
+                    q = za_put_str(q, "ZaGuest: PATCH 11cdf4=");
+                    q = za_put_hex(q, a0);
+                    q = za_put_str(q, " 11cdf8=");
+                    q = za_put_hex(q, a1);
+                    q = za_put_str(q, " 11cdfc=");
+                    q = za_put_hex(q, a2);
+                    {
+                        const char nl[2] = { 10, 0 };
+                        q = za_put_str(q, nl);
+                    }
+                    za_fatal_write(buf, (size_t)(q - buf));
+                }
                 char *p = buf;
                 p = za_put_str(p, "ZaGuest: GUARD 0x3d99000: [+3e0]=");
                 p = za_put_hex(p, a);
@@ -2379,17 +2397,31 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
             //   [D+0xa0] 读到我们放在那里的 regs 指针，当成对象解引用
             //   ⇒ vtable=0，崩在 `ldr x8,[x8,#0x10]`（实测 main+0x11ce34）。
             {
-                unsigned int nxt = *(unsigned int *)(base + e->off + 4);
                 unsigned int rt2 = e->orig & 0x1Fu;
-                if ((nxt & 0xFF800000u) == 0x92000000u &&
-                    (nxt & 0x1F) == rt2 && ((nxt >> 5) & 0x1F) == rt2 &&
-                    ((nxt >> 22) & 1u) == 1u &&
-                    ((nxt >> 16) & 0x3Fu) == 51u &&
-                    ((nxt >> 10) & 0x3Fu) == 50u)
-                    *(unsigned int *)(base + e->off + 4) = 0xD503201Fu;
+                // ⚠ `and` 不一定紧跟随 mrs：实测 0x11cdf4 是
+                //   mrs x8 ; mov x19,x1 ; and x8,x8,#~0x1FFF
+                //   ⇒ 要同时看 off+4 和 off+8。
+                for (unsigned k = 1; k <= 2; k++)
+                {
+                    unsigned int nxt = *(unsigned int *)(base + e->off + k * 4);
+                    if ((nxt & 0xFF800000u) == 0x92000000u &&
+                        (nxt & 0x1F) == rt2 && ((nxt >> 5) & 0x1F) == rt2 &&
+                        ((nxt >> 22) & 1u) == 1u &&
+                        ((nxt >> 16) & 0x3Fu) == 51u &&
+                        ((nxt >> 10) & 0x3Fu) == 50u)
+                    {
+                        *(unsigned int *)(base + e->off + k * 4) = 0xD503201Fu;
+                        break;
+                    }
+                }
             }
             patched++;
         }
+        ZLOGI("TLS 自检 0x11cdf4=%08x 0x11cdf8=%08x 0x11cdfc=%08x 0x11ce00=%08x",
+              *(const unsigned int *)(base + 0x11cdf4),
+              *(const unsigned int *)(base + 0x11cdf8),
+              *(const unsigned int *)(base + 0x11cdfc),
+              *(const unsigned int *)(base + 0x11ce00));
         ZLOGI("TLS mrs 改写：%u / %u 条已替换（桩区 %#x..%#x）",
               patched, (unsigned)ZA_TLS_MRS_COUNT,
               (unsigned)ZA_TLS_STUB_OFF, (unsigned)(ZA_TLS_STUB_OFF + ZA_TLS_STUB_SIZE));
