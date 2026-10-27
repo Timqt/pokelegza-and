@@ -1412,6 +1412,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         int type = (int)a1;
         unsigned int v = (unsigned int)a2;
         long long ns = (long long)a3;      // 纳秒，< 0 = 无限
+        // 登记进等待表：看门狗伪唤醒才够得着（以前这条路径完全在表外）。
+        za_sync_note_addr_wait((unsigned long long)a0, v, type);
         for (;;)
         {
             unsigned int cur = __atomic_load_n(p, __ATOMIC_ACQUIRE);
@@ -1428,7 +1430,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 case 2: wait = (cur <= v); break;   // GreaterThan：等到 > value
                 default: wait = (cur != v); break;  // NotEqual：等到 == value
             }
-            if (!wait) return 0xFA01u;              // InvalidState ⇒ 调用方用新值重试
+            if (!wait) { za_sync_addr_wait_done(); return 0xFA01u; }  // InvalidState
             struct timespec ts;
             if (ns >= 0)
             {
@@ -1448,9 +1450,10 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 ts.tv_nsec = 20 * 1000 * 1000;
             }
             int rc = (int)syscall(SYS_futex, (int *)p, FUTEX_WAIT_PRIVATE, (int)cur, &ts, NULL, 0);
-            if (rc == 0) return 0;                  // 被唤醒
+            if (rc == 0) { za_sync_addr_wait_done(); return 0; }     // 被唤醒
             if (errno == EAGAIN || errno == EINTR) continue;   // 值变了/被信号打断 ⇒ 重判
             if (ns < 0) continue;                   // 分片到期 ⇒ 重判条件（伪唤醒）
+            za_sync_addr_wait_done();
             return 0xEA01u;                         // 真超时
         }
     }

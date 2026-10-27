@@ -400,6 +400,28 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
 
 // 等待表快照（看门狗/崩溃诊断用）：谁在等哪把锁/哪个条件键。
 // 记录「进等待时的客机 sp / x30」——等待表里据此扫栈找客机返回地址。
+// svc#52 WaitForAddress 的等待者：登记进同一张表，让看门狗的伪唤醒够得着。
+// 这条路径以前完全在表外 —— 真机实测卡住时有线程睡在这里，而看门狗只看到
+// 「0 个/1 个线程」，伪唤醒打不到它。
+void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int type)
+{
+    zs_slot_t *w = zs_self();
+    if (!w) return;
+    w->kind = 3;
+    w->addr = addr;
+    w->key = 0;
+    w->tag = (unsigned int)value;
+    w->gsp = (unsigned long long)type;
+    __atomic_store_n(&w->granted, 0, __ATOMIC_RELEASE);
+}
+
+void za_sync_addr_wait_done(void)
+{
+    zs_slot_t *w = zs_self();
+    if (!w) return;
+    if (w->kind == 3) w->kind = 0;
+}
+
 void za_sync_note_guest(unsigned long long sp, unsigned long long pc)
 {
     zs_slot_t *w = zs_self();
@@ -473,6 +495,15 @@ unsigned za_sync_poke_all(void)
     for (int i = 0; i < ZS_MAX; i++) {
         zs_slot_t *w = &zs_slots[i];
         if (__atomic_load_n(&w->tid, __ATOMIC_RELAXED) == 0) continue;
+        if (w->kind == 3) {
+            // WaitForAddress：直接在它等的那个字上做 futex 唤醒（合法伪唤醒，
+            // 调用方本来就会重判条件）。
+            if (w->addr) syscall(SYS_futex, (int *)(uintptr_t)w->addr, FUTEX_WAKE_PRIVATE,
+                                 0x7fffffff, NULL, NULL, 0);
+            w->kind = 0;
+            n++;
+            continue;
+        }
         if (w->kind != 2) continue;
         if (w->key) __atomic_store_n((unsigned int *)(uintptr_t)w->key, 1u, __ATOMIC_RELEASE);
         w->kind = 0;
