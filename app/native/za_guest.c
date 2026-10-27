@@ -2373,6 +2373,21 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
             long long delta = (long long)e->stub - (long long)e->off;
             if (delta < -(1LL << 27) || delta >= (1LL << 27)) continue;
             *at = 0x14000000u | (unsigned int)((delta >> 2) & 0x3FFFFFF);
+            // ★ 紧跟的 `and Xt, Xt, #~0x1FFF` 必须一起 nop：
+            //   桩返回的已经是**客机 TLS 变量区 A**；保留 and 会把 A 向 8KB
+            //   对齐取整（A = D+0x1000，取整后落回描述符页 D）⇒ 客机从
+            //   [D+0xa0] 读到我们放在那里的 regs 指针，当成对象解引用
+            //   ⇒ vtable=0，崩在 `ldr x8,[x8,#0x10]`（实测 main+0x11ce34）。
+            {
+                unsigned int nxt = *(unsigned int *)(base + e->off + 4);
+                unsigned int rt2 = e->orig & 0x1Fu;
+                if ((nxt & 0xFF800000u) == 0x92000000u &&
+                    (nxt & 0x1F) == rt2 && ((nxt >> 5) & 0x1F) == rt2 &&
+                    ((nxt >> 22) & 1u) == 1u &&
+                    ((nxt >> 16) & 0x3Fu) == 51u &&
+                    ((nxt >> 10) & 0x3Fu) == 50u)
+                    *(unsigned int *)(base + e->off + 4) = 0xD503201Fu;
+            }
             patched++;
         }
         ZLOGI("TLS mrs 改写：%u / %u 条已替换（桩区 %#x..%#x）",
