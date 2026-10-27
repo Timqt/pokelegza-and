@@ -923,18 +923,12 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     for (;;) pause();
                 }
             }
-            // ★ 2026-10-27：致命信号（SEGV/BUS/ILL/FPE）**不转交**给原处理器。
-            //   原来链给 ART 的 libsigchain，它会当成 ART 自己的故障直接终止
-            //   进程（真机：命令缓冲录制后、pc/x30 都在 libc 的一个故障，现场全丢）。
-            //   这类故障多半只在一个线程上 ⇒ 改成挂起该线程，其余线程继续跑。
-            //   非致命信号（SIGQUIT/SIGUSR…）仍按原样转交。
-            // ★ 2026-10-27：致命信号（SEGV/BUS/ILL/FPE）不再 `signal(SIG_DFL)` 让
-            //   内核把整个进程带走 —— 那会丢掉全部现场，而且这类故障多半只发生
-            //   在某一个线程上（实测：命令缓冲录制后，一个宿主库里的空对象调用，
-            //   pc/x30 都在 libc、栈上没有任何客机地址）。改成**挂起该线程**，
-            //   其余线程继续跑；日志里已经留下了 pc/addr/x30/tid。
-            //   非致命信号（SIGQUIT/SIGUSR…）仍按默认处理。
-            if (sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE)
+            // ★ 2026-10-27：致命信号（SEGV/BUS/ILL/FPE）在非客机线程上：
+            //   · 空页访问（si_addr < 0x1000）= ART 的隐式空指针检查 ⇒ 交回 ART；
+            //   · 其余（pc/x30 都在宿主库、栈上没有客机地址）⇒ 挂起该线程，
+            //     其余线程继续跑（链给 ART 会让它当成自己的故障直接终止进程）。
+            if ((sig == SIGSEGV || sig == SIGBUS || sig == SIGILL || sig == SIGFPE) &&
+                !(info && (unsigned long long)(uintptr_t)info->si_addr < 0x1000ull))
             {
                 char b2[120];
                 char *q = b2;
@@ -942,6 +936,10 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 za_fatal_write(b2, (size_t)(q - b2));
                 for (;;) pause();
             }
+            // ★ 例外：**空页访问**（si_addr < 0x1000）必须交回 ART。
+            //   libart 故意解引用空指针做「隐式空指针检查」来抛 NPE，靠它自己的
+            //   处理器恢复；我们抢过来挂起会让 ART 的 NPE 永远不返回、JVM 状态
+            //   坏掉（真机实测崩在 libart+0x791558、addr=0x10）。
             if (sig > 0 && sig < 64 && za_fatal_prev_ok[sig])
             {
                 struct sigaction *o = &za_fatal_prev[sig];
