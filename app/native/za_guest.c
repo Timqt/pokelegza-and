@@ -862,6 +862,17 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     ZLOGE("★ 线程从 0 开始执行（tid=%ld sp=%#lx tp=%#lx desc=%#llx）"
                           " ⇒ 挂起，保住进程",
                           (long)syscall(SYS_gettid), spx, tpx, slot);
+                    // 栈顶几格 + 各寄存器：判断它是「线程入口就是 0」还是
+                    // 「跑到一半跳飞」——前者栈上没有返回地址，后者有。
+                    for (int k = 0; k < 8 && spx; k++)
+                    {
+                        unsigned long long v = 0;
+                        if (!za_read_bytes(spx + (unsigned long)k * 8, &v, 8)) break;
+                        ZLOGE("    sp+%#x = %#llx", k * 8, v);
+                    }
+                    for (int k = 0; k < 31; k++)
+                        ZLOGE("    x%d = %#llx", k,
+                              (unsigned long long)((ucontext_t *)ctx)->uc_mcontext.regs[k]);
                     for (;;) pause();
                 }
             }

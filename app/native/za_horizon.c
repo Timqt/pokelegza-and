@@ -349,6 +349,8 @@ static void *za_thread_trampoline(void *p)
     //   ⇒ 保留 install 时写入的自备 TP 块，这里不再覆盖。
     za_thread_start_t *ts = (za_thread_start_t *)p;
     void (*entry)(void *) = ts->entry;
+    ZLOGI("客机线程启动 tid=%ld entry=%p arg=%p", (long)syscall(SYS_gettid),
+          (void *)entry, ts->arg);
     void *arg = ts->arg;
     za_handle_t *h = ts->h;
     free(ts);
