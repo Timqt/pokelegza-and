@@ -71,8 +71,14 @@
 #define ZA_MEM_ALIAS_OFF 0x10000000ull
 #define ZA_MEM_ALIAS_CAP 0x400000000ull  // 16GB —— VammManager 管理窗，≥ 12GB 堆
 #define ZA_MEM_STACK_OFF 0x500000000ull
-#define ZA_MEM_STACK_CAP 0x10000000ull   // 256MB
-#define ZA_MEM_HEAP_OFF  0x510000000ull
+// ★ 2026-10-27：256MB → 2GB。客机每个线程栈我们给 16MB，游戏在 NVN 初始化
+//   阶段已经开到 18 个线程（288MB）⇒ 栈区用光 ⇒ SDK 的
+//   StackGuardManager::MapAtRandomAddress 里 AddressSpaceAllocator 分不到
+//   保护页（重试 64 次后返回失败）⇒ nn::os::CreateThread 走到 unreachable
+//   ⇒ nn::diag::Abort（真机实测：第 18 个线程、Break reason=0）。
+//   2GB / 16MB = 128 个线程，够用。
+#define ZA_MEM_STACK_CAP 0x80000000ull   // 2GB
+#define ZA_MEM_HEAP_OFF  0x580000000ull
 #define ZA_MEM_HEAP_CAP  0x300000000ull  // 12GB —— ≥ nn::init::Start 要的 0x300000000
 
 // 报给游戏的「应用内存池」：Switch 上是 3285MB，这里多给一点（d2r 加 512MB）

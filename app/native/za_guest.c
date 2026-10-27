@@ -1166,7 +1166,8 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             {
                 unsigned long long b = za_sdk_base;
                 static const unsigned long long slots[] = {
-                    0xb7ad18ull, 0xb7a880ull, 0xb7a888ull, 0xb7a890ull, 0xb79018ull
+                    0xb7ad18ull, 0xb7a880ull, 0xb7a888ull, 0xb7a890ull, 0xb79018ull,
+                    0xb7af40ull, 0xb7af48ull, 0xb7af50ull, 0xb74078ull, 0xb74080ull
                 };
                 char *p = buf;
                 p = za_put_str(p, "ZaGuest: GOTCHK");
