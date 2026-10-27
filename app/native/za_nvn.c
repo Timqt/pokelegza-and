@@ -111,6 +111,31 @@ static u64 za_nvn_now_ns(void)
     return (u64)ts.tv_sec * 1000000000ull + (u64)ts.tv_nsec;
 }
 
+// 设备属性表：Tegra X1 实测值。
+// 出处：d2r-and 的 dm/gfx/nvn/hle_nvn.c（那边在 SMO 上逐项调 nvnDeviceGetInteger 量出来的，
+// 与 nnheaders nvn_DeviceConstantsNX.h 一致）。0x00/0x01 是 API 版本，游戏只读不比较。
+// ⚠ 原型是 `void nvnDeviceGetInteger(dev, what, int *out)` —— 结果**写指针**，
+//   不是返回值。之前这里把值当返回值给、没写 out，客机读到的就是栈上的垃圾。
+static const int za_nvn_devinfo[] = {
+    [0x00] = 53, [0x01] = 311, [0x02] = 14, [0x03] = 65536, [0x04] = 256, [0x05] = 8,
+    [0x06] = 16, [0x07] = 4, [0x08] = 16, [0x09] = 32, [0x0A] = 16, [0x0B] = 4,
+    [0x0C] = 4, [0x0D] = 4, [0x0E] = 16, [0x0F] = 32, [0x10] = 32, [0x11] = 256,
+    [0x12] = 256, [0x13] = 4, [0x14] = 8, [0x15] = 512, [0x16] = 256, [0x17] = 2,
+    [0x18] = 256, [0x19] = 4096, [0x1A] = 131072, [0x1B] = 16, [0x1C] = 1536,
+    [0x1D] = 1024, [0x1E] = 64, [0x1F] = 1536, [0x20] = 65535, [0x21] = 65535,
+    [0x22] = 65535, [0x23] = 8, [0x24] = 1048576, [0x25] = 4096, [0x26] = 16,
+    [0x27] = 4096, [0x28] = 1, [0x29] = 1, [0x2A] = 1, [0x2B] = 262144, [0x2C] = 15,
+    [0x2D] = 2048, [0x2E] = 1, [0x2F] = 1, [0x30] = 14, [0x31] = 5, [0x32] = 1,
+    [0x33] = 8, [0x34] = 8, [0x35] = 4, [0x36] = 32, [0x37] = 128, [0x38] = 32,
+    [0x39] = 128, [0x3A] = 65536, [0x3B] = 1, [0x3C] = 4, [0x3D] = 16384,
+    [0x3E] = 134217728, [0x3F] = 2048, [0x40] = 16384, [0x41] = 16384, [0x42] = 1,
+    [0x43] = 1, [0x44] = 1, [0x45] = 1, [0x46] = 5, [0x47] = 1, [0x48] = 1, [0x49] = 1,
+    [0x4A] = 1, [0x4B] = 1, [0x4C] = 1, [0x4D] = 16, [0x4E] = 1024, [0x4F] = 32,
+    [0x50] = 4096, [0x51] = 65536, [0x52] = 65536, [0x53] = 256, [0x54] = 16384,
+    [0x55] = 262144, [0x56] = 4096, [0x57] = 1, [0x58] = 4, [0x59] = 2, [0x5A] = 0,
+    [0x5B] = 4096, [0x5C] = 16384, [0x5D] = 4096, [0x5E] = 128, [0x5F] = 4096,
+};
+
 // 状态对象（blend/color/depth…）没有 CPU 可见结果，只需要默认值 + get/set 自洽：
 // 我们把第一个参数当作对象，按 (id, 字段序号) 存在对象前 0x80 字节里。
 // 约定：*Set*(obj, a, v) 存 a 字段；*Get* 读回。字段地址由 id 高位区分。
@@ -164,7 +189,46 @@ static u64 za_nvn_unknown_impl(u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
     return 0;
 }
 
+// ── 最近调用环形缓冲（客机 Panic/断言时由崩溃处理器打印）────────────
+// 只记「谁、前两个参数、返回值」——足够定位 panic 前最后几步 NVN 调用。
+#define ZA_NVN_HIST 64
+typedef struct {
+    unsigned id;
+    u64 a0, a1, ret;
+} za_nvn_hist_t;
+static za_nvn_hist_t za_nvn_hist[ZA_NVN_HIST];
+static unsigned za_nvn_hist_n;
+
+void za_nvn_dump_recent(void)
+{
+    unsigned n = za_nvn_hist_n < ZA_NVN_HIST ? za_nvn_hist_n : ZA_NVN_HIST;
+    ZLOGI("NVN 最近 %u 次调用（旧 → 新）：", n);
+    for (unsigned k = 0; k < n; k++) {
+        unsigned i = (za_nvn_hist_n - n + k) % ZA_NVN_HIST;
+        const za_nvn_hist_t *h = &za_nvn_hist[i];
+        ZLOGI("    %s(a0=%#llx a1=%#llx) -> %#llx", za_nvn_name[h->id],
+              (unsigned long long)h->a0, (unsigned long long)h->a1,
+              (unsigned long long)h->ret);
+    }
+}
+
+static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6,
+                           u64 a7);
+
 static u64 za_nvn_call(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6, u64 a7)
+{
+    u64 r = za_nvn_dispatch(id, a0, a1, a2, a3, a4, a5, a6, a7);
+    za_nvn_hist_t *h = &za_nvn_hist[za_nvn_hist_n % ZA_NVN_HIST];
+    h->id = (unsigned)id;
+    h->a0 = a0;
+    h->a1 = a1;
+    h->ret = r;
+    za_nvn_hist_n++;
+    return r;
+}
+
+static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u64 a6,
+                           u64 a7)
 {
     void *o = (void *)(uintptr_t)a0;
 
@@ -201,12 +265,23 @@ static u64 za_nvn_call(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
             ZLOGI("★ NVN 客机要的入口不在表里：%s（给通用桩）", (const char *)(uintptr_t)a1);
             fn = (void *)&za_nvn_unknown_impl;
         }
-        st64(o, F_EXTRA, (u64)(uintptr_t)fn);
+        // ⚠ 不要往 device 里写任何东西：main 解析整张表时传的 device 是 NULL
+        //   （nvnDeviceGetProcAddress(NULL, 名字) 取「全局函数」），写影子字段
+        //   会直接落到 0x0+0x78 ⇒ SIGSEGV @ addr=0x78（真机实测）。
         return (u64)(uintptr_t)fn;
     }
-    case ZA_NVN_ID_nvnDeviceGetInteger:
-        ZLOGI("★ NVN nvnDeviceGetInteger(id=%#llx)", (unsigned long long)a1);
+    case ZA_NVN_ID_nvnDeviceGetInteger: {
+        // 原型：void nvnDeviceGetInteger(const NVNdevice*, NVNdeviceInfo, int*)
+        int *out = (int *)(uintptr_t)a2;
+        unsigned what = (unsigned)a1;
+        int v = 0;
+        if (what < sizeof za_nvn_devinfo / sizeof za_nvn_devinfo[0])
+            v = za_nvn_devinfo[what];
+        else
+            ZLOGI("★ NVN DeviceGetInteger 未知项 %#x（给 0）", what);
+        if (out) *out = v;
         return 0;
+    }
     case ZA_NVN_ID_nvnDeviceGetCurrentTimestampInNanoseconds:
     case ZA_NVN_ID_nvnDeviceGetTimestampInNanoseconds:
         if (a1) st64((void *)(uintptr_t)a1, 0, za_nvn_now_ns());
@@ -216,6 +291,16 @@ static u64 za_nvn_call(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
         return ld32(o, F_EXTRA);
     case ZA_NVN_ID_nvnDeviceIsExternalDebuggerAttached:
         return 0;
+    // 贴图句柄：低 20 位是贴图描述符号，高位是采样器号（与 NVN 的位布局一致）
+    case ZA_NVN_ID_nvnDeviceGetTextureHandle:
+        return (u64)(u32)a1 | ((u64)(u32)a2 << 20);
+    case ZA_NVN_ID_nvnDeviceGetTexelFetchHandle:
+    case ZA_NVN_ID_nvnDeviceGetImageHandle:
+        return (u64)(u32)a1;
+    case ZA_NVN_ID_nvnDeviceGetSeparateTextureHandle:
+        return (u64)(u32)a1;
+    case ZA_NVN_ID_nvnDeviceGetSeparateSamplerHandle:
+        return (u64)(u32)a1 << 20;
     case ZA_NVN_ID_nvnDeviceGetWindowOriginMode:
         return 0;
     case ZA_NVN_ID_nvnDeviceGetDepthMode:
@@ -407,9 +492,14 @@ static u64 za_nvn_call(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
     case ZA_NVN_ID_nvnWindowFinalize:
         return 0;
     case ZA_NVN_ID_nvnWindowAcquireTexture: {
+        // 原型：NVNwindowAcquireTextureResult nvnWindowAcquireTexture(NVNwindow*, NVNsync*, int*)
+        // 结果 0 = SUCCESS（之前返回 1 = NATIVE_ERROR，客机会当成取图失败）。
         void *idx = (void *)(uintptr_t)a2;
-        if (idx) st32(idx, 0, 0);
-        return 1;
+        u32 ntex = is_obj(o) ? ld32(o, F_FLAGS2) : 0;
+        u32 cur = is_obj(o) ? ld32(o, F_W) : 0;
+        if (idx) st32(idx, 0, ntex ? (cur % ntex) : 0);
+        if (is_obj(o)) st32(o, F_W, cur + 1);
+        return 0;
     }
     case ZA_NVN_ID_nvnWindowGetNativeWindow:
         return is_obj(o) ? ld64(o, F_MEMORY) : 0;
@@ -739,15 +829,19 @@ static u64 za_nvn_call(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
         return 0;
 
     // ── 纹理池 / 采样器池 ─────────────────────────────────────────────
+    // 原型：NVNboolean nvnXxxPoolInitialize(pool, const NVNmemoryPool*, ptrdiff_t off, int n)
+    // ⚠ 第二个参数是**内存池对象**，不是 builder；n 是描述符个数（贴图 0x7000 / 采样器 0x200）。
     case ZA_NVN_ID_nvnTexturePoolInitialize:
     case ZA_NVN_ID_nvnSamplerPoolInitialize:
         init_obj(o, 0x20);
-        if (is_obj((const void *)(uintptr_t)a1)) {
-            st64(o, F_POOL, ld64((const void *)(uintptr_t)a1, 0));
-            st64(o, F_POOLOFF, ld64((const void *)(uintptr_t)a1, 8));
-            st64(o, F_SIZE, ld64((const void *)(uintptr_t)a1, 16));
-        }
-        return 0;
+        st64(o, F_POOL, a1);
+        st64(o, F_POOLOFF, a2);
+        st64(o, F_SIZE, a3);
+        ZLOGI("★ NVN %s(size=%llu)", za_nvn_name[id], (unsigned long long)a3);
+        return 1;
+    case ZA_NVN_ID_nvnTexturePoolGetSize:
+    case ZA_NVN_ID_nvnSamplerPoolGetSize:
+        return is_obj(o) ? ld64(o, F_SIZE) : 0;
     case ZA_NVN_ID_nvnTexturePoolFinalize:
     case ZA_NVN_ID_nvnSamplerPoolFinalize:
     case ZA_NVN_ID_nvnTexturePoolRegisterTexture:
@@ -761,9 +855,6 @@ static u64 za_nvn_call(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
     case ZA_NVN_ID_nvnTexturePoolGetMemoryOffset:
     case ZA_NVN_ID_nvnSamplerPoolGetMemoryOffset:
         return is_obj(o) ? ld64(o, F_POOLOFF) : 0;
-    case ZA_NVN_ID_nvnTexturePoolGetSize:
-    case ZA_NVN_ID_nvnSamplerPoolGetSize:
-        return is_obj(o) ? ld64(o, F_SIZE) : 0;
 
     // ── 命令缓冲 ──────────────────────────────────────────────────────
     case ZA_NVN_ID_nvnCommandBufferInitialize:
@@ -847,7 +938,11 @@ static u64 za_nvn_call(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a5, u
     case ZA_NVN_ID_nvnEventGetValue:
         return is_obj(o) ? ld64(o, F_SIZE) : 0;
     case ZA_NVN_ID_nvnEventSignal:
-        if (is_obj(o)) st64(o, F_SIZE, ld64(o, F_SIZE) + 1);
+        // 原型：void nvnEventSignal(NVNevent*, NVNeventSignalMode, uint32_t)
+        // 0 = ADD，1 = SET
+        if (!is_obj(o)) return 0;
+        if ((u32)a1 == 0) st64(o, F_SIZE, ld64(o, F_SIZE) + (u32)a2);
+        else st64(o, F_SIZE, (u32)a2);
         return 0;
     case ZA_NVN_ID_nvnEventGetMemoryPool:
         return is_obj(o) ? ld64(o, F_POOL) : 0;

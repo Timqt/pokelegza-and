@@ -52,6 +52,7 @@
 #include "za_guest_info.h"
 #include "za_mem.h"
 #include "za_os.h"
+#include "za_nvn.h"
 
 // SDK 映像基址/大小（定义在 za_guest.c）：崩溃与断言回溯时用来把地址换算成模块偏移
 extern volatile unsigned long za_sdk_base;
@@ -1875,6 +1876,10 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             memcpy(&v, (const void *)(uintptr_t)a1, (size_t)a2);
         ZLOGI("Horizon: Break reason=%#lx info=%#lx size=%ld 值=%#llx",
               (unsigned long)a0, (unsigned long)a1, a2, v);
+        // ★ 新增：把 panic 前最后 64 次 NVN 调用打出来。
+        //   NVN 入口只在每个函数前两次调用时打日志，后面全是静默的；
+        //   客机 panic 时没有这份记录就只能靠猜最后走到哪一步。
+        za_nvn_dump_recent();
         // ① info 附近原始字节：断言文本/结构体常紧邻它
         if (a1)
         {

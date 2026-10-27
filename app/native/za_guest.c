@@ -53,6 +53,7 @@
 #include "za_guest_api.h"
 #include "za_os.h"
 #include "za_nvn.h"
+#include "za_vi.h"
 
 // ── 客机映像布局（来自 za_guest_info.h，实测值）────────────────────────
 //   text   0x0000000 .. 0x2fc7250
@@ -2154,6 +2155,14 @@ static const za_host_sym_t za_host_syms[] = {
 
     // NVN 图形入口（图形层未接：回陷阱桩，客机一调就知道缺哪个）
     { "nvnBootstrapLoader", (void *)za_nvn_bootstrap_loader },
+
+    // vi 客户端 API（显示 / 图层 / 原生窗口）。只接 main 导入的这 5 个，
+    // Initialize/Finalize 仍走 SDK：SDK 内部还有别的模块读它的 vi 状态。
+    { "_ZN2nn2vi18OpenDefaultDisplayEPPNS0_7DisplayE", (void *)za_vi_open_default_display },
+    { "_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", (void *)za_vi_create_layer },
+    { "_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", (void *)za_vi_get_native_window },
+    { "_ZN2nn2vi12DestroyLayerEPNS0_5LayerE", (void *)za_vi_destroy_layer },
+    { "_ZN2nn2vi12CloseDisplayEPNS0_7DisplayE", (void *)za_vi_close_display },
 
     // 时间
     { "_ZN2nn2os13GetSystemTickEv", (void *)za_get_system_tick },

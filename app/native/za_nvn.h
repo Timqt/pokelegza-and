@@ -14,4 +14,7 @@ void *za_nvn_bootstrap(const char *name);
 // 名字 -> 实现地址；不在表里返回 NULL。
 void *za_nvn_lookup(const char *name);
 
+// 打印最近 64 次 NVN 调用（名字 + 参数 + 返回值）。崩溃处理器里调用。
+void za_nvn_dump_recent(void);
+
 #endif

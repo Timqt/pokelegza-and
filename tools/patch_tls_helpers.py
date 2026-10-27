@@ -54,6 +54,47 @@ def is_tls_mask(w):
     return False
 
 
+# ── 「这条指令会不会写 Rd」的保守判断 ─────────────────────────────────
+# 用途：同一个 `mrs x24,TPIDR_EL0` 之后，函数里可能**多次**把 x24 掩码成
+# 「线程上下文基址」（实测 main+0x177038c 就是第二处）。只改写紧挨着 mrs 的
+# 那一条（本脚本原来的做法）会让后面的站点继续拿 bionic 的裸 TP 去对齐：
+#   真机实测 [TP&~0x1fff +0x98] = 0xb400006f9b1bb800（bionic 元数据当计数用）
+#   ⇒ `add x8,x8,x9,lsl#3` 溢成 0xa00003ea4385a000 ⇒ SIGSEGV。
+# 所以从 mrs 往后扫，遇到「写同一个寄存器」就停，把中间的掩码点都补上。
+# 只列常见会产值的编码；判不准时**当作不写**（保守：最多多改一条掩码，
+# 而掩码改写的语义与该点原本要算的东西一致）。
+_RD_WRITING = [
+    (0x7F000000, 0x0A000000),   # 逻辑/算术（移位寄存器）
+    (0x7F000000, 0x0B000000),   # add/sub（移位寄存器）
+    (0x7F800000, 0x11000000),   # add/sub（立即数）
+    (0x7F800000, 0x12000000),   # 逻辑（立即数）
+    (0x7F800000, 0x52800000),   # movz/movn/movk
+    (0x7F800000, 0x12800000),
+    (0x7F800000, 0x72800000),
+    (0x7F800000, 0xD2800000),
+    (0x7F800000, 0xF2800000),
+    (0x7F800000, 0x92800000),
+    (0x7F800000, 0xB2800000),
+    (0x1F000000, 0x10000000),   # adr/adrp
+    (0x7F200000, 0x1A000000),   # 数据处理（寄存器）
+    (0x7F200000, 0x2A000000),   # 逻辑（寄存器）
+]
+
+
+def writes_rd(w):
+    """这条指令写入的目标寄存器号；判断不了返回 -1。"""
+    rd = w & 0x1F
+    for mask, val in _RD_WRITING:
+        if (w & mask) == val:
+            return rd
+    if (w & 0x3B000000) in (0x39000000, 0x18000000, 0xB9000000, 0x19000000):
+        return rd
+    if (w & 0xFFC00000) in (0xF9400000, 0xF8400000, 0xB9400000, 0x39400000,
+                            0x79400000, 0x39800000, 0xB9800000, 0xF9800000):
+        return rd
+    return -1
+
+
 def adrp_x(rd, page_delta):
     """编码 adrp Xd, <page>：imm21 = (目标页 - 本指令所在页) >> 12。
 
@@ -105,6 +146,28 @@ def main():
         #   D+0x98 = (area-D)/8 ⇒ 结果正好是该线程的 TLS 变量区。
         patches.append((off, 0xD53BD040 | src1,
                         0xF9400000 | ((0x40 // 8) << 10) | (src1 << 5) | dst2))
+
+        # ★ 2026-10-27：同一函数里可能**再次**用同一个寄存器去掩码。
+        #   实测 main+0x17702d0 `mrs x24,TPIDR_EL0` 之后，0x177038c 又有一条
+        #   `and x8,x24,#~0x1FFF`：第一处改写后 x24 仍是裸 TP，第二处照旧
+        #   把 bionic 的 TP 对齐 8KB 当线程上下文 ⇒ 读到 bionic 元数据当计数
+        #   （x9=0xb400006f9b1bb800）⇒ add 溢出成野地址 ⇒ SIGSEGV。
+        #   只有「掩到另一个寄存器」的形态才需要补：原地形态（ubfm x8,x8）
+        #   改写后 x8 已经是 D，后续语义不再依赖 TP。
+        if dst2 != src1:
+            for k in range(i + 2, min(i + 256, n)):
+                wk = words[k]
+                if wk in (0xD65F03C0, 0xD65F0BFF, 0x00000000):   # ret / udf
+                    break
+                if writes_rd(wk) == src1 and not is_tls_mask(wk):
+                    break                                       # src1 被重新赋值
+                if is_tls_mask(wk) and ((wk >> 5) & 31) == src1:
+                    # 只替换这一条：off=该掩码点，w0=ldr，w1=原样的下一条
+                    # （补丁应用端固定写两条，所以要把 +4 那条原封不动写回去）
+                    patches.append((k * 4,
+                                    0xF9400000 | ((0x40 // 8) << 10) |
+                                    (src1 << 5) | (wk & 31),
+                                    words[k + 1]))
 
     print("TLS helper 改写点：%d 处" % len(patches))
     with open(OUT_H, "w", encoding="utf-8", newline="\n") as o:
