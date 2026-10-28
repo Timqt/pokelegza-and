@@ -1418,6 +1418,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         // 登记进等待表：看门狗伪唤醒才够得着（以前这条路径完全在表外）。
         za_sync_note_addr_wait((unsigned long long)a0, v, type,
                                (unsigned long long)za_horizon_regs[ZA_REG_PC]);
+        int slices = 0;
         for (;;)
         {
             unsigned int cur = __atomic_load_n(p, __ATOMIC_ACQUIRE);
@@ -1456,7 +1457,23 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             int rc = (int)syscall(SYS_futex, (int *)p, FUTEX_WAIT_PRIVATE, (int)cur, &ts, NULL, 0);
             if (rc == 0) { za_sync_addr_wait_done(); return 0; }     // 被唤醒
             if (errno == EAGAIN || errno == EINTR) continue;   // 值变了/被信号打断 ⇒ 重判
-            if (ns < 0) continue;                   // 分片到期 ⇒ 重判条件（伪唤醒）
+            if (ns < 0) {
+                // ★ 陈旧持锁兜底：sdk+0x13a684 是 mutex 慢路径
+                //   WaitForAddress(addr, GreaterThan(2), 1) —— 等锁字变成 2。
+                //   锁字一直停在 1 说明持锁者再也不会解锁（线程挂了/自己也在等）。
+                //   等够 1 秒就把它强制清零并唤醒：宁可短暂破坏互斥，也不能整条线停死。
+                if (++slices >= 50) {
+                    static int nforce;
+                    if (nforce++ < 6)
+                        ZLOGE("svc#52 1s 未解锁 addr=%#llx word=%#x ⇒ 强制清零",
+                              (unsigned long long)a0, __atomic_load_n(p, __ATOMIC_ACQUIRE));
+                    __atomic_store_n(p, 0u, __ATOMIC_RELEASE);
+                    syscall(SYS_futex, (int *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
+                    za_sync_addr_wait_done();
+                    return 0;
+                }
+                continue;                           // 分片到期 ⇒ 重判条件（伪唤醒）
+            }
             za_sync_addr_wait_done();
             return 0xEA01u;                         // 真超时
         }

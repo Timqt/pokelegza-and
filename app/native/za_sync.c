@@ -458,8 +458,8 @@ void za_sync_dump(void)
     ZLOGI("sync 等待表（%d 个线程）：", n);
     for (int i = 0; i < n; i++)
     {
-        ZLOGI("    tid=%ld kind=%d granted=%d lock=%#llx(word=%#x) key=%#llx tag=%#x",
-              tid[i], kind[i], granted[i], addr[i], word[i], key[i], tag[i]);
+        ZLOGI("    tid=%ld kind=%d granted=%d lock=%#llx(word=%#x) key=%#llx tag=%#x pc=%#llx",
+              tid[i], kind[i], granted[i], addr[i], word[i], key[i], tag[i], gpc[i]);
         if (kind[i] == 2) za_dump_ret_ring_for(tid[i]);   // 它最后几条 svc
         // 客机侧调用链：x30 + 从 sp 往上扫到的前 4 个映像内返回地址
         if (kind[i] == 2 && i < 4 && gsp[i]) za_sync_dump_guest_chain(gsp[i], gpc[i]);
