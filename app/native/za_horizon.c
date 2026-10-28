@@ -1470,6 +1470,22 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         // 唤醒该地址上的所有等待者；type/value 的过滤由等待者自己重判条件完成
         // （内核按条件过滤，这里多唤醒是安全的：条件不成立的会立刻再睡）。
         unsigned int *p = (unsigned int *)(uintptr_t)a0;
+        // 诊断：完整采样信号参数（每秒最多 12 行）。要回答的问题是
+        // 「到底有没有人给这些被监视的地址发过信号、发的什么 type/value」。
+        {
+            static unsigned long long win;
+            static unsigned nl;
+            struct timespec tsv;
+            clock_gettime(CLOCK_MONOTONIC, &tsv);
+            unsigned long long now = (unsigned long long)tsv.tv_sec * 1000000000ull + tsv.tv_nsec;
+            if (now - win > 1000000000ull) { win = now; nl = 0; }
+            if (nl < 12) {
+                nl++;
+                unsigned int cur = p ? __atomic_load_n(p, __ATOMIC_RELAXED) : 0xdeadbeef;
+                ZLOGI("svc#53 addr=%#llx type=%ld value=%u cur=%#x", (unsigned long long)a0,
+                      (long)a1, (unsigned)a2, cur);
+            }
+        }
         if (p) syscall(SYS_futex, (int *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
         return 0;
     }
