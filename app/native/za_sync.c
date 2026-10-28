@@ -778,6 +778,76 @@ void za_sync_scan_for_addr(unsigned long long val)
     ZLOGI("      ↳ 全线程栈扫描：%d 处命中", hits);
 }
 
+// ── LightMessageQueue 配对诊断 ────────────────────────────────────────
+// SDK 里 nn::os::LightMessageQueue 的布局（反汇编 sdk+0x13b370 TryReceive 确认）：
+//   +0x00 数组指针  +0x08 容量  +0x0c 已用  +0x10 头下标  +0x18 用户态自旋锁
+//   +0x20 **发送方**等待字（队列满时 Send 睡在这里，等接收方腾位置）
+//   +0x28 **接收方**等待字（队列空时 Receive 睡在这里，等发送方投递）
+// 两个方向互相唤醒：发送方投递后 svc#53(q+0x28)，接收方取出后应 svc#53(q+0x20)。
+// 死锁形状：队满 + 发送方睡在 +0x20 + 接收方睡在 +0x28 ⇒ 谁也叫不醒谁。
+//
+// 停摆时把每个 kind=3 等待者对应的候选队列打出来（+0x20 与 +0x28 两种解释都试），
+// 用 used/cap 和两个等待字立刻能分辨是「队满没人取」还是「队空没人投」。
+void za_sync_dump_lq_pairs(void)
+{
+    unsigned long long qs[ZS_MAX];
+    unsigned long long fullq[2];
+    int nq = 0, nfull = 0;
+    zs_lock();
+    for (int i = 0; i < ZS_MAX; i++) {
+        zs_slot_t *w = &zs_slots[i];
+        if (!__atomic_load_n(&w->tid, __ATOMIC_RELAXED)) continue;
+        if (w->kind != 3 || !w->addr) continue;
+        unsigned long long cand[2] = { w->addr - 0x20, w->addr - 0x28 };
+        for (int k = 0; k < 2; k++) {
+            int j = 0;
+            while (j < nq && qs[j] != cand[k]) j++;
+            if (j == nq && nq < ZS_MAX) qs[nq++] = cand[k];
+        }
+    }
+    ZLOGE("★ LightMessageQueue 候选（%d 个）：", nq);
+    for (int i = 0; i < nq; i++) {
+        unsigned long long q = qs[i];
+        unsigned long long arr = 0;
+        unsigned int cap = 0, used = 0, head = 0, w20 = 0, w28 = 0;
+        if (!za_sync_read(&arr, q, 8)) continue;
+        if (!za_sync_read(&cap, q + 8, 4)) continue;
+        if (!za_sync_read(&used, q + 0xc, 4)) continue;
+        if (!za_sync_read(&head, q + 0x10, 4)) continue;
+        if (!za_sync_read(&w20, q + 0x20, 4)) continue;
+        if (!za_sync_read(&w28, q + 0x28, 4)) continue;
+        // 只打印「像 LQ」的：数组指针是堆地址且容量合理
+        int looks = (cap > 0 && cap <= 0x10000 && used <= cap);
+        if (!looks) continue;
+        int sw = 0, rw = 0;
+        for (int s = 0; s < ZS_MAX; s++) {
+            zs_slot_t *w = &zs_slots[s];
+            if (!__atomic_load_n(&w->tid, __ATOMIC_RELAXED)) continue;
+            if (w->kind != 3) continue;
+            if (w->addr == q + 0x20) sw++;
+            if (w->addr == q + 0x28) rw++;
+        }
+        ZLOGE("    q=%#llx arr=%#llx used=%u/%u head=%u  send_wait(+20)=%u recv_wait(+28)=%u"
+              "  等待者: 发送方 %d / 接收方 %d%s",
+              q, arr, used, cap, head, w20, w28, sw, rw,
+              (used == cap && sw && !rw) ? "  ← 队满+发送方在等：接收方没在等 ⇒ 没人取" :
+              (used == cap && sw && rw) ? "  ← 队满+两边都在等 ⇒ 双向死锁" :
+              (used == 0 && rw) ? "  ← 队空+接收方在等 ⇒ 没人投递" : "");
+        // 队满且没有接收方 ⇒ 找出「谁认识这个工作队列对象」：如果连一条线程的
+        // 栈上都没有它，说明负责消费的那个 runner 根本不存在/没在跑。
+        // ⚠ 扫栈很慢，而且要在**放锁之后**做（扫描本身会读栈/取别的锁，
+        //   持 zs_lock 会与其它线程形成 ABBA 死锁——真机上直接把进程卡住）。
+        if (used == cap && !rw && nfull < 2) fullq[nfull++] = q - 0x40;
+    }
+    zs_unlock();
+    // 放锁之后再扫栈（很慢，且会取别的锁）
+    for (int i = 0; i < nfull; i++) {
+        extern void za_sync_scan_for_addr(unsigned long long val);
+        ZLOGE("      ↳ 扫线程栈找工作队列对象 %#llx（=q-0x40）的持有者：", fullq[i]);
+        za_sync_scan_for_addr(fullq[i]);
+    }
+}
+
 void za_sync_dump(void)
 {
     long tid[ZS_MAX];
