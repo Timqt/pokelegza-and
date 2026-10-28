@@ -228,6 +228,20 @@ static void za_probe_threadtype(const char *tag, unsigned long long t)
 }
 static void za_hook_startthread(unsigned long long *r)   { za_probe_threadtype("os::StartThread", r[0]); }
 static void za_hook_startimpl(unsigned long long *r)     { za_probe_threadtype("Impl::StartThread", r[0]); }
+// sdk+0x56e3a0 = memset(dst=x0, val=w1, len=x2) 的入口。
+// 目的：验证「客机反复按超大尺寸建池并 memset」这个假设 ——
+// 若 len 经常是几十~几百 MB，而池子只要 4MB，就是我们的尺寸计算放大了。
+static void za_hook_memset(unsigned long long *r)
+{
+    unsigned long long dst = r[0], len = r[2];
+    static int big;
+    if (len < (1ull << 20)) return;                 // <1MB 不记，避免刷屏
+    if (big < 24 || (big % 100) == 0)
+        ZLOGE("★ memset len=%#llx dst=%#llx val=%#llx tid=%ld caller=%#llx (第%d次≥1MB)",
+              len, dst, r[1], (long)syscall(SYS_gettid), r[19], big + 1);
+    big++;
+}
+
 static void za_hook_lockmutex(unsigned long long *r)     { za_trace_mutex("lock", r[0]); }
 // 慢路径见过「锁字 = 2（交接态）」的对象地址。停摆时据此做恢复。
 #define ZA_MSLOW_N 8
@@ -959,6 +973,8 @@ int za_sdk_load(za_mod_t *sdk,
         za_install_entry_probe(base, 0x13c1c0, 0xc90c80, 0xc90cf8, za_hook_unlockmutex);
         // sdk+0x13a5d0：慢路径互斥（主线程卡在它内部的 0x13a684 WaitForAddress）
         za_install_entry_probe(base, 0x13a5d0, 0xc91080, 0xc910f8, za_hook_mutex_slow);
+        // sdk+0x56e3a0 = memset(dst,val,len)：验证「超大尺寸建池 + memset」假设
+        za_install_entry_probe(base, 0x56e3a0, 0xc91180, 0xc911f8, za_hook_memset);
         // ⚠ 探针在一个函数的**中间指令**上（0x500194 = `cbnz w0, abort`）时，
         //   hook 的返回值/寄存器约定必须和原指令自洽 —— 实测这条探针让执行流
         //   落进了 hook 槽中间（sdk+0xc90d7c），SIGILL。已移除。
