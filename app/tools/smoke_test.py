@@ -102,9 +102,16 @@ MILESTONES = [
     ("M5", "SetHostArgc/Argv 已设置",
      lambda lg, cg, cr: "里程碑 M5" in lg,
      "进程参数已交给 SDK ⇒ 下一步进 nnMain"),
-    ("M6", "nn::init::Start 返回",
+]
+
+# ★ 不计入里程碑的参考项：M6 表示 nn::init::Start **返回**，
+#   对仍在运行的游戏永远不成立（要 nnMain 跑完/退出才会返回）。
+#   以前把它算进里程碑 ⇒ 每次都显示「M6 未达成」，系统性低估进度，
+#   还把真正的卡点盖住了。
+INFO_ROWS = [
+    ("M6", "nn::init::Start 返回（参考项）",
      lambda lg, cg, cr: "里程碑 M6" in lg,
-     "nnMain 已跑完/退出"),
+     "运行中的游戏永不成立（只有 nnMain 结束才返回），不作判定"),
 ]
 
 HEALTH = [
@@ -119,7 +126,7 @@ HEALTH = [
      "nnrtld/SDK 的符号解析失败"),
     ("H4", "关键 TLS 指令补丁已生效",
      lambda lg, cg, cr: cr.get("tls_patched"),
-     "0x144618 应是 adrp（不是 mrs TPIDRRO_EL0）、0x144620 应是 nop（不是 msr TPIDR_EL0）"),
+     "0x144618 应是 b（0x14xxxxxx，跳到每站点桩）、0x144620 应是 nop"),
     ("H5", "进程在跑（未崩）",
      lambda lg, cg, cr: cr.get("alive"),
      "app 进程仍然存活"),
@@ -179,8 +186,9 @@ def parse_crash(cg, lg=""):
         v620 = int(m620.group(1), 16)
         info["probe_144618"] = v618
         info["probe_144620"] = v620
-        # 0x144618 应是 adrp（0x90......）；0x144620 应是 nop（0xD503201F）
-        info["tls_patched"] = (v618 & 0x9F000000) == 0x90000000 and v620 == 0xD503201F
+        # ★ 现在 TPIDRRO_EL0 的补丁方式是「换成 `b <每站点桩>`」（每线程页由宿主给），
+        #   不再是 adrp ⇒ 0x144618 应是 b（0x14xxxxxx）；0x144620 仍是 nop。
+        info["tls_patched"] = (v618 & 0xFC000000) == 0x14000000 and v620 == 0xD503201F
     return info
 
 
@@ -272,6 +280,8 @@ def main():
     print("=" * 74)
     for code, title, kind, ok, note in rows:
         print(f"  {'✅' if ok else '❌'} {code}  {title:<26} {note}")
+    for code, title, fn, note in INFO_ROWS:
+        print(f"  ℹ️  {code}  {title:<26} {note}")
     print("-" * 74)
     print(f"  当前到达：{blocking}")
     m = re.search(r"signal b pc=([0-9a-f]+).*?addr=([0-9a-f]+)", gcb)
@@ -284,7 +294,7 @@ def main():
     if tail:
         print("  最后几次 #41：" + "  ".join(f"id={a}@{b}" for a, b in tail[-6:]))
     if "probe_144618" in info:
-        print(f"  指令探针：0x144618={info.get('probe_144618'):#x}（应为 adrp 0x90xxxxxx）"
+        print(f"  指令探针：0x144618={info.get('probe_144618'):#x}（应为 b 0x14xxxxxx，每站点桩）"
               f"  0x144620={info.get('probe_144620'):#x}（应为 nop 0xd503201f）")
     if info.get("c41_max"):
         print(f"  #41 单 id 最大次数：{info['c41_max']}")
