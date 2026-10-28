@@ -62,18 +62,33 @@ static void za_sync_dump_guest_chain(unsigned long long sp, unsigned long long p
 {
     extern unsigned char *za_guest_base;
     unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
-    ZLOGI("      客机等待点 x30=%s%#llx",
-          (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? "main+" :
-          (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? "sdk+" : "",
-          (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? pc - mb
-              : (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? pc - za_sdk_base : pc);
-    int hits = 0;
-    for (int k = 0; k < 2048 && hits < 24; k++) {
-        unsigned long long v = 0;
-        if (!za_sync_read(&v, sp + (unsigned long)k * 8, 8)) break;
-        if (v >= mb && v < mb + ZA_IMAGE_SIZE) { ZLOGI("        main+%#llx", v - mb); hits++; }
-        else if (v >= za_sdk_base && v < za_sdk_base + za_sdk_size) { ZLOGI("        sdk+%#llx", v - za_sdk_base); hits++; }
+    if (pc) {
+        ZLOGI("      客机等待点 x30=%s%#llx",
+              (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? "main+" :
+              (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? "sdk+" : "",
+              (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? pc - mb
+                  : (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? pc - za_sdk_base : pc);
     }
+    // 先收集，再决定打印多少：**工作线程**的链里一定有 main+0x1bab754（工作循环）；
+    // 不含它的就是主线程（或别的非常规线程），那条链要全量打印 —— 这才是
+    // 「游戏到底停在哪个函数」的答案。
+    unsigned long long v[24];
+    int kind[24];   // 1 = main, 2 = sdk
+    int n = 0, is_worker = 0;
+    for (int k = 0; k < 2048 && n < 24; k++) {
+        unsigned long long x = 0;
+        if (!za_sync_read(&x, sp + (unsigned long)k * 8, 8)) break;
+        if (x >= mb && x < mb + ZA_IMAGE_SIZE) {
+            if (x - mb == 0x1bab754ull || x - mb == 0x1bac54cull) is_worker = 1;
+            v[n] = x - mb; kind[n++] = 1;
+        } else if (za_sdk_base && x >= za_sdk_base && x < za_sdk_base + za_sdk_size) {
+            v[n] = x - za_sdk_base; kind[n++] = 2;
+        }
+    }
+    int show = is_worker ? (n < 6 ? n : 6) : n;
+    if (!is_worker) ZLOGI("      ★ 非工作线程（链中无 0x1bab754 / 0x1bac54c）——全量 %d 帧：", n);
+    for (int i = 0; i < show; i++)
+        ZLOGI("        %s%#llx", kind[i] == 1 ? "main+" : "sdk+", v[i]);
 }
 
 // za_horizon.c：按 tid 倒出 svc 环形记录（阻塞中的那条 ret 是哨兵 0xdead）
