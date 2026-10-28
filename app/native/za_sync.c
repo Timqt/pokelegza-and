@@ -634,6 +634,55 @@ void za_sync_note_guest(unsigned long long sp, unsigned long long pc,
     w->gfp = fp;
 }
 
+// ── svc#52 最热线程：谁在原地打转 ─────────────────────────────────────
+// 自旋的线程永远不登记进等待表（每次都是 FA01 立刻返回），所以等待表里
+// 看不到它。这里按 tid 记一份「最后一次调用 svc#52 时的客机 sp/fp/pc」，
+// 停摆时挑调用次数最多的那个线程，把它的 **fp 链**打出来 —— 这才是
+// 「游戏卡在哪个子系统」的直接答案。
+typedef struct {
+    volatile long tid;
+    unsigned long long sp, fp, pc, addr;
+    unsigned int cnt;
+} zs_spin_rec_t;
+static zs_spin_rec_t zs_spin_rec[64];
+
+void za_sync_note_spin(long tid, unsigned long long sp, unsigned long long fp,
+                       unsigned long long pc, unsigned long long addr)
+{
+    zs_spin_rec_t *r = &zs_spin_rec[(unsigned)tid & 63];
+    r->tid = tid;
+    r->sp = sp; r->fp = fp; r->pc = pc; r->addr = addr;
+    r->cnt++;
+}
+
+void za_sync_dump_top_spinner(void)
+{
+    zs_spin_rec_t *best = NULL;
+    for (int i = 0; i < 64; i++) {
+        zs_spin_rec_t *r = &zs_spin_rec[i];
+        if (!r->tid) continue;
+        if (!best || r->cnt > best->cnt) best = r;
+    }
+    if (!best) { ZLOGE("      （还没有 svc#52 记录）"); return; }
+    ZLOGE("★ svc#52 最热线程 tid=%ld 累计 %u 次，等待字 %#llx sp=%#llx fp=%#llx：",
+          best->tid, best->cnt, best->addr, best->sp, best->fp);
+    if (best->pc) za_sync_print_addr("  它的 pc", best->pc);
+    if (best->fp) za_sync_dump_guest_chain(best->fp, best->sp, 0);
+    else ZLOGE("      （没有 fp，无法回溯）");
+}
+
+// 最热线程在等的那个字：停摆时要扫的是**它**的持有者，不是主线程的。
+unsigned long long za_sync_top_spin_addr(void)
+{
+    zs_spin_rec_t *best = NULL;
+    for (int i = 0; i < 64; i++) {
+        zs_spin_rec_t *r = &zs_spin_rec[i];
+        if (!r->tid) continue;
+        if (!best || r->cnt > best->cnt) best = r;
+    }
+    return best ? best->addr : 0;
+}
+
 void za_sync_dump_chain_for(long tid)
 {
     zs_slot_t *w = NULL;
@@ -878,8 +927,34 @@ unsigned long za_sync_wait_addr(unsigned long long addr, int type, int val, long
     zs_lock();
     {
         unsigned int v = __atomic_load_n(p, __ATOMIC_ACQUIRE);
-        int ok = (type == 2) ? ((int)v == val) : ((int)v < val);
-        if (ok && type == 1) {
+        // type 是「哪种关系成立才等」（真机实测，见 SDK+0x13a670 与 0x13a854）：
+        //   0 = Equal   ⇒ 等 v == val
+        //   1 = Less    ⇒ 等 v <  val（成功后再减一，语义是信号量 Acquire）
+        //   2 = Greater ⇒ 等 v >  val
+        //   3 = NotEqual⇒ 等 v != val
+        // 互斥字 0/1/2 的握手就是靠 (2, 1)：等 word > 1，也就是等持有者把它推成 2。
+        // 以前把 2 当成 ==，于是 word==1 的等待者永远睡着（没人需要写 2），整机停摆。
+        int ok;
+        switch (type) {
+        case 0: ok = ((int)v == val); break;
+        // ★ 2026-10-28 实测确认：这个 SDK 的 (type=2, value=1) 用在**工作队列**上
+        //   （SDK+0x13b2d0..0x13b334）：
+        //     word == 2 → 直接试着出队（工作已就绪）
+        //     word == 0 → 先 CAS 0→1 把自己登记成「有人在等」，再 svc#52
+        //     word == 1 → svc#52 睡下去，等生产方把它推成 2
+        //   生产方 svc#53(type=1, value=1) 做 CAS 1→2 并唤醒。
+        //   ⇒ 等待条件是 **v == value**（睡在自己的「等待中」标记上）。
+        //   按 v > value 判会变成纯自旋（实测 120 万次/秒、队列永远空）。
+        case 2: ok = ((int)v == val); break;
+        case 1: ok = ((int)v < val); break;
+        case 3: ok = ((int)v != val); break;
+        default: ok = 0; break;
+        }
+        if (!ok) {
+            zs_unlock();
+            return 0xFA01u;
+        }
+        if (type == 1) {
             while (!__atomic_compare_exchange_n(p, &v, v - 1u, 0,
                                                 __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
                 if (!((int)v < val)) { ok = 0; break; }
@@ -939,4 +1014,60 @@ unsigned long za_sync_signal_addr(unsigned long long addr, int type, int val, in
     }
     zs_unlock();
     return r;
+}
+
+// 伪唤醒所有「地址等待」(kind=3) 线程。内核允许伪唤醒，调用方必须重判条件，
+// 所以这在语义上是合法的。用途是**分辨两种停摆**：
+//   伪唤醒后系统能推进 ⇒ 是我们丢了一次唤醒（真 bug 在信号侧）；
+//   伪唤醒后等待者立刻又睡回去 ⇒ 对方确实没释放，得去找持有者。
+int za_sync_poke_addr_waiters(void)
+{
+    int n = 0;
+    zs_lock();
+    for (int i = 0; i < ZS_MAX; i++) {
+        zs_slot_t *w = &zs_slots[i];
+        if (!__atomic_load_n(&w->tid, __ATOMIC_RELAXED)) continue;
+        if (w->kind != 3) continue;
+        zs_wake(w);
+        n++;
+    }
+    zs_unlock();
+    return n;
+}
+
+// 诊断性强制解锁：只对「同一地址上 >= 2 个等待者」的锁字执行 SDK 解锁路径的
+// 动作（把 1 或 2 写成 0）再唤醒全部等待者。
+// ⚠ 这会破坏互斥（被保护的数据可能被两个线程同时改）。仅用于**判定死锁性质**：
+//   能推进 ⇒ 锁是被「泄漏」的（持有者已经不存在）；崩溃 ⇒ 锁确实还在保护数据。
+// 调用方负责限流；这里只返回动了几个地址。
+int za_sync_force_release_stuck(void)
+{
+    unsigned long long addrs[ZS_MAX];
+    int cnt[ZS_MAX], na = 0, done = 0;
+    zs_lock();
+    for (int i = 0; i < ZS_MAX; i++) {
+        zs_slot_t *w = &zs_slots[i];
+        if (!__atomic_load_n(&w->tid, __ATOMIC_RELAXED)) continue;
+        if (w->kind != 3) continue;
+        int k = 0;
+        while (k < na && addrs[k] != w->addr) k++;
+        if (k == na) { addrs[na] = w->addr; cnt[na] = 0; na++; }
+        cnt[k]++;
+    }
+    for (int k = 0; k < na; k++) {
+        if (cnt[k] < 2) continue;           // 只有一个等待者 ⇒ 可能只是正常等锁
+        unsigned int *p = (unsigned int *)(uintptr_t)addrs[k];
+        unsigned int old = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+        if (old != 1 && old != 2) continue;
+        __atomic_store_n(p, 0u, __ATOMIC_RELEASE);
+        ZLOGE("★ 强制解锁 %#llx：word %#x → 0（%d 个等待者）", addrs[k], old, cnt[k]);
+        for (;;) {
+            zs_slot_t *w = zs_pick(3, addrs[k]);
+            if (!w) break;
+            zs_wake(w);
+        }
+        done++;
+    }
+    zs_unlock();
+    return done;
 }

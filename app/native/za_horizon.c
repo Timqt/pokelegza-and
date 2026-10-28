@@ -1542,10 +1542,39 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             za_sync_note_addr_wait((unsigned long long)a0, (unsigned int)a2, (int)a1, spv,
                                    (unsigned long long)za_horizon_regs[ZA_REG_PC],
                                    (unsigned long long)za_horizon_regs[ZA_REG_FP]);
+            // 同一个线程可能一直在 FA01 重试（从不登记等待表）⇒ 另记一份，
+            // 停摆时按调用次数找出「原地打转」的那个线程并回溯它的 fp 链。
+            {
+                extern void za_sync_note_spin(long tid, unsigned long long sp,
+                                              unsigned long long fp, unsigned long long pc,
+                                              unsigned long long addr);
+                za_sync_note_spin((long)syscall(SYS_gettid), spv,
+                                  (unsigned long long)za_horizon_regs[ZA_REG_FP],
+                                  (unsigned long long)za_horizon_regs[ZA_REG_PC],
+                                  (unsigned long long)a0);
+            }
         }
-        // ★ 2026-10-28：整条等待语义改为**参考版**（d2r hle_thread.c svc 0x34）：
-        //   type 2 ⇒ 值等于 value 才等；0/1 ⇒ 值小于 value 才等；1 ⇒ 先减一再等。
-        //   条件不成立立刻返回 0xFA01（SDK 的锁慢路径把它当「重判」）。
+        // ★ 2026-10-28：type 语义按真机实测（SDK+0x13a670 / +0x13a854）：
+        //   0 ==、1 <、2 >、3 !=；条件不成立立刻返回 0xFA01（SDK 的锁慢路径
+        //   把它当「重判并重试」）。互斥字握手用 (2, 1)：等 word > 1。
+        //   以前把 2 当成 ==，导致 word==1 的等待者永久睡死。
+        {
+            static unsigned long long win;
+            static unsigned nl;
+            struct timespec tsv;
+            clock_gettime(CLOCK_MONOTONIC, &tsv);
+            unsigned long long now = (unsigned long long)tsv.tv_sec * 1000000000ull + tsv.tv_nsec;
+            if (now - win > 1000000000ull) { win = now; nl = 0; }
+            if (nl < 12) {
+                nl++;
+                unsigned int cur = 0;
+                if (a0) memcpy(&cur, (const void *)(uintptr_t)a0, 4);
+                ZLOGI("svc#52 addr=%#llx type=%ld value=%ld cur=%#x tid=%ld pc=sdk+%#lx",
+                      (unsigned long long)a0, (long)a1, (long)a2, cur,
+                      (long)syscall(SYS_gettid),
+                      (unsigned long)za_horizon_regs[ZA_REG_PC] - (unsigned long)za_sdk_base);
+            }
+        }
         //   等待由 za_sync 的等待表统一管，不再直接 futex 等客机地址。
         ZA_W52_RET(za_sync_wait_addr((unsigned long long)a0, (int)a1, (int)a2,
                                      (long long)a3));

@@ -390,7 +390,12 @@ static void *za_nvn_tick_main(void *p)
                        za_nvn_calls[ZA_NVN_ID_nvnCommandBufferBeginRecording] +
                        za_nvn_calls[ZA_NVN_ID_nvnQueueSubmitCommands] + za_nvn_presents;
             if (prog != last_prog) { last_prog = prog; last_change = za_nvn_ticks; }
-            else if (za_nvn_ticks - last_change == 1800) {   // 30 秒
+            else if ((za_nvn_ticks - last_change) % 600 == 0) {   // 每 10 秒
+                extern void za_dump_progress_stall(void);
+                ZLOGE("★ NVN 10 秒无进展 ⇒ 倒线程快照");
+                za_dump_progress_stall();
+            }
+            if (prog == last_prog && za_nvn_ticks - last_change == 1800) {   // 30 秒
                 extern volatile long za_guest_tid;
                 ZLOGE("★ NVN 30 秒无进展 ⇒ 倒客机栈（tid=%ld）", za_guest_tid);
                 if (za_guest_tid > 0)
@@ -408,20 +413,24 @@ static void *za_nvn_tick_main(void *p)
         {
             extern volatile unsigned long za_svc_nr_count[64];
             static unsigned long prev[64];
-            char lb[256];
-            int n = snprintf(lb, sizeof lb, "   svc 增量:");
-            int changed = 0;
-            for (int i = 0; i < 64; i++) {
-                unsigned long c = za_svc_nr_count[i];
-                if (c != prev[i]) {
-                    if (n > 0 && n < (int)sizeof lb - 24) {
-                        n += snprintf(lb + n, sizeof lb - (size_t)n, " #%d+%lu", i, c - prev[i]);
-                        changed = 1;
+            // 只在每 60 tick（1 秒）汇总一次：以前每 16ms 打一行，logcat 环形
+            // 缓冲被我们自己的状态行冲干净，真正的停摆倒出反而看不见。
+            if ((za_nvn_ticks % 60) == 0) {
+                char lb[256];
+                int n = snprintf(lb, sizeof lb, "   svc 增量:");
+                int changed = 0;
+                for (int i = 0; i < 64; i++) {
+                    unsigned long c = za_svc_nr_count[i];
+                    if (c != prev[i]) {
+                        if (n > 0 && n < (int)sizeof lb - 24) {
+                            n += snprintf(lb + n, sizeof lb - (size_t)n, " #%d+%lu", i, c - prev[i]);
+                            changed = 1;
+                        }
+                        prev[i] = c;
                     }
-                    prev[i] = c;
                 }
+                if (changed) ZLOGI("%s", lb);
             }
-            if (changed) ZLOGI("%s", lb);
         }
     }
     return NULL;
@@ -1205,6 +1214,36 @@ static u64 za_nvn_dispatch(int id, u64 a0, u64 a1, u64 a2, u64 a3, u64 a4, u64 a
     case ZA_NVN_ID_nvnProgramInitialize:
         init_obj(o, 0xc0);
         return 1;
+    case ZA_NVN_ID_nvnProgramSetShadersExt:
+    case ZA_NVN_ID_nvnProgramSetShaders: {
+        // 原型：void nvnProgramSetShadersExt(NVNprogram*, int numShaders,
+        //                                   const NVNshader* const* shaders)
+        // 这是唯一能看到「游戏到底把哪份着色器二进制交给 GPU」的地方 ——
+        // 着色器表（控制段 sha16 → SPIR-V）就是挂在它上面的。
+        // 前几次把参数和着色器对象头 0x60 字节倒出来，确认 NVNshader 的布局
+        // （哪个字段是 BNSH 指针）。
+        static int nlog;
+        unsigned n = (unsigned)a1;
+        const unsigned long long *arr = (const unsigned long long *)(uintptr_t)a2;
+        if (nlog < 6) {
+            nlog++;
+            ZLOGI("★ NVN SetShadersExt: program=%p count=%u arr=%p", o, n, (void *)arr);
+            for (unsigned i = 0; i < n && i < 4; i++) {
+                unsigned long long sp = 0;
+                if (arr) memcpy(&sp, (const void *)(uintptr_t)(arr + i), 8);
+                ZLOGI("    shader[%u]=%#llx", i, sp);
+                if (sp >= 0x400000000ull && sp < 0xd00000000ull) {
+                    unsigned long long h[8] = {0};
+                    memcpy(h, (const void *)(uintptr_t)sp, sizeof h);
+                    ZLOGI("      +0x00=%#llx +0x08=%#llx +0x10=%#llx +0x18=%#llx",
+                          h[0], h[1], h[2], h[3]);
+                    ZLOGI("      +0x20=%#llx +0x28=%#llx +0x30=%#llx +0x38=%#llx",
+                          h[4], h[5], h[6], h[7]);
+                }
+            }
+        }
+        return 0;
+    }
     case ZA_NVN_ID_nvnProgramFinalize:
         return 0;
     case ZA_NVN_ID_nvnProgramGetSubtileSize:

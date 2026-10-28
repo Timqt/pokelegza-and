@@ -2904,6 +2904,7 @@ static void za_hook_m_jobsubmit(unsigned long long *r);
 static void za_hook_m_jobdispatch(unsigned long long *r);
 static void za_hook_m_jobpost(unsigned long long *r);
 static void za_hook_m_dequeue(unsigned long long *r);
+static void za_hook_m_jobenqueue(unsigned long long *r);
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -3070,10 +3071,11 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd270d8, ZA_MPROBE_STUB + 0x300, ZA_MPROBE_SLOT + 0x30, za_hook_m_jobdispatch);
         za_install_main_probe(base, 0xd270ec, ZA_MPROBE_STUB + 0x380, ZA_MPROBE_SLOT + 0x38, za_hook_m_jobpost);
         za_install_main_probe(base, 0x1bab3a0, ZA_MPROBE_STUB + 0x400, ZA_MPROBE_SLOT + 0x40, za_hook_m_dequeue);
+        za_install_main_probe(base, 0xd848fc, ZA_MPROBE_STUB + 0x480, ZA_MPROBE_SLOT + 0x48, za_hook_m_jobenqueue);
         // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
         //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
         //   main 的 BSS（pc=main+0x76b732c）。call 类指令不适合这套探针，已移除。
-        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x500);
+        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x600);
         mprotect(base + ZA_MPROBE_STUB, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
               (unsigned)ZA_MPROBE_STUB, (unsigned)ZA_MPROBE_SLOT);
@@ -3276,6 +3278,124 @@ static void za_hook_m_w3(unsigned long long *r)
 static volatile unsigned long long za_job_objs[ZA_JOBRING];
 static volatile unsigned long long za_job_caller[ZA_JOBRING];
 static volatile unsigned za_job_pos;
+// 按线程记「正在等哪个任务对象」（共享环形会被别的线程覆盖）。
+volatile unsigned long long za_job_by_tid[64];
+
+// 停摆时做一次（仅一次）：在客机堆里搜主线程等的那个任务对象。
+//   找得到 ⇒ 它确实被挂进了某个队列（该队列的 worker 才是该被唤醒的人）；
+//   找不到 ⇒ 任务从未入队，问题在提交侧，不在等待原语。
+void za_scan_job_in_heap(void)
+{
+    // 只扫一次（256MB 的 process_vm_readv 很贵），但结论要每次停摆都打出来：
+    // 以前是 done 后直接 return，唯一那次输出随 logcat 环形缓冲滚掉，等于没有。
+    static int scanned;
+    static char verdict[320] = "（还没有结果）";
+    unsigned long long o;
+    const unsigned long long lo = 0x452000000ull, len = 0x10000000ull;
+    static unsigned char buf[1 << 20];
+    int hits = 0;
+    if (!scanned) {
+        scanned = 1;
+        o = za_job_by_tid[(long)za_guest_tid & 63];
+        if (!o) {
+            snprintf(verdict, sizeof verdict, "主线程没有记录到任务对象（探针没触发？）");
+        } else {
+            char *w = verdict;
+            size_t cap = sizeof verdict;
+            int n = snprintf(w, cap, "找 %#llx：", o);
+            w += n; cap -= (size_t)n;
+            for (unsigned long long a = lo; a < lo + len && hits < 8; a += sizeof buf) {
+                struct iovec l = { buf, sizeof buf }, r = { (void *)(uintptr_t)a, sizeof buf };
+                ssize_t got = process_vm_readv(getpid(), &l, 1, &r, 1, 0);
+                if (got <= 0) continue;
+                for (ssize_t i = 0; i + 8 <= got; i += 8) {
+                    unsigned long long v;
+                    memcpy(&v, buf + i, 8);
+                    if (v == o) {
+                        int k = snprintf(w, cap, " @%#llx", a + (unsigned long long)i);
+                        if (k > 0) { w += k; cap -= (size_t)k; }
+                        if (++hits >= 8) break;
+                    }
+                }
+            }
+            if (!hits) snprintf(verdict, sizeof verdict,
+                                "找 %#llx：没有任何结构引用它 ⇒ 它从未入队（问题在提交侧）", o);
+        }
+    }
+    ZLOGE("★ 堆扫描：%s", verdict);
+}
+
+// 自旋型停摆的快照。客机自旋时 svc 计数一直在涨，旧的 no_progress 判定
+// 永远不会触发；但 NVN 一个提交都没有，说明它其实没前进。
+// 由 NVN 帧驱动每 10 秒调一次，倒出「每条线程此刻停在哪」。
+void za_dump_progress_stall(void)
+{
+    extern void za_sample_all_threads(void);
+    za_sample_all_threads();
+    { struct timespec t = { 0, 40 * 1000 * 1000 }; nanosleep(&t, NULL); }
+    ZLOGE("★ 10 秒无 NVN 进展快照（svc 在涨 ⇒ 客机在自旋）：");
+    za_dump_task_stats();
+    {
+        extern void za_sync_dump_top_spinner(void);
+        za_sync_dump_top_spinner();
+    }
+    za_sync_dump();
+    {
+        unsigned long pos = za_pc_ring_pos;
+        unsigned long n = pos < ZA_PC_RING ? pos : ZA_PC_RING;
+        unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+        ZLOGE("★ PC 采样环（最近 %lu 条）：", n);
+        for (unsigned long i = 0; i < n; i++) {
+            unsigned long k = (pos - n + i) % ZA_PC_RING;
+            unsigned long pc = za_pc_ring[k];
+            const char *w = "@";
+            unsigned long long off = pc;
+            if (mb && pc >= mb && pc < mb + ZA_IMAGE_SIZE) { w = "main+"; off = pc - mb; }
+            else if (za_sdk_base && pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) {
+                w = "sdk+"; off = pc - za_sdk_base;
+            }
+            ZLOGE("    tid=%ld %s%#llx", za_pc_tid_ring[k], w, off);
+        }
+    }
+    // 主线程卡在哪个等待字上 ⇒ 以「等待字」和「对象基址」两个值扫全线程栈。
+    // 等待字只能找到别的等待者；**持有者**栈上留的是对象基址（互斥字通常在
+    // obj+0x20），所以必须再扫一次 val-0x20。
+    {
+        extern unsigned long long za_last_blocked_addr(long tid);
+        extern unsigned long long za_sync_top_spin_addr(void);
+        extern void za_sync_scan_for_addr(unsigned long long val);
+        unsigned long long lb = za_last_blocked_addr(za_guest_tid);
+        unsigned long long sp = za_sync_top_spin_addr();
+        if (sp && sp != lb) {
+            ZLOGE("★ 自旋线程等待字 %#llx ⇒ 扫线程栈找持有者（对象基址 %#llx）：", sp, sp - 0x20);
+            za_sync_scan_for_addr(sp);
+            za_sync_scan_for_addr(sp - 0x20);
+        }
+        if (lb) {
+            ZLOGE("★ 主线程等待字 %#llx ⇒ 扫线程栈找持有者（对象基址 %#llx）：", lb, lb - 0x20);
+            za_sync_scan_for_addr(lb);
+            za_sync_scan_for_addr(lb - 0x20);
+            {
+                extern void za_dump_mtx_hist(unsigned long long addr);
+                za_dump_mtx_hist(lb);
+            }
+            // 伪唤醒一次：语义合法，用来区分「我们丢了唤醒」和「对方没释放」。
+            {
+                extern int za_sync_poke_addr_waiters(void);
+                static int poke_n;
+                int pk = za_sync_poke_addr_waiters();
+                if (pk) ZLOGE("   ↳ 伪唤醒了 %d 个地址等待者（第 %d 次）", pk, ++poke_n);
+                // 伪唤醒三次都没让系统动 ⇒ 等待的字确实没人写。做一次限定范围的
+                // 强制解锁，把「锁泄漏」和「锁还在保护数据」区分开。
+                if (poke_n >= 3 && (poke_n % 3) == 0) {
+                    extern int za_sync_force_release_stuck(void);
+                    int fr = za_sync_force_release_stuck();
+                    ZLOGE("   ↳ 强制解锁：动了 %d 个锁字（第 %d 轮）", fr, poke_n / 3);
+                }
+            }
+        }
+    }
+}
 
 static void za_hook_m_jobwait(unsigned long long *r)
 {
@@ -3286,6 +3406,12 @@ static void za_hook_m_jobwait(unsigned long long *r)
         za_job_objs[p % ZA_JOBRING] = o;
         za_job_caller[p % ZA_JOBRING] = r[19];
         za_job_pos = p + 1;
+    }
+    // 按线程记一份：停摆时要精确知道「主线程在等的那个任务对象是哪个」，
+    // 共享环形会被别的 worker 覆盖掉。
+    {
+        extern volatile unsigned long long za_job_by_tid[64];
+        za_job_by_tid[syscall(SYS_gettid) & 63] = o;
     }
     if (n++ >= 24) return;
     unsigned long long st = 0, a = 0, b = 0, p = 0;
@@ -3411,6 +3537,50 @@ static void za_hook_m_dequeue(unsigned long long *r)
         ZLOGI("★ worker 出队: 第%llu次 obj=%#llx 队列数(+0x2f8)=%u +0x330=%u",
               k, o, cnt, cnt2);
 }
+// 入队点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`
+//   ⇒ x22 是调度器对象，vtable+0x50 是「把任务交出去」的虚函数。
+//   把这条链解出来，就能定位任务到底交给了谁、有没有真的入队。
+static void za_hook_m_jobenqueue(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 4) return;
+    unsigned long long vt = r[8], fn = 0;
+    if (vt >= 0x400000000ull && vt < 0xd00000000ull)
+        memcpy(&fn, (const void *)(uintptr_t)(vt + 0x50), 8);
+    {
+        char a[48], b[48];
+        za_fmt_addr(a, sizeof a, vt);
+        za_fmt_addr(b, sizeof b, fn);
+        ZLOGI("★ job-enqueue: 调度器 vtable=%s 入队函数=%s", a, b);
+    }
+}
+
+// 停摆快照用：读调度器单例（main+0x3d80800）的 vtable 与两个虚函数目标。
+// 探针里读到的可能是 0（对象尚未构造完），停摆时刻再读一次。
+void za_dump_dispatch_state(void)
+{
+    unsigned long gb = (unsigned long)za_guest_base;
+    unsigned long long g = 0, vt = 0, f10 = 0, f50 = 0;
+    if (gb) {
+        memcpy(&g, (const void *)(uintptr_t)(gb + 0x3d80800), 8);
+        if (g >= 0x400000000ull && g < 0xd00000000ull) {
+            memcpy(&vt, (const void *)(uintptr_t)g, 8);
+            if (vt >= 0x400000000ull && vt < 0xd00000000ull) {
+                memcpy(&f10, (const void *)(uintptr_t)(vt + 0x10), 8);
+                memcpy(&f50, (const void *)(uintptr_t)(vt + 0x50), 8);
+            }
+        }
+    }
+    {
+        char a[40], b[40], c[40], d[40];
+        za_fmt_addr(a, sizeof a, g);
+        za_fmt_addr(b, sizeof b, vt);
+        za_fmt_addr(c, sizeof c, f10);
+        za_fmt_addr(d, sizeof d, f50);
+        ZLOGE("★ 调度器单例=%s vtable=%s [+0x10]=%s [+0x50]=%s", a, b, c, d);
+    }
+}
+
 // 循环入口（main+0x1653d00）：x0=desc(+0x18 stride,+0x1c count), x2=base, x8=stride/8
 // ★ 2026-10-28：装在循环头，每迭代一次就进来一次 ⇒ 累计迭代数 ÷ count = 完整建表了几轮。
 static void za_hook_m_poolloop(unsigned long long *r)
@@ -3849,6 +4019,20 @@ static void *za_sampler_watchdog(void *arg)
     {
         struct timespec ts = { 0, 50 * 100 * 1000 };   // 50ms
         nanosleep(&ts, NULL);
+        // ★ 2026-10-28：常开的 10 秒快照。以前所有倒出都挂在「svc 没推进」
+        //   或「NVN 有调用」这类条件上：客机自旋时 svc 一直在涨、还没进 NVN 时
+        //   帧驱动又没起来 ⇒ 两种情况下都一行诊断都没有，等于没有观测。
+        {
+            static unsigned long long last_dump_ns;
+            struct timespec tp;
+            clock_gettime(CLOCK_MONOTONIC, &tp);
+            unsigned long long now = (unsigned long long)tp.tv_sec * 1000000000ull +
+                                     (unsigned long long)tp.tv_nsec;
+            if (now - last_dump_ns >= 10ull * 1000000000ull) {
+                last_dump_ns = now;
+                za_dump_progress_stall();
+            }
+        }
         /* 向客机线程投递采样信号（tgkill 按线程）：SIGEV_THREAD_ID 只能绑
          * 装载线程，绑不到客机线程 ⇒ 环形轨迹一直为空的根因。 */
         if (za_guest_tid > 0)
@@ -3973,7 +4157,11 @@ static void *za_sampler_watchdog(void *arg)
                         {
                             extern void za_dump_job_states(void);
                             extern void za_dump_hle_stuck(void);
+                            extern void za_dump_dispatch_state(void);
+                            extern void za_scan_job_in_heap(void);
                             za_dump_job_states();
+                            za_scan_job_in_heap();
+                            za_dump_dispatch_state();
                             za_dump_hle_stuck();
                         }
                         // 主线程阻塞在哪个锁上 ⇒ 扫所有线程栈找持有者
