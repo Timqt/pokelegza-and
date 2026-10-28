@@ -1396,7 +1396,16 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         return (long)za_sync_wait_key((unsigned long long)a0, (unsigned long long)a1,
                                       (unsigned int)a2, (long long)a3);
     case 29: // SignalProcessWideKey(condkey=x0, count=w1)
+    {
+        static unsigned long long win; static unsigned nl;
+        struct timespec tsv; clock_gettime(CLOCK_MONOTONIC, &tsv);
+        unsigned long long now = (unsigned long long)tsv.tv_sec * 1000000000ull + tsv.tv_nsec;
+        if (now - win > 1000000000ull) { win = now; nl = 0; }
+        if (nl++ < 10)
+            ZLOGI("svc#29 key=%#llx n=%d pc=sdk+%#lx", (unsigned long long)a0, (int)a1,
+                  (unsigned long)za_horizon_regs[ZA_REG_PC] - (unsigned long)za_sdk_base);
         return (long)za_sync_signal_key((unsigned long long)a0, (int)a1);
+    }
 
     // ── 地址等待/唤醒（nn::os 的用户态 futex 算法）──────────────────
     // 实测（SDK+0x13b2xx，nn::os 的 mutex/条件变量实现）：
@@ -1503,8 +1512,9 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             if (nl < 12) {
                 nl++;
                 unsigned int cur = p ? __atomic_load_n(p, __ATOMIC_RELAXED) : 0xdeadbeef;
-                ZLOGI("svc#53 addr=%#llx type=%ld value=%u cur=%#x", (unsigned long long)a0,
-                      (long)a1, (unsigned)a2, cur);
+                ZLOGI("svc#53 addr=%#llx type=%ld value=%u cur=%#x pc=sdk+%#lx", (unsigned long long)a0,
+                      (long)a1, (unsigned)a2, cur,
+                      (unsigned long)za_horizon_regs[ZA_REG_PC] - (unsigned long)za_sdk_base);
             }
         }
         if (p) syscall(SYS_futex, (int *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
