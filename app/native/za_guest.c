@@ -836,7 +836,12 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
     //   严格条件：si_addr < 0x1000、pc 在 main/sdk 映像内、故障指令确实是
     //   `ldr Rt,[Xn,#imm]` 且 Xn+imm == si_addr。满足就把 Rt 置 0、pc += 4 继续；
     //   其余一律走原来的致命流程（不改判别的故障）。
-    if (ctx && sig == SIGSEGV && info &&
+    // ⚠ 实测：恢复出来的状态是自相矛盾的（后续会读到一个垃圾指针，
+    //   main+0x250b0b8 崩在 0x6ee3...）。它只适合**定位**，不能当修复用。
+    //   默认关闭，需要时 ZA_NULLRECOVER=1 打开。
+    static int nr_on = -1;
+    if (nr_on < 0) nr_on = getenv("ZA_NULLRECOVER") ? 1 : 0;
+    if (nr_on && ctx && sig == SIGSEGV && info &&
         (unsigned long long)(uintptr_t)info->si_addr < 0x1000ull)
     {
         ucontext_t *uc0 = (ucontext_t *)ctx;
@@ -851,11 +856,13 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             int is64 = ((w & 0xffc00000u) == 0xf9400000u);
             int is32 = ((w & 0xffc00000u) == 0xb9400000u);
             int is8  = ((w & 0xffc00000u) == 0x39400000u);
-            if ((is64 || is32 || is8) && rn != 31)
+            int is16 = ((w & 0xffc00000u) == 0x79400000u);   // ldrh：实测崩在 sdk+0x80fb8
+            int issw = ((w & 0xffc00000u) == 0xb9800000u);   // ldrsw
+            if ((is64 || is32 || is8 || is16 || issw) && rn != 31)
             {
                 unsigned long long base = (unsigned long long)uc0->uc_mcontext.regs[rn];
-                unsigned long long imm = (unsigned long long)((w >> 10) & 0xfffu) *
-                                         (is8 ? 1ull : (is64 ? 8ull : 4ull));
+                unsigned long long scale = is8 ? 1ull : (is16 ? 2ull : (is64 ? 8ull : 4ull));
+                unsigned long long imm = (unsigned long long)((w >> 10) & 0xfffu) * scale;
                 if (base + imm == (unsigned long long)(uintptr_t)info->si_addr)
                 {
                     // 同一个 pc 反复故障 ⇒ 这不是「读一次 0 就完了」的写法，
@@ -2750,6 +2757,21 @@ static unsigned int za_fs_openfile(void *out, const char *path, int mode)
     return 0;
 }
 
+// ── nn::oe（系统性能/运行模式服务）──────────────────────────────────────
+// 真机上 `nn::oe::GetPerformanceMode()` 靠 `nn::oe::Initialize()` 建立的单例；
+// 那个单例在 SDK 的 sdk+0xbacbb0，由 oe 的初始化路径创建。我们的 HLE 没有
+// oe 服务，初始化没有真正完成 ⇒ GetPerformanceMode 里 `ldr x8,[x0]` 直接
+// 解引用 NULL（真机实测 sdk+0x3f70f4，连跑几分钟后必崩）。
+// oe 本来就是把「底座/掌机模式、焦点、语言」这些**固定答案**交给游戏的接口，
+// 所以这里按 HLE 的方式直接给答案，不走 SDK 那条会解引用 NULL 的路径。
+static unsigned za_oe_ok(void) { return 0; }                 // 各种 Set*/Enable*/Disable*
+static unsigned za_oe_perf_mode(void) { return 1; }          // 1 = 掌机(Normal)
+static unsigned za_oe_focus(void) { return 1; }              // 1 = 有焦点
+static unsigned za_oe_lang(void) { return 1; }               // 1 = AmericanEnglish
+static unsigned za_oe_no(void) { return 0; }                 // IsUserInactivity... = false
+static unsigned za_oe_pop_message(unsigned *out) { if (out) *out = 0; return 0; }
+static unsigned za_oe_pseudo_id(void *uuid) { if (uuid) memset(uuid, 0, 16); return 0; }
+
 static const za_host_sym_t za_host_syms[] = {
     // loader 提供的「runtime object file」（真机由 nnrtld 提供）
     { "__nnDetailNintendoSdkRuntimeObjectFile", (void *)za_host_runtime_object_file },
@@ -2790,6 +2812,27 @@ static const za_host_sym_t za_host_syms[] = {
     { "_ZN2nn2fs22GetDirectoryEntryCountEPlNS0_15DirectoryHandleE", (void *)za_fs_dircount },
     { "_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", (void *)za_hid_noop },
     { "_ZN2nn3hid24SetSupportedNpadStyleSetENS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", (void *)za_hid_noop },
+
+    // ── nn::oe：系统运行模式服务（HLE 直接给固定答案）─────────────────
+    { "_ZN2nn2oe10InitializeEv",                       (void *)za_oe_ok },
+    { "_ZN2nn2oe18GetPerformanceModeEv",               (void *)za_oe_perf_mode },
+    { "_ZN2nn2oe20GetCurrentFocusStateEv",             (void *)za_oe_focus },
+    { "_ZN2nn2oe18GetDesiredLanguageEv",               (void *)za_oe_lang },
+    { "_ZN2nn2oe37IsUserInactivityDetectionTimeExtendedEv", (void *)za_oe_no },
+    { "_ZN2nn2oe25TryPopNotificationMessageEPj",       (void *)za_oe_pop_message },
+    { "_ZN2nn2oe17GetPseudoDeviceIdEPNS_4util4UuidE",  (void *)za_oe_pseudo_id },
+    { "_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", (void *)za_oe_ok },
+    { "_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb", (void *)za_oe_ok },
+    { "_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", (void *)za_oe_ok },
+    { "_ZN2nn2oe38SetUserInactivityDetectionTimeExtendedEb", (void *)za_oe_ok },
+    { "_ZN2nn2oe15SetCpuBoostModeENS0_12CpuBoostModeE", (void *)za_oe_ok },
+    { "_ZN2nn2oe15EnableRecordingEv",                    (void *)za_oe_ok },
+    { "_ZN2nn2oe16DisableRecordingEv",                   (void *)za_oe_ok },
+    { "_ZN2nn2oe16EnableScreenShotEv",                   (void *)za_oe_ok },
+    { "_ZN2nn2oe17DisableScreenShotEv",                  (void *)za_oe_ok },
+    { "_ZN2nn2oe17FinishStartupLogoEv",                  (void *)za_oe_ok },
+    { "_ZN2nn2oe31EnterExitRequestHandlingSectionEv",    (void *)za_oe_ok },
+    { "_ZN2nn2oe31LeaveExitRequestHandlingSectionEv",    (void *)za_oe_ok },
 
     // NVN 图形入口（图形层未接：回陷阱桩，客机一调就知道缺哪个）
     { "nvnBootstrapLoader", (void *)za_nvn_bootstrap_loader },
@@ -3460,6 +3503,41 @@ void za_dump_progress_stall(void)
                     unsigned cv = za_sync_poke_all();
                     if (cv) ZLOGE("   ↳ 伪唤醒 %u 个条件变量等待者", cv);
                 }
+                // ★ 2026-10-28 实验：把「一直停在 state=0（新建）」的任务强制
+                //   标成完成（5）。调度器的 submit 是**同步**的（提交后就在这里
+                //   等这个任务跑完），而 worker 从来没被唤醒过、任务也没真正
+                //   入队 ⇒ 主线程永远等不到。强制完成后 submit 才会返回，
+                //   我们才能看到「下一段」到底是什么（哪怕画面内容还不正确）。
+                //   只动 JobWait 探针真实记录过的对象、且当前值必须是 0。
+                static int fj_on = -1;
+                if (fj_on < 0) fj_on = getenv("ZA_FORCEJOB") ? 1 : 0;
+                if (fj_on)
+                {
+                    static unsigned long long forced[ZA_JOBRING];
+                    unsigned pos = za_job_pos;
+                    unsigned n = pos < ZA_JOBRING ? pos : ZA_JOBRING;
+                    int changed = 0;
+                    for (unsigned i = 0; i < n; i++) {
+                        unsigned long long o = za_job_objs[(pos - 1 - i) % ZA_JOBRING];
+                        if (!ZA_PTR_OK(o)) continue;
+                        int skip = 0;
+                        for (unsigned k = 0; k < ZA_JOBRING; k++)
+                            if (forced[k] == o) { skip = 1; break; }
+                        if (skip) continue;
+                        unsigned int st = 0;
+                        struct iovec li = { &st, 4 }, ri = { (void *)(uintptr_t)(o + 0x158), 4 };
+                        if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) != 4) continue;
+                        if (st == 5) continue;          // 已经完成
+                        unsigned int done = 5;
+                        struct iovec lo = { &done, 4 }, ro = { (void *)(uintptr_t)(o + 0x158), 4 };
+                        if (process_vm_writev(getpid(), &lo, 1, &ro, 1, 0) != 4) continue;
+                        for (unsigned k = 0; k < ZA_JOBRING; k++)
+                            if (!forced[k]) { forced[k] = o; break; }
+                        ZLOGE("★ 强制完成任务 obj=%#llx：state %#x → 5（让同步 submit 返回）", o, st);
+                        changed++;
+                    }
+                    if (changed) za_sync_poke_all();   // 状态改完再叫醒它们
+                }
                 int pk = za_sync_poke_addr_waiters();
                 if (pk) ZLOGE("   ↳ 伪唤醒了 %d 个地址等待者（第 %d 次）", pk, ++poke_n);
                 // 伪唤醒三次都没让系统动 ⇒ 等待的字确实没人写。做一次限定范围的
@@ -3782,6 +3860,11 @@ int za_guest_relocate(unsigned char *base, za_guest_t *out)
             //   以便下一步直接在它的入口装探针。
             if (name && strstr(name, "nn3mem"))
                 ZLOGI("mem 导入 %s -> %p（base=%p）", name, p, (void *)base);
+            // 桩 0x2fc5a20 读 GOT 槽 0x3cea090，调用点 main+0x1a0495c 崩在里面
+            // ⇒ 把槽号一起打出来，才能确定那到底是谁（名字表的两列都有偏移，不能靠猜）。
+            if (name && (r->slot == 0x3cea090u || r->slot == 0x3cea098u ||
+                         r->slot == 0x3cea088u))
+                ZLOGE("★ GOT 槽 %#x = %s -> %p", r->slot, name, p);
             if (p)
             {
                 // 分清「真实现」和「自动桩」：桩的地址落在 za_stub_table 里
