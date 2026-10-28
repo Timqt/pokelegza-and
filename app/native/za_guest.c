@@ -2967,9 +2967,10 @@ static za_mod_t za_sdk_mod;
 static unsigned char *za_guest_main_base;
 
 // 解析客机导入的符号。顺序与上游 d2r-mobile 的 guest_sym 一致：
-//   ① 宿主自己的 nn::* 实现  ② 模块导出表（SDK→main）  ③ 系统 libc/libc++
+//   ① 宿主自己的 nn::* 实现  ② 图形层接管表  ③ 模块导出表（SDK→main）  ④ 系统 libc/libc++
 // ⚠ **模块导出表优先于 dlsym**：裸 malloc/free 是 main NSO 导出的**客机自己的 musl 分配器**，
 //   落到 dlsym 会变成 bionic 的分配器 ⇒ SDK 与客机不是同一套堆。
+void *za_gfx_hle_lookup(const char *name);
 void *za_resolve_host(const char *name)
 {
     if (name)
@@ -2981,7 +2982,12 @@ void *za_resolve_host(const char *name)
     }
     for (const za_host_sym_t *h = za_host_syms; h->name; h++)
         if (!strcmp(h->name, name)) return h->fn;
-    void *p = za_mod_lookup(&za_sdk_mod, name);
+    // 参考工程图形层的接管表（dm/ 的 HLE_FORCE 条目，放在 ELF 段 swforce/swhle）。
+    // ⚠ 必须排在模块导出表之前：nvnBootstrapLoader 是 SDK 里也有定义的，
+    //   落回 SDK 就会执行真机 NS 的 NVN 驱动（桌面 GPU 命令，安卓上必崩）。
+    void *p = za_gfx_hle_lookup(name);
+    if (p) return p;
+    p = za_mod_lookup(&za_sdk_mod, name);
     if (p) return p;
     p = za_mod_lookup(&za_main_mod, name);
     if (p) return p;

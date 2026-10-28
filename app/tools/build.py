@@ -87,25 +87,78 @@ def build_shaders():
     print("  着色器已编译 -> %s" % out)
 
 
+def find_clang(suffix=""):
+    """aarch64-linux-android26-clang[++][.cmd]：Windows 上是 .cmd 包装，Linux 上是普通脚本。"""
+    base = NDK / "toolchains" / "llvm" / "prebuilt"
+    for host in ("windows-x86_64", "linux-x86_64", "darwin-x86_64"):
+        for ext in (".cmd", ""):
+            p = base / host / "bin" / ("aarch64-linux-android26-clang" + suffix + ext)
+            if p.exists():
+                return p
+    sys.exit("缺少 clang%s: %s" % (suffix, base))
+
+
+# dm/ 是我们移植进来的**参考工程图形层**（NVN→Vulkan 翻译器 + 安卓呈现）：
+#   gfx/nvn/      NVN 函数跳板（nvn_thunks.S 523 个计数跳板）、槽表、纹理/脏区工具
+#   gfx/vulkan/   engine/ 下的 xbg_* 翻译引擎（管线、着色器、绘制、呈现）
+#   android/      ANativeWindow 的 Vulkan 交换链
+#   compat/       mach_absolute_time 等苹果 API 垫片
+DM = ROOT / "native" / "dm"
+DM_INC = [DM / "gfx" / "nvn" / "include", DM / "compat", DM / "gfx", DM / "host", DM,
+          DM / "gfx" / "vulkan" / "engine" / "third_party"]
+# 只排掉参考工程自带的单元测试；其余 *.c/*.cpp/*.S 全编译
+DM_SKIP = ("gfx/tex/tests/",)
+
+ZA_SRC = ["za_activity.c", "za_guest.c", "za_mod.c", "za_sdk.c", "za_horizon.c",
+          "za_os.c", "za_stubs.c", "za_mem.c", "za_nvn.c", "za_sync.c", "za_vi.c",
+          "za_gfx.c"]
+
+
+def dm_sources():
+    out = []
+    for pat in ("**/*.c", "**/*.cpp", "**/*.S"):
+        for p in sorted(DM.glob(pat)):
+            rel = p.relative_to(DM).as_posix()
+            if any(rel.startswith(s) for s in DM_SKIP):
+                continue
+            out.append(p)
+    return out
+
+
 def build_native():
-    clang = NDK / "toolchains" / "llvm" / "prebuilt" / "windows-x86_64" / "bin" / "aarch64-linux-android26-clang.cmd"
-    if not clang.exists():
-        clang = NDK / "toolchains" / "llvm" / "prebuilt" / "linux-x86_64" / "bin" / "aarch64-linux-android26-clang"
-    if not clang.exists():
-        sys.exit("缺少 clang: %s" % clang)
+    clang = find_clang()
+    clangxx = find_clang("++")
     # 宿主函数自动桩要先按导入表重新生成（导入表变了，桩的索引就变了）。
     run([sys.executable, str(REPO / "tools" / "gen_stubs.py")])
     so = assert_inside(BUILD / "libzaandroid.so")
-    run([clang, "-O2", "-g", "-fPIC", "-shared", "-fvisibility=hidden",
+    objdir = assert_inside(BUILD / "obj")
+    objdir.mkdir(parents=True, exist_ok=True)
+    incs = []
+    for d in DM_INC:
+        incs += ["-I", str(d)]
+    # -fsigned-char：Switch/苹果的 char 是有符号的，bcdec 等按有符号写
+    common = ["-O2", "-g", "-fPIC", "-fvisibility=hidden", "-fsigned-char",
+              "-Wno-unused-parameter", "-Wno-unused-function", "-Wno-missing-braces",
+              "-Wno-format", "-Wno-incompatible-pointer-types"] + incs
+    objs = []
+    srcs = [(ROOT / "native" / n, "c") for n in ZA_SRC if (ROOT / "native" / n).exists()]
+    srcs += [(p, p.suffix.lstrip(".").lower()) for p in dm_sources()]
+    for i, (src, kind) in enumerate(srcs):
+        tag = ("%02d_" % i) + src.relative_to(ROOT / "native").with_suffix("").as_posix().replace("/", "_")
+        obj = objdir / (tag + ".o")
+        if kind == "cpp":
+            run([clangxx, "-std=c++17"] + common + ["-c", "-o", obj, src])
+        elif kind == "s":
+            run([clang] + common + ["-c", "-o", obj, src])
+        else:
+            run([clang, "-std=gnu11"] + common + ["-c", "-o", obj, src])
+        objs.append(obj)
+    # 链接：C++ 代码要 clang++ 才会带 libc++_shared
+    run([clangxx, "-shared", "-o", so,
          "-Wl,-z,relro,-z,now",   # ★ GOT 全只读：客机越界写打到 GOT 会立刻 SIGSEGV
-         "-o", so, ROOT / "native" / "za_activity.c", ROOT / "native" / "za_guest.c",
-         ROOT / "native" / "za_mod.c", ROOT / "native" / "za_sdk.c",
-         ROOT / "native" / "za_horizon.c",
-         ROOT / "native" / "za_os.c", ROOT / "native" / "za_stubs.c",
-         ROOT / "native" / "za_mem.c", ROOT / "native" / "za_nvn.c", ROOT / "native" / "za_sync.c",
-         ROOT / "native" / "za_vi.c",
-         "-llog", "-ldl", "-landroid"])
-    print("  原生库已编译 -> %s (%.1f KB)" % (so, so.stat().st_size / 1024))
+         ] + objs + ["-lvulkan", "-llog", "-ldl", "-landroid", "-lm"])
+    print("  原生库已编译 -> %s (%.1f KB，%d 个目标文件)"
+          % (so, so.stat().st_size / 1024, len(objs)))
 
 
 def find_libcxx():
@@ -206,6 +259,10 @@ def main():
     print("  工程根目录: %s" % ROOT)
     print("  工具链    : %s" % TOOLS)
     print("  NDK       : %s" % NDK)
+    if "--native-only" in sys.argv:
+        # 迭代图形层时只编译 .so，不打包 APK（前面会 rmtree BUILD，这里补回来）
+        build_native()
+        return
     build_shaders()
     build_native()
     apk = build_apk()

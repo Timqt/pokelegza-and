@@ -31,6 +31,12 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "PokemonZA", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "PokemonZA", __VA_ARGS__)
 
+// 图形层（app/native/dm 里的参考工程 NVN→Vulkan 翻译器）。接管时这里不再自建交换链：
+// 一个 ANativeWindow 只有一条 BufferQueue，两套交换链同时呈现必然互相覆盖/崩。
+int za_gfx_active(void);
+void za_gfx_set_window(ANativeWindow *window);
+void za_gfx_start(const char *shader_root);
+
 typedef struct ZaApp
 {
     ANativeActivity *activity;
@@ -535,6 +541,9 @@ static void *guest_thread(void *arg)
         if ((beat & 7) == 1) LOGI("客机线程心跳 #%d", beat);
     }
     AAssetManager *assets = activity->assetManager;
+    // 图形层先起跑：它在自己的线程里建 Vulkan 实例/设备/交换链，并阻塞等窗口出现，
+    // 这段耗时（真机 100–300 ms）与客机装载并行，别占客机线程。
+    za_gfx_start(activity->internalDataPath ? activity->internalDataPath : "/data/local/tmp");
     size_t tsz = 0, rsz = 0, dsz = 0;
     unsigned char *text = (unsigned char *)za_read_asset(assets, "guest/text.bin", &tsz);
     unsigned char *rodata = (unsigned char *)za_read_asset(assets, "guest/rodata.bin", &rsz);
@@ -592,6 +601,7 @@ static void on_native_window_created(ANativeActivity *activity, ANativeWindow *w
 {
     ZaApp *app = (ZaApp *)activity->instance;
     LOGI("onNativeWindowCreated: window=%p 实例=%p 设备=%p", (void *)window, (void *)app->instance, (void *)app->device);
+    if (za_gfx_active()) { za_gfx_set_window(window); return; }
     if (!ensure_vulkan(app)) { LOGE("Vulkan 初始化未完成，无法建表面"); return; }
     app->window = window;
 
@@ -630,6 +640,7 @@ static void on_native_window_destroyed(ANativeActivity *activity, ANativeWindow 
     LOGI("onNativeWindowDestroyed");
     app->window = NULL;
     app->renderReady = 0;
+    if (za_gfx_active()) { za_gfx_set_window(NULL); return; }
     destroy_swapchain(app);
 }
 
@@ -637,11 +648,14 @@ static void on_activity_destroy(ANativeActivity *activity)
 {
     ZaApp *app = (ZaApp *)activity->instance;
     app->running = 0;
-    pthread_join(app->thread, NULL);
-    destroy_swapchain(app);
-    if (app->device) { gDestroyDevice(app->device, NULL); app->device = NULL; }
-    if (app->surface && gDestroySurfaceKHR) { gDestroySurfaceKHR(app->instance, app->surface, NULL); app->surface = VK_NULL_HANDLE; }
-    if (app->instance && gDestroyInstance) { gDestroyInstance(app->instance, NULL); app->instance = NULL; }
+    if (!za_gfx_active())
+    {
+        pthread_join(app->thread, NULL);
+        destroy_swapchain(app);
+        if (app->device) { gDestroyDevice(app->device, NULL); app->device = NULL; }
+        if (app->surface && gDestroySurfaceKHR) { gDestroySurfaceKHR(app->instance, app->surface, NULL); app->surface = VK_NULL_HANDLE; }
+        if (app->instance && gDestroyInstance) { gDestroyInstance(app->instance, NULL); app->instance = NULL; }
+    }
     LOGI("宿主退出");
 }
 
@@ -787,7 +801,7 @@ static void on_activity_create(ANativeActivity *activity)
     activity->instance = app;
     app->activity = activity;
     app->assets = activity->assetManager;
-    ensure_vulkan(app);
+    if (!za_gfx_active()) ensure_vulkan(app);
 }
 
 __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActivity *activity, void *savedState, size_t savedStateSize)
@@ -800,7 +814,7 @@ __attribute__((visibility("default"))) void ANativeActivity_onCreate(ANativeActi
     activity->callbacks->onNativeWindowDestroyed = on_native_window_destroyed;
     activity->callbacks->onDestroy = on_activity_destroy;
     ZaApp *app = (ZaApp *)activity->instance;
-    pthread_create(&app->thread, NULL, render_thread, app);
+    if (!za_gfx_active()) pthread_create(&app->thread, NULL, render_thread, app);
     // 客机模块另起一条线程装载+启动：它崩了也不影响 Vulkan 画面。
     // 栈给大一点：Switch 游戏的静态构造器吃栈很凶，默认 1MB 会直接栈溢出
     // （症状是进程被 SIGSEGV 静默杀掉，连 tombstone 都没有）。
