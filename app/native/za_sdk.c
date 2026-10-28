@@ -436,6 +436,34 @@ static void za_hook_workerblr(unsigned long long *r)
           obj, a, b, tgt);
 }
 
+// ── SDK 单例 sdk+0xbacbb0（客机崩在 sdk+0x3f70f4 解引用 NULL 的那个）──
+// 取用点 sdk+0x1c6620 直接返回 [0xbacbb0]；创建点在 0x1c7374
+// （`[x19]->vtable[0x20]` 建对象后存进该全局），创建函数入口 0x1c7270。
+// 两边都盯上：创建从来没跑过 ⇒ 这条初始化路径根本没被走到；
+// 跑过但存进去的还是 0 ⇒ 创建调用本身失败/返回了错误。
+static void za_hook_mem_singleton_get(unsigned long long *r)
+{
+    int *used = za_probe_budget("memsing-get");
+    if (*used >= 8) return;
+    (*used)++;
+    unsigned long long g = 0;
+    memcpy(&g, (const void *)(uintptr_t)(za_sdk_base + 0xbacbb0), 8);
+    ZLOGE("★ mem 单例 getter: [sdk+0xbacbb0]=%#llx tid=%ld lr=%#llx（%s）",
+          g, (long)syscall(SYS_gettid), r[19],
+          g ? "非空" : "NULL ⇒ 后面必崩");
+}
+
+static void za_hook_mem_singleton_create(unsigned long long *r)
+{
+    int *used = za_probe_budget("memsing-new");
+    if (*used >= 8) return;
+    (*used)++;
+    unsigned long long g = 0;
+    memcpy(&g, (const void *)(uintptr_t)(za_sdk_base + 0xbacbb0), 8);
+    ZLOGE("★ mem 单例 create 入口: x0=%#llx 当前单例=%#llx tid=%ld",
+          r[0], g, (long)syscall(SYS_gettid));
+}
+
 /* ⚠ za_install_entry_probe 只能探 **SDK** 里的地址（stub 也在 SDK 扩展区，
  *   跨模块的分支超出 ±128MB）。曾经误用它探 main+0x1653cc0/d00，
  *   结果把 b 写进了 SDK 的同偏移处、破坏了无关函数 —— 已移除。 */
@@ -973,6 +1001,9 @@ int za_sdk_load(za_mod_t *sdk,
         za_install_entry_probe(base, 0x13c1c0, 0xc90c80, 0xc90cf8, za_hook_unlockmutex);
         // sdk+0x13a5d0：慢路径互斥（主线程卡在它内部的 0x13a684 WaitForAddress）
         za_install_entry_probe(base, 0x13a5d0, 0xc91080, 0xc910f8, za_hook_mutex_slow);
+        // SDK 单例 sdk+0xbacbb0：取用/创建两侧（NULL 崩溃定位）
+        za_install_entry_probe(base, 0x1c6620, 0xc91280, 0xc912f8, za_hook_mem_singleton_get);
+        za_install_entry_probe(base, 0x1c7270, 0xc91300, 0xc91378, za_hook_mem_singleton_create);
         // sdk+0x56e3a0 = memset(dst,val,len)：验证「超大尺寸建池 + memset」假设
         za_install_entry_probe(base, 0x56e3a0, 0xc91180, 0xc911f8, za_hook_memset);
         // ⚠ 探针在一个函数的**中间指令**上（0x500194 = `cbnz w0, abort`）时，

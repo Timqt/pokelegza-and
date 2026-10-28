@@ -829,6 +829,70 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
     //   等于自己制造全局停摆。真机实测：两次这样的信号之后主线程就再也不动了，
     //   NVN 永远 submit=0。现在一律忽略，采样改走专用信号 63。
     if (info && info->si_code <= 0) return;
+    // ★ 2026-10-28：客机里的「近空指针读」受控恢复。
+    //   实测有两处（sdk+0x3f70f4 `ldr x8,[x0]` 取未初始化的单例、
+    //   main+0x1757a70 `ldr x8,[x8,#0x58]` 读 [obj+0x1f8] 为 0 的容器）
+    //   都是「读到 0 再判空」的写法：真机上直接把进程打死，语义上等价于读到 0。
+    //   严格条件：si_addr < 0x1000、pc 在 main/sdk 映像内、故障指令确实是
+    //   `ldr Rt,[Xn,#imm]` 且 Xn+imm == si_addr。满足就把 Rt 置 0、pc += 4 继续；
+    //   其余一律走原来的致命流程（不改判别的故障）。
+    if (ctx && sig == SIGSEGV && info &&
+        (unsigned long long)(uintptr_t)info->si_addr < 0x1000ull)
+    {
+        ucontext_t *uc0 = (ucontext_t *)ctx;
+        unsigned long pcv = (unsigned long)uc0->uc_mcontext.pc;
+        unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+        int in_main = mb && pcv >= mb && pcv < mb + ZA_IMAGE_SIZE;
+        int in_sdk = za_sdk_base && pcv >= za_sdk_base && pcv < za_sdk_base + za_sdk_size;
+        if (in_main || in_sdk)
+        {
+            unsigned int w = *(volatile unsigned int *)(uintptr_t)pcv;
+            unsigned int rt = w & 0x1fu, rn = (w >> 5) & 0x1fu;
+            int is64 = ((w & 0xffc00000u) == 0xf9400000u);
+            int is32 = ((w & 0xffc00000u) == 0xb9400000u);
+            int is8  = ((w & 0xffc00000u) == 0x39400000u);
+            if ((is64 || is32 || is8) && rn != 31)
+            {
+                unsigned long long base = (unsigned long long)uc0->uc_mcontext.regs[rn];
+                unsigned long long imm = (unsigned long long)((w >> 10) & 0xfffu) *
+                                         (is8 ? 1ull : (is64 ? 8ull : 4ull));
+                if (base + imm == (unsigned long long)(uintptr_t)info->si_addr)
+                {
+                    // 同一个 pc 反复故障 ⇒ 这不是「读一次 0 就完了」的写法，
+                    // 而是靠这次读的结果在循环。恢复下去只会空转，必须交回致命流程。
+                    static unsigned long seen_pc[8];
+                    static unsigned seen_n[8];
+                    int slot = 0;
+                    for (int i = 0; i < 8; i++) {
+                        if (seen_pc[i] == 0) { slot = i; break; }
+                        if (seen_pc[i] == pcv) { slot = i; break; }
+                        if (i == 7) slot = (int)(pcv & 7u);
+                    }
+                    if (seen_pc[slot] != pcv) { seen_pc[slot] = pcv; seen_n[slot] = 0; }
+                    if (++seen_n[slot] > 3) {
+                        // 放弃恢复，走正常致命流程（下面会 dump 现场）
+                    } else {
+                    if (rt != 31) uc0->uc_mcontext.regs[rt] = 0;
+                    uc0->uc_mcontext.pc = pcv + 4;
+                    static int nrec;
+                    if (nrec < 24)
+                    {
+                        char b[128];
+                        char *q = b;
+                        q = za_put_str(q, "ZaGuest: ★ 近空读恢复 pc=");
+                        q = za_put_hex(q, (unsigned long long)pcv);
+                        q = za_put_str(q, " rt=");
+                        q = za_put_dec(q, rt);
+                        q = za_put_str(q, " ← 0\n");
+                        za_fatal_write(b, (size_t)(q - b));
+                    }
+                    nrec++;
+                    return;
+                    }
+                }
+            }
+        }
+    }
     int zi = za_fatal_idx();
     if (za_fatal_dump_pool[zi]) siglongjmp(za_fatal_jmp_pool[zi], 1);   // dump 中二次 fault
     // ★★ 受控修复：ART 自己的一个已知缺陷。
@@ -3386,6 +3450,14 @@ void za_dump_progress_stall(void)
                 static int poke_n;
                 int rp = za_sync_repair_full_wait_ring();
                 if (rp) ZLOGE("   ↳ 本轮修好 %d 个写满的等待环", rp);
+                // 条件变量侧的伪唤醒：svc#29 一次都不发的时候，worker 会永远
+                // 睡在自己的 CV 上。伪唤醒合法（调用方必须重判谓词），
+                // 用它区分「我们漏了唤醒」和「确实没活可干」。
+                {
+                    extern unsigned za_sync_poke_all(void);
+                    unsigned cv = za_sync_poke_all();
+                    if (cv) ZLOGE("   ↳ 伪唤醒 %u 个条件变量等待者", cv);
+                }
                 int pk = za_sync_poke_addr_waiters();
                 if (pk) ZLOGE("   ↳ 伪唤醒了 %d 个地址等待者（第 %d 次）", pk, ++poke_n);
                 // 伪唤醒三次都没让系统动 ⇒ 等待的字确实没人写。做一次限定范围的
@@ -3526,6 +3598,24 @@ static void za_hook_m_jobpost(unsigned long long *r)
 
 // worker 出队入口（main+0x1bab3a0）：x0 = 队列对象。
 // [obj+0x2f8] = 待取数量、[obj+0x330] = 另一个计数。数量为 0 还能进来 = 空转。
+// 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。
+// 紧随其后 main 就 `bl 0x413b8` 等这个任务 —— 这里就是「任务交给谁」的唯一入口。
+static void za_hook_m_jobsubmit2(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 6) return;
+    unsigned long long o = r[0];            // x0 = x22
+    unsigned long long vt = 0, fn = 0, g = 0;
+    if (ZA_PTR_OK(o)) memcpy(&vt, (const void *)(uintptr_t)o, 8);
+    if (ZA_PTR_OK(vt)) memcpy(&fn, (const void *)(uintptr_t)(vt + 0x50), 8);
+    {
+        unsigned long gb = (unsigned long)za_guest_base;
+        if (gb) memcpy(&g, (const void *)(uintptr_t)(gb + 0x3d80800), 8);
+    }
+    ZLOGI("★ 提交点 x22=%#llx vtable=%#llx [vt+0x50]=%#llx（调度器单例=%#llx）",
+          o, vt, fn, g);
+}
+
 static void za_hook_m_dequeue(unsigned long long *r)
 {
     static volatile unsigned long long n;
