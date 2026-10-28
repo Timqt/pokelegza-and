@@ -829,6 +829,63 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
     //   等于自己制造全局停摆。真机实测：两次这样的信号之后主线程就再也不动了，
     //   NVN 永远 submit=0。现在一律忽略，采样改走专用信号 63。
     if (info && info->si_code <= 0) return;
+    // ★ 2026-10-28：「名字表缺失」修复（不受 ZA_NULLRECOVER 影响）。
+    //   主映像里有一组「按序号取名字」的小访问器（main+0x1757a6c / 0x1757a98），
+    //   形状都是
+    //       ldr x8,[obj,#0x1f8]     ; 名字表容器（虚 setter main+0x1757680 写入）
+    //       ldr x8,[x8,#0x58]       ; ← 容器为 0 时 fault addr = 0x58
+    //       cbz x8, <返回空串/0>    ; 没有表就返回空
+    //   容器由 vt[0x98] 那个虚 setter 建立；游戏这次运行里没人调它（资源没走到
+    //   那一步）⇒ 容器一直是 0。**跳过读取**的实验证明不行：调用方随后会把
+    //   读到的垃圾当指针`blr`（真机崩在 pc=0x250b0b4）。
+    //   ⇒ 正确的最小修复是「给一个空表」，让整条路径自洽：
+    //       容器 +0x58 == 0  ⇒ 访问器走 cbz，返回空串/0（=「没有名字」）
+    //       容器 +0x28 = 极大值 ⇒ 析构时的引用计数递减永远不到 0，不会 free 它
+    //   写回 [obj+0x1f8] 后**重执行**故障指令（pc 不变），后续每次访问都命中假表。
+    if (ctx && sig == SIGSEGV && info)
+    {
+        extern unsigned char *za_guest_base;
+        static unsigned long long za_fake_nametable[0x20] __attribute__((aligned(16)));
+        ucontext_t *ucx = (ucontext_t *)ctx;
+        unsigned long pcx = (unsigned long)ucx->uc_mcontext.pc;
+        unsigned long prev = pcx >= 4 ? *(volatile unsigned int *)(uintptr_t)(pcx - 4) : 0;
+        int prev_is_ld_name_table = ((prev & 0xffc00000u) == 0xf9400000u) &&   // ldr xN,[Xm,#imm]
+                                    (((prev >> 10) & 0xfffu) == 0x3fu) &&      // #0x1f8
+                                    ((prev & 0x1fu) == 8u);                    // → x8
+        if (za_guest_base && prev_is_ld_name_table &&
+            *(volatile unsigned int *)(uintptr_t)pcx == 0xf9402d08u &&        // ldr x8,[x8,#0x58]
+            ucx->uc_mcontext.regs[8] == 0)
+        {
+            int rn = (int)((prev >> 5) & 0x1fu);
+            unsigned long long self = rn < 31 ? ucx->uc_mcontext.regs[rn] : 0;
+            static int nnm;
+            // 空表：+0x00 虚表=0、+0x28 引用计数=0x40000000、+0x58 名字数组=0
+            za_fake_nametable[0x28 / 8] = 0x40000000ull;
+            za_fake_nametable[0x58 / 8] = 0;
+            if (self && ZA_PTR_OK(self)) {
+                *(volatile unsigned long long *)(uintptr_t)(self + 0x1f8) =
+                    (unsigned long long)(uintptr_t)za_fake_nametable;
+            }
+            if (nnm < 8)
+            {
+                unsigned long long vt = 0;
+                if (self) memcpy(&vt, (const void *)(uintptr_t)self, 8);
+                char b[192];
+                char *q = b;
+                q = za_put_str(q, "ZaGuest: ★ 名字表缺失→装空表 pc=+");
+                q = za_put_hex(q, (unsigned long long)(pcx - (unsigned long)(uintptr_t)za_guest_base));
+                q = za_put_str(q, " obj=");
+                q = za_put_hex(q, self);
+                q = za_put_str(q, " vt=");
+                q = za_put_hex(q, vt);
+                q = za_put_str(q, "\n");
+                za_fatal_write(b, (size_t)(q - b));
+                nnm++;
+            }
+            // 不跳过：让它带着假表重新执行
+            return;
+        }
+    }
     // ★ 2026-10-28：客机里的「近空指针读」受控恢复。
     //   实测有两处（sdk+0x3f70f4 `ldr x8,[x0]` 取未初始化的单例、
     //   main+0x1757a70 `ldr x8,[x8,#0x58]` 读 [obj+0x1f8] 为 0 的容器）
@@ -2624,18 +2681,18 @@ static unsigned int za_fs_readfile_cnt(unsigned long *out_read, unsigned int h,
         if (buf && size && size <= (4u << 20)) memset(buf, 0, (size_t)size);
         return 0;
     }
-    {
-        static int lg;
-        if (lg++ < 32)
-            ZLOGE("★ fs::ReadFile(h=%#x \"%s\" off=%lld size=%lu) => 0（空文件）",
-                  h, za_fs_path_of(h), off, size);
-    }
     if (off < 0) off = 0;
     if (!buf || (unsigned long long)off >= total) return 0;
     unsigned long n = (unsigned long)(total - (unsigned long long)off);
     if (n > size) n = size;
     memcpy(buf, d + (unsigned long)off, (size_t)n);
     if (out_read) *out_read = n;
+    {
+        static int lg;
+        if (lg++ < 32)
+            ZLOGE("★ fs::ReadFile(内嵌 h=%#x \"%s\" off=%lld size=%lu) => %lu/%lu",
+                  h, za_fs_path_of(h), off, size, n, total);
+    }
     return 0;
 }
 static unsigned int za_fs_readfile(unsigned int h, long long off, void *buf, unsigned long size)
@@ -3359,8 +3416,17 @@ void za_fs_vt_free(void *obj, void *ptr, unsigned long size, unsigned long align
     za_fs_guard_free(ptr, "vt-free");
 }
 
-// ── 基址重定位 ──────────────────────────────────────────────────
-// NSO 里**一条 RELATIVE 重定位都没有**：.data 里的模块内指针要自己加基址。
+// 看门狗的「伪唤醒」默认关闭：SDK 的条件变量等待者环（cap=100）会被
+// 每次伪唤醒多塞一条记录，且没有真实信号可消耗 ⇒ 几轮就写满。
+// 需要区分「我们丢了唤醒 / 对方确实没生产」时，手动放标记文件打开。
+static int za_fakewake_on(void)
+{
+    static int cached = -1;
+    if (cached < 0) cached = access("/data/local/tmp/za-fakewake", F_OK) == 0;
+    return cached;
+}
+
+// ── 基址重定位 ──────────────────────────────────────────────────// NSO 里**一条 RELATIVE 重定位都没有**：.data 里的模块内指针要自己加基址。
 // 判据：0x1000 <= v < 映像大小 ⇒ 视为模块内指针。
 static unsigned long long za_relocate_base(unsigned char *base)
 {
@@ -3521,19 +3587,29 @@ void za_dump_progress_stall(void)
     ZLOGE("★ 10 秒无 NVN 进展快照（svc 在涨 ⇒ 客机在自旋）：");
     {
         extern volatile unsigned long long za_enq_queue, za_enq_count;
+        extern volatile unsigned long long za_worker_obj, za_worker_polls;
         unsigned long long q = za_enq_queue;
-        ZLOGE("★ 任务队列 %#llx（累计入队 %llu 次）：", q, (unsigned long long)za_enq_count);
-        if (ZA_PTR_OK(q)) {
+        unsigned long long w = za_worker_obj;
+        ZLOGE("★ 任务队列 %#llx（累计入队 %llu 次）；worker 轮询对象 %#llx（轮询 %llu 次）：",
+              q, (unsigned long long)za_enq_count, w, (unsigned long long)za_worker_polls);
+        // worker 真正在等的那个池对象：把 +0x2c0..+0x360 的关键字段全倒出来。
+        //   前 4 个 64 位字就是「队列数组/数量/索引/停止标志」这几个；
+        //   只要和入队对象的字段对不上，就说明两头用的不是同一个池。
+        if (ZA_PTR_OK(w)) {
             unsigned long long v[8];
-            memcpy(v, (const void *)(uintptr_t)(q + 0xe0), sizeof v);
-            ZLOGE("   +0xe0: %#llx %#llx %#llx %#llx", v[0], v[1], v[2], v[3]);
-            ZLOGE("   +0x100: %#llx %#llx %#llx %#llx", v[4], v[5], v[6], v[7]);
-            memcpy(v, (const void *)(uintptr_t)(q + 0x60), sizeof v);
-            ZLOGE("   +0x60: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx",
-                  v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
-            for (unsigned long long off = 0x2f0; off <= 0x300; off += 0x10) {
-                memcpy(v, (const void *)(uintptr_t)(q + off), 16);
-                ZLOGE("   +%#llx: %#llx %#llx", off, v[0], v[1]);
+            memcpy(v, (const void *)(uintptr_t)w, 16);
+            ZLOGE("   pool[0]=%#llx pool[8]=%#llx vt=%#llx", v[0], v[1], v[0]);
+            for (unsigned long long off = 0x2c0; off <= 0x360; off += 0x10) {
+                memcpy(v, (const void *)(uintptr_t)(w + off), 16);
+                ZLOGE("   pool+%#llx: %#llx %#llx", off, v[0], v[1]);
+            }
+        }
+        if (ZA_PTR_OK(q)) {
+            ZLOGE("   enq vt=%#llx", *(volatile unsigned long long *)(uintptr_t)q);
+            for (unsigned long long off = 0x2c0; off <= 0x360; off += 0x10) {
+                unsigned long long a = *(volatile unsigned long long *)(uintptr_t)(q + off);
+                unsigned long long b = *(volatile unsigned long long *)(uintptr_t)(q + off + 8);
+                ZLOGE("   enq+%#llx: %#llx %#llx", off, a, b);
             }
         }
     }
@@ -3592,10 +3668,19 @@ void za_dump_progress_stall(void)
                 // 条件变量侧的伪唤醒：svc#29 一次都不发的时候，worker 会永远
                 // 睡在自己的 CV 上。伪唤醒合法（调用方必须重判谓词），
                 // 用它区分「我们漏了唤醒」和「确实没活可干」。
+                // ⚠ 2026-10-28 真机实测：**伪唤醒对这个 SDK 并不无害**。
+                //   SDK 的 cv.Wait（sdk+0x13a5d0）每次被唤醒都会重新登记一条
+                //   「等待者」记录进 cv 的固定环（容量 100、从不主动收缩），
+                //   而伪唤醒不消耗任何真实信号 ⇒ 每轮伪唤醒给环里塞 19 条
+                //   陈旧记录，5 轮就把环写满（真机看到 100/100），之后新等待者
+                //   登记失败，唤醒路径找不到人。所以默认**关闭**，需要时用
+                //   标记文件 /data/local/tmp/za-fakewake 打开。
                 {
                     extern unsigned za_sync_poke_all(void);
-                    unsigned cv = za_sync_poke_all();
-                    if (cv) ZLOGE("   ↳ 伪唤醒 %u 个条件变量等待者", cv);
+                    if (za_fakewake_on()) {
+                        unsigned cv = za_sync_poke_all();
+                        if (cv) ZLOGE("   ↳ 伪唤醒 %u 个条件变量等待者", cv);
+                    }
                 }
                 // ★ 2026-10-28 实验：把「一直停在 state=0（新建）」的任务强制
                 //   标成完成（5）。调度器的 submit 是**同步**的（提交后就在这里
@@ -3632,7 +3717,7 @@ void za_dump_progress_stall(void)
                     }
                     if (changed) za_sync_poke_all();   // 状态改完再叫醒它们
                 }
-                int pk = za_sync_poke_addr_waiters();
+                int pk = za_fakewake_on() ? za_sync_poke_addr_waiters() : 0;
                 if (pk) ZLOGE("   ↳ 伪唤醒了 %d 个地址等待者（第 %d 次）", pk, ++poke_n);
                 // 伪唤醒三次都没让系统动 ⇒ 等待的字确实没人写。做一次限定范围的
                 // 强制解锁，把「锁泄漏」和「锁还在保护数据」区分开。
@@ -3799,7 +3884,14 @@ static void za_hook_m_enq3(unsigned long long *r)
     __atomic_add_fetch(&za_enq_count, 1, __ATOMIC_RELAXED);
     static int n;
     if (n++ >= 8) return;
-    ZLOGI("★ 真正入队 0x16ffeb0: x0=%#llx x1=%#llx x2=%#llx", r[0], r[1], r[2]);
+    unsigned long long vt = 0, cnt = 0, idx = 0;
+    if (ZA_PTR_OK(r[0])) {
+        memcpy(&vt, (const void *)(uintptr_t)r[0], 8);
+        memcpy(&cnt, (const void *)(uintptr_t)(r[0] + 0x2f8), 8);
+        memcpy(&idx, (const void *)(uintptr_t)(r[0] + 0x2f0), 8);
+    }
+    ZLOGI("★ 真正入队 0x16ffeb0: x0=%#llx x1=%#llx x2=%#llx vt=%#llx 数量=%llu idx=%#llx lr=%#llx",
+          r[0], r[1], r[2], vt, cnt, idx, r[19]);
 }
 
 // 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。
@@ -4499,7 +4591,7 @@ static void *za_sampler_watchdog(void *arg)
                     }
                     za_nvn_dump_recent();   // 带客机 LR：最后几步 NVN 调用发生在哪
                 }
-                unsigned pk = za_sync_poke_all();
+                unsigned pk = za_fakewake_on() ? za_sync_poke_all() : 0;
                 if (pk && (no_progress % 2000) == 40)
                     ZLOGE("   已对 %u 个条件变量等待者做伪唤醒（累计 %d 次）", pk,
                           no_progress / 40);
