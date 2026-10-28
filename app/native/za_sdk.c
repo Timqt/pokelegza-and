@@ -229,6 +229,41 @@ static void za_probe_threadtype(const char *tag, unsigned long long t)
 static void za_hook_startthread(unsigned long long *r)   { za_probe_threadtype("os::StartThread", r[0]); }
 static void za_hook_startimpl(unsigned long long *r)     { za_probe_threadtype("Impl::StartThread", r[0]); }
 static void za_hook_lockmutex(unsigned long long *r)     { za_trace_mutex("lock", r[0]); }
+// 慢路径见过「锁字 = 2（交接态）」的对象地址。停摆时据此做恢复。
+#define ZA_MSLOW_N 8
+static volatile unsigned long long za_mslow_obj[ZA_MSLOW_N];
+
+static void za_mslow_record(unsigned long long obj)
+{
+    if (!obj) return;
+    for (int i = 0; i < ZA_MSLOW_N; i++)
+        if (za_mslow_obj[i] == obj) return;
+    for (int i = 0; i < ZA_MSLOW_N; i++) {
+        unsigned long long expect = 0;
+        if (__atomic_compare_exchange_n(&za_mslow_obj[i], &expect, obj, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+            return;
+    }
+}
+
+// 对探针记录过的对象做一次「解锁路径的动作」：锁字 2 → 0。
+// 语义与 sdk+0x13a7e4 (`cmp #2 ; stlxr wzr`) 完全一致，不是破坏互斥。
+int za_mutex_clear_handoff(void)
+{
+    int n = 0;
+    for (int i = 0; i < ZA_MSLOW_N; i++) {
+        unsigned long long o = za_mslow_obj[i];
+        if (!o) continue;
+        unsigned int w = 0;
+        memcpy(&w, (const void *)(uintptr_t)(o + 0x20), 4);
+        if (w != 2) continue;
+        unsigned int z = 0;
+        __atomic_store_n((unsigned int *)(uintptr_t)(o + 0x20), z, __ATOMIC_RELEASE);
+        ZLOGE("   ↳ 慢路径对象 %#llx 的锁字停在 2（交接态）⇒ 按解锁路径写回 0", o);
+        n++;
+    }
+    return n;
+}
 // sdk+0x13a5d0：nn::os 的慢路径互斥（主线程就卡在这条路径的
 // sdk+0x13a684 WaitForAddress 上）。x0 = 对象，锁字在 obj+0x20
 // （反汇编 `add x21,x20,#0x20`）。记 (对象, 锁字, tid, 调用者 x30)。
@@ -242,6 +277,7 @@ static void za_hook_mutex_slow(unsigned long long *r)
     if (obj) {
         memcpy(&word, (const void *)(uintptr_t)(obj + 0x20), 4);
         memcpy(&next, (const void *)(uintptr_t)(obj + 0x28), 4);
+        if (word == 2) za_mslow_record(obj);
     }
     ZLOGE("★ mutex-slow: obj=%#llx word(+0x20)=%#x next(+0x28)=%#x "
           "tid=%ld caller=sdk+%#llx",

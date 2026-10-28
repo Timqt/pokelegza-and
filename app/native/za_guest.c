@@ -3671,25 +3671,14 @@ static void *za_sampler_watchdog(void *arg)
                             if (lb) {
                                 ZLOGE("★ 主线程阻塞地址 %#llx ⇒ 扫全线程栈找持有者：", lb);
                                 za_sync_scan_for_addr(lb);
-                                // ★ 2026-10-28：探针实测这把互斥的字经常停在 **2**
-                                //   （交接态）。按 SDK 反汇编（sdk+0x13a5d0 / 0x13a7dc）：
-                                //     0=空闲 1=已锁 2=交接中（等待者在 0x13a630 自旋等它变）
-                                //   解锁路径的动作就是 `cmp #2 ; stlxr wzr` —— 把 2 清回 0。
-                                //   2 长期不动说明解锁方再也不会执行那一步，于是全体自旋。
-                                //   这里做**与解锁路径完全相同**的恢复动作，不是破坏互斥。
-                                unsigned int wv = 0;
+                                // ★ 2026-10-28：慢路径（sdk+0x13a5d0）探针实测，
+                                //   锁字经常停在 **2（交接态）**；解锁路径的动作就是
+                                //   `cmp #2 ; stlxr wzr` 把它清回 0。对所有被探针记录过
+                                //   且在等待态卡住的对象做同一动作。
                                 {
-                                    struct iovec li = { &wv, 4 };
-                                    struct iovec ri = { (void *)(uintptr_t)lb, 4 };
-                                    if (process_vm_readv((pid_t)syscall(SYS_getpid), &li, 1,
-                                                         &ri, 1, 0) == 4 && wv == 2) {
-                                        unsigned int zero = 0;
-                                        struct iovec lw = { &zero, 4 };
-                                        struct iovec rw = { (void *)(uintptr_t)lb, 4 };
-                                        if (process_vm_writev((pid_t)syscall(SYS_getpid),
-                                                              &lw, 1, &rw, 1, 0) == 4)
-                                            ZLOGE("   ↳ 锁字停在 2（交接态）⇒ 按解锁路径写回 0");
-                                    }
+                                    extern int za_mutex_clear_handoff(void);
+                                    int ncl = za_mutex_clear_handoff();
+                                    if (ncl) ZLOGE("   ↳ 本轮清了 %d 个交接态锁字", ncl);
                                 }
                             }
                         }
