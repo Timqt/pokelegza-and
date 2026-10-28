@@ -3507,23 +3507,21 @@ volatile unsigned long za_pc_ring_pos;
 static void za_pc_sample_handler(int sig, siginfo_t *info, void *ctx)
 {
     (void)sig; (void)info;
-    static int probe;
-    if (probe < 3)
-    {
-        probe++;
-        unsigned long raw = ctx ? (unsigned long)((ucontext_t *)ctx)->uc_mcontext.pc : 0;
-        ZLOGI("采样探针 %d：ctx=%p pc=%#lx", probe, ctx, raw);
-    }
+    // ★ 2026-10-28：这里**绝不能调 ZLOGI**。日志函数要拿互斥、走 malloc，
+    //   不是 async-signal-safe：信号恰好打断正在写日志的线程时会自锁/踩堆，
+    //   真机上就表现为「宿主崩溃 pc=libzaandroid.so+0xd77fc」，崩溃点落在
+    //   本函数里。信号处理器只做纯存储。
     if (!ctx) return;
     ucontext_t *uc = (ucontext_t *)ctx;
     unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
+    static volatile unsigned long raw_last;
+    raw_last = pc;
     if ((za_guest_base && pc >= (unsigned long)za_guest_base &&
          pc < (unsigned long)za_guest_base + ZA_IMAGE_SIZE) ||
         (za_sdk_base && pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size))
     {
         za_guest_last_guest_pc = pc;
         // 环形轨迹：崩溃前最后若干条客机 PC。
-        // 采样间隔 20ms，崩前进度通常只剩几十毫秒 ⇒ 只要 16 格就能覆盖。
         unsigned long p = za_pc_ring_pos;
         za_pc_ring[p % ZA_PC_RING] = pc;
         za_pc_ring_pos = p + 1;
@@ -3541,13 +3539,32 @@ void za_reinstall_sampler_handler(void)
         struct sigaction sa;
         memset(&sa, 0, sizeof sa);
         sa.sa_sigaction = za_pc_sample_handler;
-        sa.sa_flags = SA_SIGINFO | SA_RESTART;
+        sa.sa_flags = SA_SIGINFO | SA_RESTART | SA_ONSTACK;
         sigemptyset(&sa.sa_mask);
         sigaction(ZA_SAMPLER_SIG, &sa, NULL);
     }
     int mi = (int)((unsigned long)syscall(SYS_gettid) % 128u);
     if (mask_done[mi]) return;
     mask_done[mi] = 1;
+    // 备用信号栈：采样信号可能正好落在客机很深的调用栈上（或被 svc 门切到
+    // 宿主栈的深处），在快溢出的栈上跑处理器会二次 fault。SA_ONSTACK + 每线程
+    // 64KB 备用栈可以避免这一类崩溃。
+    {
+        static stack_t alt[128];
+        static int alt_done[128];
+        if (!alt_done[mi]) {
+            alt_done[mi] = 1;
+            size_t sz = 64 * 1024;
+            void *p = mmap(NULL, sz, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            if (p != MAP_FAILED) {
+                alt[mi].ss_sp = p;
+                alt[mi].ss_size = sz;
+                alt[mi].ss_flags = 0;
+                sigaltstack(&alt[mi], NULL);
+            }
+        }
+    }
     sigset_t m;
     sigemptyset(&m);
     sigaddset(&m, ZA_SAMPLER_SIG);
@@ -3656,6 +3673,25 @@ static void *za_sampler_watchdog(void *arg)
                             extern void za_ptrace_dump_all(void);
                             extern void za_dump_task_stats(void);
                             za_dump_task_stats();
+                            // 采样器环形轨迹（现在是纯存储、async-signal-safe）
+                            {
+                                unsigned long pos = za_pc_ring_pos;
+                                unsigned long n = pos < ZA_PC_RING ? pos : ZA_PC_RING;
+                                extern unsigned char *za_guest_base;
+                                unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+                                ZLOGE("★ PC 采样环（最近 %lu 条）：", n);
+                                for (unsigned long i = 0; i < n; i++) {
+                                    unsigned long k = (pos - n + i) % ZA_PC_RING;
+                                    unsigned long pc = za_pc_ring[k];
+                                    unsigned long long off = 0;
+                                    const char *w = "";
+                                    if (pc >= mb && pc < mb + ZA_IMAGE_SIZE) { w = "main+"; off = pc - mb; }
+                                    else if (za_sdk_base && pc >= za_sdk_base &&
+                                             pc < za_sdk_base + za_sdk_size) { w = "sdk+"; off = pc - za_sdk_base; }
+                                    else off = pc;
+                                    ZLOGE("    %s%#llx", w, off);
+                                }
+                            }
                             za_ptrace_dump_all();
                             {
                                 extern void za_dump_mutex_trace(void);
