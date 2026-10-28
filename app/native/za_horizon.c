@@ -1531,110 +1531,24 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     //   svc#53 = SignalToAddress(addr, type, value)：唤醒该地址上的等待者。
     case 52: // WaitForAddress(addr=x0, type=w1, value=w2, timeout=x3)
     {
-        unsigned int *p = (unsigned int *)(uintptr_t)a0;
         za_dbg_last_wait = (unsigned long long)a0;   // 崩溃 dump 用
         // 每条返回路径都留一条「此刻锁字是多少」的记录（谁在摸这把锁）。
 #define ZA_W52_RET(v) do { za_mtx_hint((unsigned long long)a0); return (long)(v); } while (0)
-        if (!p) return 0xFA01u;
-        int type = (int)a1;
-        unsigned int v = (unsigned int)a2;
-        long long ns = (long long)a3;      // 纳秒，< 0 = 无限
-        // 登记进等待表：看门狗伪唤醒才够得着（以前这条路径完全在表外）。
+        if (!a0) ZA_W52_RET(0xFA01u);
+        // 登记等待点（诊断用）：看门狗伪唤醒 / 栈回溯都靠这条记录。
         {
             unsigned long long spv = (unsigned long long)za_horizon_regs[ZA_REG_SP];
             if (!spv) spv = za_spcache_get((long)syscall(SYS_gettid));
-            za_sync_note_addr_wait((unsigned long long)a0, v, type, spv,
+            za_sync_note_addr_wait((unsigned long long)a0, (unsigned int)a2, (int)a1, spv,
                                    (unsigned long long)za_horizon_regs[ZA_REG_PC],
                                    (unsigned long long)za_horizon_regs[ZA_REG_FP]);
         }
-        int slices = 0;
-        unsigned long long deadline = 0;
-        if (ns >= 0) {
-            struct timespec tv0;
-            clock_gettime(CLOCK_MONOTONIC, &tv0);
-            deadline = (unsigned long long)tv0.tv_sec * 1000000000ull +
-                       (unsigned long long)tv0.tv_nsec + (unsigned long long)ns;
-        }
-        for (;;)
-        {
-            unsigned int cur = __atomic_load_n(p, __ATOMIC_ACQUIRE);
-            int wait;
-            switch (type)
-            {
-                // ★ 语义是「等待直到条件变为真」，所以阻塞条件是**当前还没到**：
-                //   GreaterThan(value) ⇒ 值还没变大 ⇒ cur <= value 时阻塞。
-                // 实测：SDK 在 *addr==1 时调用 WaitForAddress(addr, 2, 1)，
-                //   期望是**阻塞**等别人把值改大；若按 cur > value 判定就会立刻
-                //   返回 0xFA01，SDK 随后直接 abort（LAST-WAIT nr=52 ret=0xfa01）。
-                case 0: wait = (cur == v); break;   // Equal：等到 != value
-                case 1: wait = (cur >= v); break;   // LessThan：等到 < value
-                case 2: wait = (cur <= v); break;   // GreaterThan：等到 > value
-                default: wait = (cur != v); break;  // NotEqual：等到 == value
-            }
-            if (!wait) { za_stale_clear((unsigned long long)a0); za_sync_addr_wait_done(); ZA_W52_RET(0xFA01u); }
-            struct timespec ts;
-            if (ns >= 0)
-            {
-                ts.tv_sec = (time_t)(ns / 1000000000LL);
-                ts.tv_nsec = (long)(ns % 1000000000LL);
-            }
-            else
-            {
-                // ★ 2026-10-27：无限等待也必须**有界**。
-                //   这条 svc 不在我们的等待表里（za_sync 只管 #26/#28），
-                //   而写方可以只在用户态改值、不调 svc#53 ⇒ futex 唤醒丢失，
-                //   等待者就永久睡死；看门狗的伪唤醒也够不着它。
-                //   真机实测：卡住时等待表里只有 1 个线程，其余 15 个都不在
-                //   #26/#28 —— 就是睡在这里。
-                //   20ms 分片 + 重判条件是安全的：调用方本来就循环重试。
-                ts.tv_sec = 0;
-                ts.tv_nsec = 20 * 1000 * 1000;
-            }
-            int rc = (int)syscall(SYS_futex, (int *)p, FUTEX_WAIT_PRIVATE, (int)cur, &ts,
-                                  NULL, 0);
-            // ★ 2026-10-28：**被唤醒后必须重判条件**，不能直接 return 0。
-            //   以前 `if (rc == 0) return 0;` 会把「值变了但条件仍不成立」当成成功
-            //   返回给 SDK，SDK 便按「已获得」继续，随后的 CAS 失败又会绕回来，
-            //   表现为无限循环且 svc 计数停滞。
-            //   同样，**不再**在等满 1 秒后强行改锁字：2 只有解锁路径会清，
-            //   我们写 2 等于自己制造永久死锁（真机实测写入后永远停在 2/1）。
-            //   内核语义就是「条件成立才返回」，其余一律继续等（分片重判）。
-            (void)rc;
-            if (errno == EINVAL) ZA_W52_RET(0xFA01u);   // 地址非法：交给调用方
-            // ★ 2026-10-28：**无限等待也要有界**（对 #52 同样成立）。
-            //   SDK 的锁慢路径（sdk+0x13a684）明确把 0xFA01 当成「值有变化，重判」：
-            //       and w8,w0,#0x3fffff ; cmp w8,#0xfa01 ; b.eq <重试>
-            //   如果等待方永远不返回，它连「重判 + 重新 CAS」的机会都没有，
-            //   锁字被卡在 1 时整条线程就永久睡死（真机实测 5 条线程）。
-            //   这里给无限等待加上 300ms 上界：超时返回 0xFA01 让客机自己重走一遍
-            //   （读字 → CAS → 再决定），与内核对「伪唤醒」的容错等价。
-            if (ns < 0) {
-                if (!deadline) {
-                    struct timespec t0;
-                    clock_gettime(CLOCK_MONOTONIC, &t0);
-                    deadline = (unsigned long long)t0.tv_sec * 1000000000ull +
-                               (unsigned long long)t0.tv_nsec + 300000000ull;
-                } else {
-                    struct timespec t1;
-                    clock_gettime(CLOCK_MONOTONIC, &t1);
-                    if ((unsigned long long)t1.tv_sec * 1000000000ull +
-                        (unsigned long long)t1.tv_nsec >= deadline) {
-                        za_sync_addr_wait_done();
-                        ZA_W52_RET(0xFA01u);
-                    }
-                }
-            }
-            if (ns >= 0) {
-                struct timespec tv1;
-                clock_gettime(CLOCK_MONOTONIC, &tv1);
-                if ((unsigned long long)tv1.tv_sec * 1000000000ull +
-                    (unsigned long long)tv1.tv_nsec >= deadline) {
-                    za_sync_addr_wait_done();
-                    ZA_W52_RET(0xEA01u);          // 真超时
-                }
-            }
-            continue;
-        }
+        // ★ 2026-10-28：整条等待语义改为**参考版**（d2r hle_thread.c svc 0x34）：
+        //   type 2 ⇒ 值等于 value 才等；0/1 ⇒ 值小于 value 才等；1 ⇒ 先减一再等。
+        //   条件不成立立刻返回 0xFA01（SDK 的锁慢路径把它当「重判」）。
+        //   等待由 za_sync 的等待表统一管，不再直接 futex 等客机地址。
+        ZA_W52_RET(za_sync_wait_addr((unsigned long long)a0, (int)a1, (int)a2,
+                                     (long long)a3));
     }
     case 54: // SynchronizeToAddress / 慢路径让出 CPU（SDK 临界区忙等里调）
     {
@@ -1644,18 +1558,15 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         sched_yield();
         return 0;
     }
-    case 53: // SignalToAddress(addr=x0, type=w1, value=w2)
+    case 53: // SignalToAddress(addr=x0, type=w1, value=w2, count=w3)
     {
-        // ★ 2026-10-28：**这条 svc 不是「只唤醒」——它要在内存上执行操作。**
-        //   Horizon 的 SignalType：
-        //     0 = Signal            只唤醒（count 个）
-        //     1 = Increment         *addr += value，然后唤醒
-        //     2 = SignalAndIncrement 两者都做
-        //     3 = SignalAndModifyByWaitingCount  按等待者数量改
-        //   以前这里只 futex_wake、一个字节都不改 ⇒ 等待方的条件永远不成立。
-        //   真机现象：主线程在 sdk+0x13a684 反复
-        //     WaitForAddress(addr, GreaterThan, 1)，而 addr 恒为 1
-        //   ——因为与之配对的 svc#53(type=1) 从来没有把 1 变成 2。
+        // ★ 2026-10-28：整条语义改为**参考版**（d2r hle_thread.c svc 0x35）：
+        //     type 0 ⇒ 只唤醒 count 个；
+        //     type 1 ⇒ 若 *addr == value 则 **+1** 并唤醒（CAS 失败返回 0xFA01）；
+        //     type 2 ⇒ 按等待者数量改值再唤醒。
+        //   这才是客机 0/1/2 互斥字状态机需要的动作：解锁方把 1 推成 2（交接），
+        //   等待方才可能被唤醒。以前我们无条件 `+= value`，既不看原值也不改
+        //   等待表，锁字与等待者彻底脱节。
         unsigned int *p = (unsigned int *)(uintptr_t)a0;
         {
             static unsigned long long win;
@@ -1672,22 +1583,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                       (unsigned long)za_horizon_regs[ZA_REG_PC] - (unsigned long)za_sdk_base);
             }
         }
-        if (p) {
-            unsigned int type = (unsigned int)a1;
-            unsigned int val = (unsigned int)a2;
-            unsigned int add = 0;
-            switch (type) {
-                case 1: add = val; break;           // Increment
-                case 2: add = val; break;           // SignalAndIncrement
-                case 3:                             // SignalAndModifyByWaitingCount
-                    add = val ? val : 1u;
-                    break;
-                default: break;                     // Signal：只唤醒
-            }
-            if (add) __atomic_add_fetch(p, add, __ATOMIC_ACQ_REL);
-            syscall(SYS_futex, (int *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
-        }
-        return 0;
+        return (long)za_sync_signal_addr((unsigned long long)a0, (int)a1, (int)a2, (int)a3);
     }
 
     // ── 句柄 / 共享内存 ──

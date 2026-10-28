@@ -290,18 +290,20 @@ void za_dump_ret_ring_for(long tid);
 
 typedef struct {
     volatile long tid;            // 0 = 空闲槽
-    volatile int kind;            // 0=空闲, 1=等锁, 2=等条件变量
-    volatile int granted;         // 1 = 锁已交接给我
+    volatile int kind;            // 0=空闲, 1=等锁, 2=等条件变量, 3=等地址
+    volatile int granted;         // 1 = 已唤醒（锁已交接 / 条件已满足）
     volatile unsigned int futex;  // 唤醒字
-    unsigned long long addr;      // 锁地址
-    unsigned long long key;       // 条件键地址
+    unsigned long long addr;      // 锁地址（kind 1/2/3 都记）
+    unsigned long long key;       // 条件键地址（仅 kind 2）
     unsigned int tag;             // 我的 tag
+    unsigned long long wseq;      // 登记序号：内核按「先登记先服务」
     unsigned long long gsp, gpc;  // 进 svc#28 时的客机 sp / x30（等待点调用链用）
     unsigned long long gfp;       // 进 svc#28 时的客机 x29（真正的帧指针）
 } zs_slot_t;
 
 static zs_slot_t zs_slots[ZS_MAX];
 static volatile unsigned int zs_spin;
+static volatile unsigned long long zs_wseq;
 
 static void zs_lock(void)
 {
@@ -326,6 +328,9 @@ static zs_slot_t *zs_self(void)
 
 static void zs_wake(zs_slot_t *w)
 {
+    // 照参考版 wake()：摘出等待链（kind=0）+ 置已唤醒 + 通知它自己的等待字。
+    w->kind = 0;
+    __atomic_store_n(&w->granted, 1, __ATOMIC_RELEASE);
     __atomic_add_fetch(&w->futex, 1u, __ATOMIC_RELEASE);
     syscall(SYS_futex, (int *)&w->futex, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
 }
@@ -346,15 +351,20 @@ static int zs_wait_granted(zs_slot_t *w, long long slice_ns)
     return __atomic_load_n(&w->granted, __ATOMIC_ACQUIRE) ? 1 : 0;
 }
 
+// 按内核顺序挑等待者（照 d2r 参考版 pick()）：
+//   kind 2 按条件键匹配，kind 1/3 按地址匹配；同组里**先登记者优先**（wseq 小）。
+//   以前按槽位下标挑，等于随机 —— 两个等待者同时被信号时会挑错人。
 static zs_slot_t *zs_pick(int kind, unsigned long long what)
 {
+    zs_slot_t *best = NULL;
     for (int i = 0; i < ZS_MAX; i++) {
         zs_slot_t *w = &zs_slots[i];
         if (__atomic_load_n(&w->tid, __ATOMIC_RELAXED) == 0) continue;
         if (w->kind != kind) continue;
-        if ((kind == 1 ? w->addr : w->key) == what) return w;
+        if ((kind == 2 ? w->key : w->addr) != what) continue;
+        if (!best || w->wseq < best->wseq) best = w;
     }
-    return NULL;
+    return best;
 }
 
 // 解锁交接：把锁字写成第一个等待者的 tag；还有别人就保留等待者位。
@@ -402,6 +412,8 @@ static void zs_acquire_for_locked(zs_slot_t *w, unsigned long long addr, unsigne
     w->kind = 1;
     w->addr = addr;
     w->tag = tag;
+    // 内核把它**新插进**锁持有者的等待队列：同优先级排在已有锁等待者之后。
+    w->wseq = ++zs_wseq;
     __atomic_store_n(&w->granted, 0, __ATOMIC_RELEASE);
 }
 
@@ -425,8 +437,10 @@ unsigned long za_sync_arbitrate_lock(unsigned int owner, unsigned long long addr
         //   —— 客机把一段文本缓冲当成 mutex 传进来了。这种字永远不会有人 unlock，
         //   永久阻塞就等于整条线死掉。Horizon 的 tag 是线程句柄（小整数，实测
         //   ≤ 0x13），所以 owner 超出合理范围就当成「未被占用」，直接取走。
+        // 锁空闲 ⇒ 直接返回，让用户态自己的 CAS 去拿（参考版同样不在这里取锁）。
+        // 以前这里替客机写 tag，会和用户态的 CAS 抢同一把锁，制造「锁字是 A、
+        // 持有者却是 B」的错乱状态。
         if (cur == 0) {
-            __atomic_store_n(lock, tag, __ATOMIC_RELEASE);
             zs_unlock();
             return 0;
         }
@@ -524,24 +538,24 @@ unsigned long za_sync_arbitrate_unlock(unsigned long long addr)
 unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, unsigned int tag,
                                long long ns)
 {
-    volatile unsigned int *lock = (volatile unsigned int *)(uintptr_t)addr;
     volatile unsigned int *cond = (volatile unsigned int *)(uintptr_t)key;
     zs_slot_t *w;
     if (!addr || !key) return 0;
     w = zs_self();
     zs_lock();
-    // ① 先登记条件键。★ *cv 是**等待者计数**，不是布尔量：
-    //    SDK 的 SignalConditionVariable 先读 *cv，为 0 就整条 svc#29 都不发。
-    //    以前这里 store 写 1 ⇒ 同一键上有两个等待者时计数永远是 1，信号唤醒
-    //    一个就把 *cv 清 0，剩下的等待者再也收不到信号
-    //    （真机现象：每秒都要靠看门狗伪唤醒才往前走一步）。
-    __atomic_add_fetch(cond, 1u, __ATOMIC_ACQ_REL);
+    // ★ 顺序照参考版（d2r hle_thread.c 的 svc 0x1C）：
+    //   ① 先把条件键置 1（SDK 的 Signal 在用户态先读它，为 0 就**根本不发** svc#29），
+    //   ② 登记等待槽，③ 再放锁，④ 最后睡。
+    //   以前把「放锁」排在「置键」之前：放锁后、置键前的窗口里，别的线程可以在
+    //   用户态抢到锁、改完条件、读到键 0 就不唤醒，本线程随后挂上去永远等不到
+    //   —— 这正是之前 15 条线程一起睡死的机制。
+    __atomic_store_n(cond, 1u, __ATOMIC_RELEASE);
     w->kind = 2;
     w->addr = addr;
     w->key = key;
     w->tag = tag;
+    w->wseq = ++zs_wseq;
     __atomic_store_n(&w->granted, 0, __ATOMIC_RELEASE);
-    // ② 放锁（交给下一个等待者），③ 再睡 —— 顺序不能反
     zs_handoff_locked(addr);
     zs_unlock();
     {
@@ -562,52 +576,24 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
                 if (left < slice) slice = left;
             }
             if (zs_wait_granted(w, slice)) break;
-            // ★ 2026-10-27：**无限等待也按分片返回**（不是一直睡下去）。
-            //   根因：SDK 的信号方在用户态先读 `*cv`，为 0 就直接返回、不发
-            //   svc#29；而等待方把 `*cv = 1` 是在进入 svc#28 之后。两者之间存在
-            //   「信号早于登记」的窗口 ⇒ 这次唤醒永久丢失。
-            //   （实测：16 个线程全睡死，对它们做一次伪唤醒后游戏立刻继续建纹理。）
-            //   内核靠等待队列原子性避免了这个窗口，用户态近似做不到；
-            //   返回后 SDK 会重判条件，所以**有界等待 + 伪唤醒**是安全的。
             if (ns >= 0) {
                 struct timespec now;
                 clock_gettime(CLOCK_MONOTONIC, &now);
                 if (deadline <= (long long)now.tv_sec * 1000000000LL + now.tv_nsec) break;
             }
-            // 无限等待：继续睡（保持正确交接）。丢唤醒由看门狗的「伪唤醒」兜底
-            // —— 实测每 1 秒无 svc 推进时对全部等待者伪唤醒一次即可让游戏继续。
+            // 无限等待继续睡；丢唤醒由看门狗伪唤醒兜底（调用方会重判条件）。
         }
     }
     zs_lock();
     {
-        // 自己退出（超时/被伪唤醒）时撤销登记；被信号唤醒的那条路径已经减过
-        // （它先把 kind 置 0）。不撤销会让 *cv 只增不减，SDK 也会跟着空转。
-        int was_cv = (w->kind == 2);
+        int granted = __atomic_load_n(&w->granted, __ATOMIC_ACQUIRE);
         w->kind = 0;
-        if (was_cv && cond) {
-            unsigned cur = __atomic_load_n(cond, __ATOMIC_RELAXED);
-            while (cur && !__atomic_compare_exchange_n(cond, &cur, cur - 1, 0,
-                                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) { }
-        }
+        zs_unlock();
+        // ★ 照参考版：**超时/伪唤醒时不重新拿锁**。锁由用户态自己重试；
+        //   以前这里强行 CAS(0→tag) 会把一把不属于自己的锁抢过来，
+        //   随后解锁就写坏了别人的锁（锁字在 0/1/2 之间乱跳的根源）。
+        return granted ? 0u : 0xEA01u;
     }
-    zs_unlock();
-    // ★★ 2026-10-28：Horizon 的 WaitProcessWideKeyAtomic **返回时互斥已重新持有**。
-    //   内核在唤醒等待者的同时把 `tag` 写回锁字（这正是 tag 的用途）。
-    //   以前这里只把自己从等待表摘掉就 return 0 ⇒ SDK 以为还拿着锁，而锁字
-    //   实际是 0（空闲），别的线程可以抢走；随后本线程 Unlock 会写坏一把
-    //   不属于自己的锁 —— 表现为锁字在 0/1 之间乱跳、所有人互相等。
-    if (lock) {
-        for (int spin = 0; spin < 400; spin++) {
-            unsigned int expect = 0;
-            if (__atomic_compare_exchange_n(lock, &expect, tag, 0,
-                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-                break;                                   // 取到了
-            if ((expect & ~ZA_WAITERS_BIT) == tag) break; // 本来就是我的
-            struct timespec tv = { 0, 2000000 };          // 2ms
-            syscall(SYS_futex, (int *)lock, FUTEX_WAIT_PRIVATE, expect, &tv, NULL, 0);
-        }
-    }
-    return 0;
 }
 
 // 等待表快照（看门狗/崩溃诊断用）：谁在等哪把锁/哪个条件键。
@@ -628,6 +614,7 @@ void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int typ
     w->gsp = sp;   // ★ 真正的客机 sp（以前这里存的是 type，导致扫栈永远 0 帧）
     w->gpc = pc;   // 调用方客机 pc：谁在等这个地址
     w->gfp = fp;   // 调用方 x29：fp 链回溯的起点
+    w->wseq = ++zs_wseq;
     __atomic_store_n(&w->granted, 0, __ATOMIC_RELEASE);
 }
 
@@ -813,27 +800,15 @@ unsigned za_sync_poke_all(void)
         zs_slot_t *w = &zs_slots[i];
         if (__atomic_load_n(&w->tid, __ATOMIC_RELAXED) == 0) continue;
         if (w->kind == 3) {
-            // WaitForAddress：直接在它等的那个字上做 futex 唤醒（合法伪唤醒，
-            // 调用方本来就会重判条件）。
-            if (w->addr) syscall(SYS_futex, (int *)(uintptr_t)w->addr, FUTEX_WAKE_PRIVATE,
-                                 0x7fffffff, NULL, NULL, 0);
-            w->kind = 0;
+            // WaitForAddress：现在走自己的等待槽（不再直接 futex 等客机地址），
+            // 所以用 zs_wake 唤醒它，调用方会重判条件。
+            zs_wake(w);
             n++;
             continue;
         }
         if (w->kind != 2) continue;
-        // ★ 伪唤醒也要**递减等待者计数**：以前这里只把 kind 清 0 并往 *cv 写 1，
-        //   而退出路径靠 `kind == 2` 判断要不要减 —— 被 poke 过的槽位从此不再递减，
-        //   *cv 只增不减。SDK 的 SignalConditionVariable 先读 *cv 决定要不要发
-        //   svc#29，计数虚高会让它一直以为「还有人在等」，而真正的等待者已经
-        //   被我们自己唤醒过一轮 ⇒ 主线程等的那个键永远等不到有效信号。
-        if (w->key) {
-            unsigned int *cv = (unsigned int *)(uintptr_t)w->key;
-            unsigned int cur = __atomic_load_n(cv, __ATOMIC_RELAXED);
-            while (cur && !__atomic_compare_exchange_n(cv, &cur, cur - 1, 0,
-                                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) { }
-        }
-        w->kind = 0;
+        // 照参考版：伪唤醒 = 把锁交给它（或转成锁等待），调用方会重判条件。
+        // 不再递减「等待者计数」—— 条件键现在是布尔量（signal 时无等待者才清 0）。
         zs_acquire_for_locked(w, w->addr, w->tag);
         n++;
     }
@@ -846,19 +821,122 @@ unsigned long za_sync_signal_key(unsigned long long key, int count)
     volatile unsigned int *cond = (volatile unsigned int *)(uintptr_t)key;
     if (!key) return 0;
     zs_lock();
+    // 照参考版（svc 0x1D）：按内核顺序挑 kind 2，唤醒并把锁交给它；
+    // 已经没有 kind 2 等待者时把条件键清 0（SDK 靠它决定要不要发 signal）。
     for (int n = 0; count <= 0 || n < count; n++) {
         zs_slot_t *w = zs_pick(2, key);
         if (!w) break;
-        w->kind = 0;                       // 不再是条件等待者（可能变成锁等待）
-        {   // *cv 是等待者计数：每唤醒一个减一
-            unsigned cur = __atomic_load_n(cond, __ATOMIC_RELAXED);
-            while (cur && !__atomic_compare_exchange_n(cond, &cur, cur - 1, 0,
-                                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) { }
-        }
         zs_acquire_for_locked(w, w->addr, w->tag);
     }
     if (!zs_pick(2, key))
         __atomic_store_n(cond, 0u, __ATOMIC_RELEASE);
     zs_unlock();
     return 0;
+}
+
+// ── 地址等待 / 唤醒（svc#52 / svc#53）────────────────────────────────
+// 语义照参考版 dm/host/hle_thread.c 的 svc 0x34 / 0x35（真机跑通的成品）：
+//   WaitForAddress(addr, type, val, ns)：
+//       type 2 ⇒ 值**等于** val 才等；其它（0/1）⇒ 值**小于** val 才等；
+//       type 1 ⇒ 先原子减一再等（"等到小于"的计数用法）。
+//       条件不成立 ⇒ 返回 0xFA01（SDK 明确把它当「值有变化，重判」）。
+//   SignalToAddress(addr, type, val, count)：
+//       type 0 ⇒ 只唤醒；
+//       type 1 ⇒ 若值等于 val 则 +1 并唤醒（CAS 失败返回 0xFA01）；
+//       type 2 ⇒ 按等待者数量改值再唤醒。
+//   以前这里只做 futex 等待/唤醒、完全不碰等待表 ⇒ 与客机的 0/1/2 互斥字
+//   状态机对不上，锁字卡在 1 时没人能把它推到 2。
+static int zs_block_registered(zs_slot_t *w, long long ns)
+{
+    long long deadline = 0;
+    if (ns >= 0) {
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        deadline = (long long)now.tv_sec * 1000000000LL + now.tv_nsec + ns;
+    }
+    for (;;) {
+        long long slice = (ns < 0) ? ZS_CV_SLICE_NS : ZS_SLICE_NS;
+        if (ns >= 0) {
+            struct timespec now;
+            long long left;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            left = deadline - ((long long)now.tv_sec * 1000000000LL + now.tv_nsec);
+            if (left <= 0) return 0;
+            if (left < slice) slice = left;
+        }
+        if (zs_wait_granted(w, slice)) return 1;
+    }
+}
+
+unsigned long za_sync_wait_addr(unsigned long long addr, int type, int val, long long ns)
+{
+    zs_slot_t *t;
+    volatile unsigned int *p = (volatile unsigned int *)(uintptr_t)addr;
+    if (!addr) return 0xFA01u;
+    t = zs_self();
+    if (!t) return 0xFA01u;
+    zs_lock();
+    {
+        unsigned int v = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+        int ok = (type == 2) ? ((int)v == val) : ((int)v < val);
+        if (ok && type == 1) {
+            while (!__atomic_compare_exchange_n(p, &v, v - 1u, 0,
+                                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                if (!((int)v < val)) { ok = 0; break; }
+            }
+        }
+        if (!ok) {
+            zs_unlock();
+            return 0xFA01u;
+        }
+        t->kind = 3;
+        t->addr = addr;
+        t->key = 0;
+        t->wseq = ++zs_wseq;
+        __atomic_store_n(&t->granted, 0, __ATOMIC_RELEASE);
+    }
+    zs_unlock();
+    {
+        int r = zs_block_registered(t, ns);
+        zs_lock();
+        t->kind = 0;
+        zs_unlock();
+        return r ? 0u : 0xEA01u;
+    }
+}
+
+unsigned long za_sync_signal_addr(unsigned long long addr, int type, int val, int count)
+{
+    volatile unsigned int *p = (volatile unsigned int *)(uintptr_t)addr;
+    unsigned long r = 0;
+    int nw = 0;
+    if (!addr) return 0xFA01u;
+    zs_lock();
+    for (int i = 0; i < ZS_MAX; i++) {
+        zs_slot_t *w = &zs_slots[i];
+        if (!__atomic_load_n(&w->tid, __ATOMIC_RELAXED)) continue;
+        if (w->kind == 3 && w->addr == addr) nw++;
+    }
+    if (type != 0) {
+        int nv = val + 1;
+        if (type == 2) {
+            if (count <= 0) nv = nw > 0 ? val - 1 : val + 1;
+            else nv = nw == 0 ? val + 1 : (nw <= count ? val - 1 : val);
+        }
+        {
+            unsigned int e = (unsigned int)val;
+            if (!__atomic_compare_exchange_n(p, &e, (unsigned int)nv, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                r = 0xFA01u;
+        }
+    }
+    if (!r) {
+        for (int n = 0; count <= 0 || n < count; n++) {
+            zs_slot_t *w = zs_pick(3, addr);
+            if (!w) break;
+            zs_wake(w);
+        }
+    }
+    zs_unlock();
+    return r;
 }

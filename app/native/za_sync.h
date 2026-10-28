@@ -13,6 +13,12 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key,
                                unsigned int tag, long long ns);
 // svc#29 SignalProcessWideKey(key, count)
 unsigned long za_sync_signal_key(unsigned long long key, int count);
+// svc#52 WaitForAddress(addr, type, value, timeout_ns)
+// type: 2 = 值等于 value 才等；0/1 = 值小于 value 才等；1 = 先减一再等。
+unsigned long za_sync_wait_addr(unsigned long long addr, int type, int val, long long ns);
+// svc#53 SignalToAddress(addr, type, value, count)
+// type: 0 = 只唤醒；1 = 等于 value 则 +1 并唤醒；2 = 按等待者数量改值再唤醒。
+unsigned long za_sync_signal_addr(unsigned long long addr, int type, int val, int count);
 
 // 对所有条件变量等待者做一次合法伪唤醒；返回被唤醒的线程数。
 unsigned za_sync_poke_all(void);

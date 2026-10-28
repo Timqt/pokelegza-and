@@ -2901,6 +2901,9 @@ static void za_hook_m_w2(unsigned long long *r);
 static void za_hook_m_w3(unsigned long long *r);
 static void za_hook_m_jobwait(unsigned long long *r);
 static void za_hook_m_jobsubmit(unsigned long long *r);
+static void za_hook_m_jobdispatch(unsigned long long *r);
+static void za_hook_m_jobpost(unsigned long long *r);
+static void za_hook_m_dequeue(unsigned long long *r);
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -3063,10 +3066,14 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         // 任务系统：等待入口 + 提交入口（回答「任务排上了没有」）
         za_install_main_probe(base, 0x1938e30, ZA_MPROBE_STUB + 0x200, ZA_MPROBE_SLOT + 0x20, za_hook_m_jobwait);
         za_install_main_probe(base, 0xd26b90, ZA_MPROBE_STUB + 0x280, ZA_MPROBE_SLOT + 0x28, za_hook_m_jobsubmit);
+        // 提交函数内部的调用点 + worker 出队侧
+        za_install_main_probe(base, 0xd270d8, ZA_MPROBE_STUB + 0x300, ZA_MPROBE_SLOT + 0x30, za_hook_m_jobdispatch);
+        za_install_main_probe(base, 0xd270ec, ZA_MPROBE_STUB + 0x380, ZA_MPROBE_SLOT + 0x38, za_hook_m_jobpost);
+        za_install_main_probe(base, 0x1bab3a0, ZA_MPROBE_STUB + 0x400, ZA_MPROBE_SLOT + 0x40, za_hook_m_dequeue);
         // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
         //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
         //   main 的 BSS（pc=main+0x76b732c）。call 类指令不适合这套探针，已移除。
-        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x300);
+        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x500);
         mprotect(base + ZA_MPROBE_STUB, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
               (unsigned)ZA_MPROBE_STUB, (unsigned)ZA_MPROBE_SLOT);
@@ -3342,6 +3349,68 @@ void za_dump_job_states(void)
     }
 }
 
+// 把地址格式化成 main+0x… / sdk+0x… / 裸地址（探针日志用）
+static void za_fmt_addr(char *out, unsigned long n, unsigned long long a)
+{
+    unsigned long sb = za_sdk_base, gb = (unsigned long)za_guest_base;
+    if (sb && a >= sb && a < sb + za_sdk_size) snprintf(out, n, "sdk+%#llx", a - sb);
+    else if (gb && a >= gb && a < gb + ZA_IMAGE_SIZE) snprintf(out, n, "main+%#llx", a - gb);
+    else snprintf(out, n, "%#llx", a);
+}
+
+// 提交点（main+0xd270d8，紧跟 adrp x8,0x3d8000 之后）：
+//   此处 x8 = main+0x3d8000（页基址），单例指针在 [x8+0x800]；
+//   随后 `ldr x0,[x8,#0x800]; ldr x8,[x0]; ldr x8,[x8,#0x10]; blr x8`
+//   就是「取单例 → 取 vtable → 调 +0x10」。把这条链解出来就知道提交函数是谁。
+static void za_hook_m_jobdispatch(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 4) return;
+    unsigned long long g = 0, vt = 0, fn = 0;
+    unsigned long gb = (unsigned long)za_guest_base;
+    unsigned long long page = r[8];
+    if (!(gb && page >= gb && page < gb + ZA_IMAGE_SIZE)) page = (unsigned long long)gb + 0x3d80000ull;
+    if (gb)
+    {
+        memcpy(&g, (const void *)(uintptr_t)(page + 0x800), 8);
+        if (g >= 0x400000000ull && g < 0xd00000000ull)
+        {
+            memcpy(&vt, (const void *)(uintptr_t)g, 8);
+            if (vt) memcpy(&fn, (const void *)(uintptr_t)(vt + 0x10), 8);
+        }
+    }
+    char a[48], b[48], c[48];
+    za_fmt_addr(a, sizeof a, g);
+    za_fmt_addr(b, sizeof b, vt);
+    za_fmt_addr(c, sizeof c, fn);
+    ZLOGI("★ job-dispatch: 单例=%s vtable=%s 提交函数=%s", a, b, c);
+}
+
+// 提交之后（main+0xd270ec）：虚调用返回点。能走到这里 ⇒ 提交确实执行完了。
+static void za_hook_m_jobpost(unsigned long long *r)
+{
+    (void)r;
+    static int n;
+    if (n++ >= 4) return;
+    ZLOGI("★ job-post: 虚提交调用已返回（第 %d 次）", n);
+}
+
+// worker 出队入口（main+0x1bab3a0）：x0 = 队列对象。
+// [obj+0x2f8] = 待取数量、[obj+0x330] = 另一个计数。数量为 0 还能进来 = 空转。
+static void za_hook_m_dequeue(unsigned long long *r)
+{
+    static volatile unsigned long long n;
+    unsigned long long k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
+    unsigned long long o = r[0];
+    unsigned int cnt = 0, cnt2 = 0;
+    if (o >= 0x400000000ull && o < 0xd00000000ull) {
+        memcpy(&cnt, (const void *)(uintptr_t)(o + 0x2f8), 4);
+        memcpy(&cnt2, (const void *)(uintptr_t)(o + 0x330), 4);
+    }
+    if (k <= 8 || cnt || (k % 500ull) == 0)
+        ZLOGI("★ worker 出队: 第%llu次 obj=%#llx 队列数(+0x2f8)=%u +0x330=%u",
+              k, o, cnt, cnt2);
+}
 // 循环入口（main+0x1653d00）：x0=desc(+0x18 stride,+0x1c count), x2=base, x8=stride/8
 // ★ 2026-10-28：装在循环头，每迭代一次就进来一次 ⇒ 累计迭代数 ÷ count = 完整建表了几轮。
 static void za_hook_m_poolloop(unsigned long long *r)
@@ -3364,6 +3433,25 @@ static void za_install_main_probe(unsigned char *base, unsigned int func_off,
 {
     unsigned int *s = (unsigned int *)(base + stub_off);
     unsigned int orig = *(unsigned int *)(base + func_off);
+    // ★ 2026-10-28：**PC 相对指令不能重放**。桩在 0x6048000，原指令在 main 映像里，
+    //   重放 ADR/ADRP/B/BL/CBZ/TBZ/LDR-literal 时会按**桩的 PC** 重新计算目标。
+    //   真机实测：探针装在 main+0xd270d4 的 `adrp x8, 0x3d8000` 上，重放后
+    //   x8 变成 main+0x90a1000，随后 ldr x8,[x8,#0x800] 崩在 main+0x90a1800
+    //   —— 等于我们自己把游戏打断了（而且看起来像「游戏死锁」）。
+    //   检测到这类指令就拒绝安装并在日志里点名，换一条安全指令。
+    {
+        int pcrel = 0;
+        if ((orig & 0x9F000000u) == 0x90000000u) pcrel = 1;      // ADR/ADRP
+        if ((orig & 0x7C000000u) == 0x14000000u) pcrel = 1;      // B/BL
+        if ((orig & 0x7E000000u) == 0x34000000u) pcrel = 1;      // CBZ/CBNZ
+        if ((orig & 0x7E000000u) == 0x36000000u) pcrel = 1;      // TBZ/TBNZ
+        if ((orig & 0x3B000000u) == 0x18000000u) pcrel = 1;      // LDR literal
+        if (pcrel) {
+            ZLOGE("★ 探针拒绝安装在 main+%#x：首指令 %#x 是 PC 相对指令，"
+                  "重放到桩里会算错目标（换一条安全指令）", func_off, orig);
+            return;
+        }
+    }
     static const unsigned int seq[27] = {
         0xA9BD7BFD, 0xD10283FF, 0xA9097BFD,
         0xA90007E0, 0xA9010FE2, 0xA90217E4, 0xA9031FE6,
