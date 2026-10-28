@@ -55,6 +55,8 @@
 #include "za_nvn.h"
 #include "za_sync.h"
 
+static void za_spcache_put(long tid, unsigned long long sp);
+static unsigned long long za_spcache_get(long tid);
 // ── svc#52 陈旧持锁兜底（按地址记时间戳）────────────────────────────
 // 该等待会被 20ms 分片反复重新进入，函数内计数器每次都从 0 开始，
 // 所以原先 slices >= 50 的兜底永远达不到、从未生效（真机确认）。
@@ -1459,9 +1461,12 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         unsigned int v = (unsigned int)a2;
         long long ns = (long long)a3;      // 纳秒，< 0 = 无限
         // 登记进等待表：看门狗伪唤醒才够得着（以前这条路径完全在表外）。
-        za_sync_note_addr_wait((unsigned long long)a0, v, type,
-                               (unsigned long long)za_horizon_regs[ZA_REG_SP],
-                               (unsigned long long)za_horizon_regs[ZA_REG_PC]);
+        {
+            unsigned long long spv = (unsigned long long)za_horizon_regs[ZA_REG_SP];
+            if (!spv) spv = za_spcache_get((long)syscall(SYS_gettid));
+            za_sync_note_addr_wait((unsigned long long)a0, v, type, spv,
+                                   (unsigned long long)za_horizon_regs[ZA_REG_PC]);
+        }
         int slices = 0;
         for (;;)
         {
@@ -2133,6 +2138,27 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
 //   SDK 的等待路径对非 0 返回值会直接 throw/abort，必须知道是哪一条返回了什么。
 volatile long za_dbg_last_wait_nr;
 volatile long za_dbg_last_wait_ret;
+
+// ── 每线程「最近一次有效的客机 sp」缓存 ────────────────────────────────
+// 主线程的 svc 走的是另一条门桩路径，slot 9 常为 0（实测），
+// 于是它进 svc#52 时我们拿不到栈指针、倒不出调用链。
+// 这里在**任何** svc 上把非 0 的 sp 记下来，缺的时候用它兜底。
+static struct { long tid; unsigned long long sp; } za_spcache[64];
+static void za_spcache_put(long tid, unsigned long long sp)
+{
+    if (!tid || !sp) return;
+    int free_slot = -1;
+    for (int i = 0; i < 64; i++) {
+        if (za_spcache[i].tid == tid) { za_spcache[i].sp = sp; return; }
+        if (!za_spcache[i].tid && free_slot < 0) free_slot = i;
+    }
+    if (free_slot >= 0) { za_spcache[free_slot].tid = tid; za_spcache[free_slot].sp = sp; }
+}
+static unsigned long long za_spcache_get(long tid)
+{
+    for (int i = 0; i < 64; i++) if (za_spcache[i].tid == tid) return za_spcache[i].sp;
+    return 0;
+}
 static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
                                 long a4, long a5, long a6, long a7, long nr);
 // ★ 每线程的 svc 环形记录（服务号 + 返回值 + 参数 + 调用点 PC）。
@@ -2314,6 +2340,7 @@ static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
     }
     za_disp_count_bump();
     za_svc_nr_count_bump((unsigned)nr);
+    za_spcache_put((long)syscall(SYS_gettid), (unsigned long long)za_horizon_regs[ZA_REG_SP]);
     long res = za_horizon_dispatch(a0, a1, a2, a3, a4, a5, a6, a7, nr);
     // 返回值也记进轨迹：客机多数 svc 包装函数是
     //   svc #N ; <收尾> ; ret     —— 返回值直接进 x0/w0
