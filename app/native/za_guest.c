@@ -658,13 +658,16 @@ static void za_dump_frame_snap(void)
 // 崩溃时倒出 svc 轨迹（定义在后面）
 void za_dump_svc_trace(void);
 // 客机 PC 采样环形轨迹（定义在后面；fatal handler 在它之前）
-#define ZA_PC_RING 16
+#define ZA_PC_RING 64
 volatile unsigned long za_disp_count;   // svc 派发计数（看门狗判卡死用）
 // 按服务号分桶的计数：卡住时能看出「只剩下哪几个 svc 在动」。
 volatile unsigned long za_svc_nr_count[64];
 void za_disp_count_bump(void) { za_disp_count++; }
 void za_svc_nr_count_bump(unsigned nr) { if (nr < 64) __atomic_add_fetch(&za_svc_nr_count[nr], 1, __ATOMIC_RELAXED); }
 volatile unsigned long za_pc_ring[ZA_PC_RING];
+// 2026-10-28：同时记下「是哪条线程」—— 停摆时只有知道每条线程各自停在哪，
+// 才能分清「谁在等」和「谁本该干活却没干活」。
+volatile long za_pc_tid_ring[ZA_PC_RING];
 extern volatile unsigned long za_pc_ring_pos;
 static void za_dump_pc_ring(void)
 {
@@ -785,8 +788,47 @@ static int za_is_guest_thread(void)
     return magic == 0x5a5a524547535f31ull;
 }
 
+// 崩在宿主库里时，pc 只有换算成「模块+偏移」才有意义。安卓上 shell 读不到
+// app 的 /proc/<pid>/maps，所以让进程自己写一份。open/read/write 都是
+// async-signal-safe，可以在信号处理器里直接做。
+static void za_write_maps_file(void)
+{
+    int in = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+    if (in < 0) return;
+    int out = open("/data/data/org.pokelegza.android.port/files/za_maps.txt",
+                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (out >= 0)
+    {
+        char b[4096];
+        ssize_t r;
+        while ((r = read(in, b, sizeof b)) > 0)
+        {
+            ssize_t w = write(out, b, (size_t)r);
+            (void)w;
+        }
+        close(out);
+    }
+    close(in);
+}
+// 停摆时也存一份：宿主库是运行中才 dlopen 的，启动时的映射表不够用。
+void za_write_maps_now(void) { za_write_maps_file(); }
+
+static void za_fatal_dump_maps_once(void)
+{
+    static volatile int done;
+    if (__atomic_exchange_n(&done, 1, __ATOMIC_ACQ_REL)) return;
+    za_write_maps_file();
+}
+
 static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
 {
+    // ★ 2026-10-28：只处理**内核产生的**故障。si_code <= 0 表示这个信号是别的
+    //   线程用 tgkill/kill 发来的（SI_USER=0 / SI_TKILL=-6 / SI_QUEUE=-1），
+    //   不是真实的内存故障。看门狗本来用「给最忙的线程发 SIGSEGV」来倒现场，
+    //   结果被这里当成致命故障，把被采样的线程（含主线程）永久 pause() 掉 ——
+    //   等于自己制造全局停摆。真机实测：两次这样的信号之后主线程就再也不动了，
+    //   NVN 永远 submit=0。现在一律忽略，采样改走专用信号 63。
+    if (info && info->si_code <= 0) return;
     int zi = za_fatal_idx();
     if (za_fatal_dump_pool[zi]) siglongjmp(za_fatal_jmp_pool[zi], 1);   // dump 中二次 fault
     // ★★ 受控修复：ART 自己的一个已知缺陷。
@@ -887,6 +929,7 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
                 q = za_put_str(q, "\n");
                 za_fatal_write(b, (size_t)(q - b));
+                za_fatal_dump_maps_once();
             }
             // ★ 客机 -> 宿主库（libc++/libc）里崩的情况：pc 和 x30 都在宿主库，
             //   但**栈上**还留着客机的返回地址。扫一遍栈，找到就按客机故障处理
@@ -927,6 +970,10 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     }
                 }
             }
+            // ★ 2026-10-28：上面把 ours 置 1 之后必须真的**转去客机故障处理**。
+            //   以前没有这条跳转：置了 1 却继续往下走到「致命信号无处理器 ⇒ 挂起」，
+            //   日志写着「按客机故障处理」，线程实际被挂起了（主线程就是这样丢的）。
+            if (ours) goto guest_fault;
             // ★ 2026-10-27：pc=0 / x30=0 / addr=0 —— 这是一个**线程从地址 0 开始执行**
             //   的特征（线程入口为空），不是普通空指针调用。它没有客机描述符，
             //   以前直接交回 SIG_DFL 把整个进程带走，什么都看不到。
@@ -1026,6 +1073,7 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             return;
         }
     }
+guest_fault:
     // ★★ 串行化：多线程同时崩时，只让**一个**线程做 dump。
     //   其它线程**挂起**而不是 _exit —— 以前一有第二个线程故障就把整个进程
     //   杀掉，日志里只剩最先那个线程的现场，其它线程的死因完全看不到。
@@ -1038,6 +1086,7 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
     {
         static const char tag[] = "ZaGuest: FATAL-ENTER\n";
         za_fatal_write(tag, sizeof tag - 1);
+        za_fatal_dump_maps_once();
     }
     // ★ NVN 调用历史：NVN 入口平时每种只记前两次，崩在 NVN 初始化中段时
     //   没有这份记录就只能靠猜最后走到哪一步。这里用宿主日志（非信号安全
@@ -1869,6 +1918,28 @@ void za_dump_task_stats(void)
 // 停摆时若某条线程在客机代码里自旋（例如 SDK 的 wfe 临界区循环），它根本
 // 不发 svc ⇒ 等待表/探针都看不见它。SIGSEGV 会让致命处理器把它那一刻的
 // pc/sp/x29 整份倒出来 —— 这是唯一能看到「自旋在哪」的办法。
+// 采样信号（值在后面真正使用处也定义了一次，两处必须一致）。
+#define ZA_SAMPLER_SIG 63
+
+// 给**所有**线程投递一次采样信号，拿到「每条线程各自停在哪」的全景。
+// 必须用专用信号 63（处理器只做纯存储）：以前用 SIGSEGV 采样，被自己的
+// 致命处理器当成真故障，把被采样的线程（含主线程）永久挂起。
+void za_sample_all_threads(void)
+{
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return;
+    long self = (long)syscall(SYS_gettid);
+    struct dirent *de;
+    int n = 0;
+    while ((de = readdir(d)) && n < 128) {
+        long tid = atol(de->d_name);
+        if (tid <= 0 || tid == self) continue;
+        syscall(SYS_tgkill, (int)getpid(), (int)tid, ZA_SAMPLER_SIG);
+        n++;
+    }
+    closedir(d);
+}
+
 long za_tgkill_hottest(int sig)
 {
     DIR *d = opendir("/proc/self/task");
@@ -2828,6 +2899,8 @@ static void za_hook_m_poolinit(unsigned long long *r);
 static void za_hook_m_poolloop(unsigned long long *r);
 static void za_hook_m_w2(unsigned long long *r);
 static void za_hook_m_w3(unsigned long long *r);
+static void za_hook_m_jobwait(unsigned long long *r);
+static void za_hook_m_jobsubmit(unsigned long long *r);
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -2987,10 +3060,13 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0x1653d00, ZA_MPROBE_STUB + 0x80, ZA_MPROBE_SLOT + 0x08, za_hook_m_poolloop);
         za_install_main_probe(base, 0x1a0a204, ZA_MPROBE_STUB + 0x100, ZA_MPROBE_SLOT + 0x10, za_hook_m_w2);
         za_install_main_probe(base, 0x1bab754, ZA_MPROBE_STUB + 0x180, ZA_MPROBE_SLOT + 0x18, za_hook_m_w3);
+        // 任务系统：等待入口 + 提交入口（回答「任务排上了没有」）
+        za_install_main_probe(base, 0x1938e30, ZA_MPROBE_STUB + 0x200, ZA_MPROBE_SLOT + 0x20, za_hook_m_jobwait);
+        za_install_main_probe(base, 0xd26b90, ZA_MPROBE_STUB + 0x280, ZA_MPROBE_SLOT + 0x28, za_hook_m_jobsubmit);
         // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
         //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
         //   main 的 BSS（pc=main+0x76b732c）。call 类指令不适合这套探针，已移除。
-        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x100);
+        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x300);
         mprotect(base + ZA_MPROBE_STUB, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
               (unsigned)ZA_MPROBE_STUB, (unsigned)ZA_MPROBE_SLOT);
@@ -3125,12 +3201,29 @@ static unsigned long long za_relocate_base(unsigned char *base)
 /* ZA_MPROBE_STUB / ZA_MPROBE_SLOT 见前面的声明区 */
 
 // 空闲链表池初始化（main+0x1653cc0）：x0=desc, x1=stride, x2=base, w3=size
+// ★ 2026-10-28：以前只打前 6 次，看不出「同一个池被重建了几次」。现在一直计数，
+//   并把 x30（调用者返回地址）也打出来 —— 谁在反复初始化这个池就是它。
 static void za_hook_m_poolinit(unsigned long long *r)
 {
-    static int n;
-    if (n++ >= 6) return;
-    ZLOGI("★ main 探针 pool-init: desc=%#llx stride=%#llx base=%#llx size=%#llx",
-          r[0], r[1], r[2], r[3]);
+    static volatile unsigned long long calls;
+    static unsigned long long seen[16];
+    static int nseen;
+    unsigned long long n = __atomic_add_fetch(&calls, 1, __ATOMIC_RELAXED);
+    unsigned long long lr = r[19];
+    int found = 0, fresh = 0;
+    for (int i = 0; i < nseen; i++) if (seen[i] == lr) { found = 1; break; }
+    if (!found && nseen < 16) { seen[nseen++] = lr; fresh = 1; }
+    if (n <= 8 || fresh || (n & 0xfffull) == 0)
+    {
+        char who[64];
+        unsigned long sb = za_sdk_base, gb = (unsigned long)za_guest_base;
+        if (sb && lr >= sb && lr < sb + za_sdk_size) snprintf(who, sizeof who, "sdk+%#lx", lr - sb);
+        else if (gb && lr >= gb && lr < gb + ZA_IMAGE_SIZE) snprintf(who, sizeof who, "main+%#lx", lr - gb);
+        else snprintf(who, sizeof who, "%#llx", lr);
+        ZLOGI("★ main 探针 pool-init: 累计第%llu次 desc=%#llx stride=%#llx base=%#llx "
+              "size=%#llx 调用者=%s%s",
+              n, r[0], r[1], r[2], r[3], who, fresh ? "（新的调用点）" : "");
+    }
 }
 // worker 线程实际执行的 main 函数（登录参数和调用者）
 static void za_hook_m_w2(unsigned long long *r)
@@ -3170,16 +3263,99 @@ static void za_hook_m_w3(unsigned long long *r)
     ZLOGI("★ main 探针 w3(0x1bab754): x0=%#llx x1=%#llx x2=%#llx x3=%#llx lr=%#llx",
           r[0], r[1], r[2], r[3], r[19]);
 }
-// 循环入口（main+0x1653d00）：x0=desc(+0x18 stride,+0x1c count), x2=base, x8=stride/8
-static void za_hook_m_poolloop(unsigned long long *r)
+// 任务等待入口（main+0x1938e30）：x0 = 任务对象；[x0+0x158] = 状态（5 = 完成）。
+// 这条探针回答「任务到底排上了没有」：状态是 0/1 ⇒ 没人取走；是 3/4 ⇒ 被取走后在跑。
+#define ZA_JOBRING 16
+static volatile unsigned long long za_job_objs[ZA_JOBRING];
+static volatile unsigned long long za_job_caller[ZA_JOBRING];
+static volatile unsigned za_job_pos;
+
+static void za_hook_m_jobwait(unsigned long long *r)
+{
+    static int n;
+    unsigned long long o = r[0];
+    {
+        unsigned p = za_job_pos;
+        za_job_objs[p % ZA_JOBRING] = o;
+        za_job_caller[p % ZA_JOBRING] = r[19];
+        za_job_pos = p + 1;
+    }
+    if (n++ >= 24) return;
+    unsigned long long st = 0, a = 0, b = 0, p = 0;
+    if (o >= 0x400000000ull && o < 0xd00000000ull) {
+        memcpy(&st, (const void *)(uintptr_t)(o + 0x158), 8);
+        memcpy(&a,  (const void *)(uintptr_t)(o + 0x168), 8);
+        memcpy(&b,  (const void *)(uintptr_t)(o + 0x170), 8);
+        memcpy(&p,  (const void *)(uintptr_t)(o + 0x38), 8);
+    }
+    {
+        unsigned long lr = (unsigned long)r[19];
+        unsigned long sb = za_sdk_base, gb = (unsigned long)za_guest_base;
+        char who[48];
+        if (sb && lr >= sb) snprintf(who, sizeof who, "sdk+%#lx", lr - sb);
+        else if (gb && lr >= gb) snprintf(who, sizeof who, "main+%#lx", lr - gb);
+        else snprintf(who, sizeof who, "%#lx", lr);
+        ZLOGI("★ job-wait: obj=%#llx state=%#llx(+0x158) x168=%#llx x170=%#llx payload=%#llx 调用者=%s",
+              o, st, a, b, p, who);
+    }
+}
+
+// 任务提交入口（main+0xd26b90）：x0 = 描述符。用来看「提交了几次」。
+static void za_hook_m_jobsubmit(unsigned long long *r)
 {
     static int n;
     if (n++ >= 6) return;
+    unsigned long lr = (unsigned long)r[19];
+    unsigned long sb = za_sdk_base, gb = (unsigned long)za_guest_base;
+    char who[48];
+    if (sb && lr >= sb) snprintf(who, sizeof who, "sdk+%#lx", lr - sb);
+    else if (gb && lr >= gb) snprintf(who, sizeof who, "main+%#lx", lr - gb);
+    else snprintf(who, sizeof who, "%#lx", lr);
+    ZLOGI("★ job-submit: desc=%#llx arg1=%#llx arg2=%#llx 调用者=%s",
+          r[0], r[1], r[2], who);
+}
+// 停摆快照用：把最近等过的任务对象的**当前**状态读出来。
+void za_dump_job_states(void)
+{
+    unsigned pos = za_job_pos;
+    unsigned n = pos < ZA_JOBRING ? pos : ZA_JOBRING;
+    ZLOGE("★ 任务对象状态（最近 %u 次 job-wait；state: 0=新建 5=完成）：", n);
+    for (unsigned i = 0; i < n; i++)
+    {
+        unsigned k = (pos - n + i) % ZA_JOBRING;
+        unsigned long long o = za_job_objs[k];
+        unsigned long lr = (unsigned long)za_job_caller[k];
+        unsigned long long st = 0, m = 0, cv = 0;
+        if (o >= 0x400000000ull && o < 0xd00000000ull)
+        {
+            memcpy(&st, (const void *)(uintptr_t)(o + 0x158), 8);
+            memcpy(&m, (const void *)(uintptr_t)(o + 0x118), 8);
+            memcpy(&cv, (const void *)(uintptr_t)(o + 0x138), 8);
+        }
+        unsigned long sb = za_sdk_base, gb = (unsigned long)za_guest_base;
+        unsigned long off = lr;
+        const char *w = "";
+        if (sb && lr >= sb) { w = "sdk+"; off = lr - sb; }
+        else if (gb && lr >= gb) { w = "main+"; off = lr - gb; }
+        ZLOGE("    obj=%#llx state=%#llx mutex(+118)=%#llx cv(+138)=%#llx 调用者=%s%#lx",
+              o, st, m, cv, w, off);
+    }
+}
+
+// 循环入口（main+0x1653d00）：x0=desc(+0x18 stride,+0x1c count), x2=base, x8=stride/8
+// ★ 2026-10-28：装在循环头，每迭代一次就进来一次 ⇒ 累计迭代数 ÷ count = 完整建表了几轮。
+static void za_hook_m_poolloop(unsigned long long *r)
+{
+    static volatile unsigned long long iters;
+    unsigned long long n = __atomic_add_fetch(&iters, 1, __ATOMIC_RELAXED);
+    if (n > 6 && (n % 4681ull) != 0) return;
     unsigned long long desc = r[0], base = r[2], stride = r[8] << 3;
     unsigned int count = 0;
     if (desc) memcpy(&count, (const void *)(uintptr_t)(desc + 0x1c), 4);
-    ZLOGI("★ main 探针 pool-loop: desc=%#llx base=%#llx stride=%#llx count=%u ⇒ 跨度=%#llx",
-          desc, base, stride, count, stride * (unsigned long long)count);
+    ZLOGI("★ main 探针 pool-loop: 累计第%llu次迭代 desc=%#llx base=%#llx stride=%#llx "
+          "count=%u ⇒ 跨度=%#llx（约 %llu 轮完整建表）",
+          n, desc, base, stride, count, stride * (unsigned long long)count,
+          count ? n / count : 0);
 }
 
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
@@ -3516,16 +3692,18 @@ static void za_pc_sample_handler(int sig, siginfo_t *info, void *ctx)
     unsigned long pc = (unsigned long)uc->uc_mcontext.pc;
     static volatile unsigned long raw_last;
     raw_last = pc;
+    // ★ 2026-10-28：**所有**样本都记（不再只记客机映像内的）。停摆时真正要回答的
+    //   是「每条线程此刻停在哪」；把落在 libc/驱动里的样本丢掉，等于把
+    //   正在 futex/驱动里等的那十几条线程全滤掉，只剩一堆旧样本。
     if ((za_guest_base && pc >= (unsigned long)za_guest_base &&
          pc < (unsigned long)za_guest_base + ZA_IMAGE_SIZE) ||
         (za_sdk_base && pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size))
-    {
         za_guest_last_guest_pc = pc;
-        // 环形轨迹：崩溃前最后若干条客机 PC。
-        unsigned long p = za_pc_ring_pos;
-        za_pc_ring[p % ZA_PC_RING] = pc;
-        za_pc_ring_pos = p + 1;
-    }
+    // 环形轨迹：崩溃前最后若干条 PC（含线程号）。
+    unsigned long p = za_pc_ring_pos;
+    za_pc_ring[p % ZA_PC_RING] = pc;
+    za_pc_tid_ring[p % ZA_PC_RING] = (long)syscall(SYS_gettid);
+    za_pc_ring_pos = p + 1;
 }
 
 // 每次 svc 之后重装采样信号（SDK 会把实时信号段全屏蔽掉）
@@ -3624,8 +3802,8 @@ static void *za_sampler_watchdog(void *arg)
                               rate, za_guest_tid);
                         {
                             extern long za_tgkill_hottest(int sig);
-                            if (za_tgkill_hottest(11) < 0 && za_guest_tid > 0)
-                                syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, 11);
+                            if (za_tgkill_hottest(ZA_SAMPLER_SIG) < 0 && za_guest_tid > 0)
+                                syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, ZA_SAMPLER_SIG);
                         }
                     }
                 } else {
@@ -3675,21 +3853,26 @@ static void *za_sampler_watchdog(void *arg)
                             za_dump_task_stats();
                             // 采样器环形轨迹（现在是纯存储、async-signal-safe）
                             {
+                                extern void za_sample_all_threads(void);
+                                extern void za_write_maps_now(void);
+                                za_write_maps_now();
+                                za_sample_all_threads();
+                                struct timespec samp = { 0, 40 * 1000 * 1000 };
+                                nanosleep(&samp, NULL);
                                 unsigned long pos = za_pc_ring_pos;
                                 unsigned long n = pos < ZA_PC_RING ? pos : ZA_PC_RING;
                                 extern unsigned char *za_guest_base;
                                 unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
-                                ZLOGE("★ PC 采样环（最近 %lu 条）：", n);
+                                ZLOGE("★ PC 采样环（最近 %lu 条，signal=%d）：", n, ZA_SAMPLER_SIG);
                                 for (unsigned long i = 0; i < n; i++) {
                                     unsigned long k = (pos - n + i) % ZA_PC_RING;
                                     unsigned long pc = za_pc_ring[k];
-                                    unsigned long long off = 0;
-                                    const char *w = "";
+                                    unsigned long long off = pc;
+                                    const char *w = "@";
                                     if (pc >= mb && pc < mb + ZA_IMAGE_SIZE) { w = "main+"; off = pc - mb; }
                                     else if (za_sdk_base && pc >= za_sdk_base &&
                                              pc < za_sdk_base + za_sdk_size) { w = "sdk+"; off = pc - za_sdk_base; }
-                                    else off = pc;
-                                    ZLOGE("    %s%#llx", w, off);
+                                    ZLOGE("    tid=%ld %s%#llx", za_pc_tid_ring[k], w, off);
                                 }
                             }
                             za_ptrace_dump_all();
@@ -3699,6 +3882,12 @@ static void *za_sampler_watchdog(void *arg)
                             }
                         }
                         if (za_guest_tid > 0) za_sync_dump_chain_for(za_guest_tid);
+                        {
+                            extern void za_dump_job_states(void);
+                            extern void za_dump_hle_stuck(void);
+                            za_dump_job_states();
+                            za_dump_hle_stuck();
+                        }
                         // 主线程阻塞在哪个锁上 ⇒ 扫所有线程栈找持有者
                         {
                             extern unsigned long long za_last_blocked_addr(long tid);
@@ -3732,9 +3921,9 @@ static void *za_sampler_watchdog(void *arg)
             //   SIGSEGV 打到正常线程上，整个进程被带走。
             if (no_progress == 12000)
             {
-                ZLOGE("★ 卡死 60 秒：向客机线程发 SIGSEGV 倒现场");
+                ZLOGE("★ 卡死 60 秒：采样客机线程 PC（信号 %d，不再用 SIGSEGV）", ZA_SAMPLER_SIG);
                 za_sync_dump();
-                syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, 11);
+                syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, ZA_SAMPLER_SIG);
             }
         }
         else { last_count = cnt; no_progress = 0; }

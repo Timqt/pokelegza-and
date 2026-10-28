@@ -1556,6 +1556,29 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             //   内核语义就是「条件成立才返回」，其余一律继续等（分片重判）。
             (void)rc;
             if (errno == EINVAL) return 0xFA01u;   // 地址非法：交给调用方
+            // ★ 2026-10-28：**无限等待也要有界**（对 #52 同样成立）。
+            //   SDK 的锁慢路径（sdk+0x13a684）明确把 0xFA01 当成「值有变化，重判」：
+            //       and w8,w0,#0x3fffff ; cmp w8,#0xfa01 ; b.eq <重试>
+            //   如果等待方永远不返回，它连「重判 + 重新 CAS」的机会都没有，
+            //   锁字被卡在 1 时整条线程就永久睡死（真机实测 5 条线程）。
+            //   这里给无限等待加上 300ms 上界：超时返回 0xFA01 让客机自己重走一遍
+            //   （读字 → CAS → 再决定），与内核对「伪唤醒」的容错等价。
+            if (ns < 0) {
+                if (!deadline) {
+                    struct timespec t0;
+                    clock_gettime(CLOCK_MONOTONIC, &t0);
+                    deadline = (unsigned long long)t0.tv_sec * 1000000000ull +
+                               (unsigned long long)t0.tv_nsec + 300000000ull;
+                } else {
+                    struct timespec t1;
+                    clock_gettime(CLOCK_MONOTONIC, &t1);
+                    if ((unsigned long long)t1.tv_sec * 1000000000ull +
+                        (unsigned long long)t1.tv_nsec >= deadline) {
+                        za_sync_addr_wait_done();
+                        return 0xFA01u;
+                    }
+                }
+            }
             if (ns >= 0) {
                 struct timespec tv1;
                 clock_gettime(CLOCK_MONOTONIC, &tv1);
@@ -2222,6 +2245,79 @@ static unsigned long long za_spcache_get(long tid)
 }
 static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
                                 long a4, long a5, long a6, long a7, long nr);
+
+// ★ 2026-10-28：「谁正卡在我们的 HLE 里」。
+//   停摆时如果所有客机线程都睡在 futex，那是正常的等待；但如果某条线程其实
+//   卡在宿主实现里（IPC / NVN / fs），它就还占着客机侧的锁，而等待表里看不到它
+//   —— 这次死锁的锁持有者就是这么藏起来的。这里给每次 svc 派发记一条出入记录，
+//   看门狗据此倒出「超过 1 秒还没返回」的线程。
+#define ZA_HLE_SLOTS 64
+typedef struct {
+    long tid;
+    long nr;
+    unsigned long long since;
+    unsigned long long pc;
+} za_hle_rec_t;
+static za_hle_rec_t za_hle_rec[ZA_HLE_SLOTS];
+
+static za_hle_rec_t *za_hle_find(long tid)
+{
+    unsigned h = (unsigned)tid;
+    h ^= h >> 16; h *= 0x7feb352du; h ^= h >> 15;
+    for (unsigned k = 0; k < ZA_HLE_SLOTS; k++)
+    {
+        za_hle_rec_t *r = &za_hle_rec[(h + k) & (ZA_HLE_SLOTS - 1)];
+        long cur = __atomic_load_n(&r->tid, __ATOMIC_ACQUIRE);
+        if (cur == tid) return r;
+        if (cur == 0)
+        {
+            long expect = 0;
+            if (__atomic_compare_exchange_n(&r->tid, &expect, tid, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || expect == tid)
+                return r;
+        }
+    }
+    return NULL;
+}
+
+static void za_hle_enter(long nr)
+{
+    long tid = (long)syscall(SYS_gettid);
+    za_hle_rec_t *r = za_hle_find(tid);
+    if (!r) return;
+    r->nr = nr;
+    r->pc = (unsigned long long)za_horizon_regs[ZA_REG_PC];
+    r->since = (unsigned long long)za_now_ns();
+}
+
+static void za_hle_leave(void)
+{
+    long tid = (long)syscall(SYS_gettid);
+    za_hle_rec_t *r = za_hle_find(tid);
+    if (r) r->nr = 0;
+}
+
+// 看门狗用：倒出卡在 HLE 里超过 1 秒的线程。
+void za_dump_hle_stuck(void)
+{
+    unsigned long long now = (unsigned long long)za_now_ns();
+    int n = 0;
+    for (int i = 0; i < ZA_HLE_SLOTS; i++)
+    {
+        za_hle_rec_t *r = &za_hle_rec[i];
+        if (!__atomic_load_n(&r->tid, __ATOMIC_ACQUIRE)) continue;
+        long nr = __atomic_load_n(&r->nr, __ATOMIC_ACQUIRE);
+        if (!nr) continue;
+        unsigned long long age_ms = r->since ? (now - r->since) / 1000000ull : 0;
+        if (age_ms < 1000) continue;
+        if (n == 0) ZLOGE("★ 卡在 HLE 里的线程（>1s 未返回）：");
+        n++;
+        ZLOGE("    tid=%ld svc#%ld 已 %llums pc=%s", r->tid, nr, age_ms,
+              za_h_addrstr((unsigned long)r->pc));
+    }
+    if (!n) ZLOGI("    （没有线程卡在 HLE 里）");
+}
+
 // ★ 每线程的 svc 环形记录（服务号 + 返回值 + 参数 + 调用点 PC）。
 //   之前是全局一份：多线程并发写会互相覆盖，dump 出来的「最后几条 svc」
 //   来自不同线程，据此推断谁返回了非 0 会漂移。
@@ -2445,7 +2541,9 @@ static long za_horizon_svc_impl(long a0, long a1, long a2, long a3,
     za_disp_count_bump();
     za_svc_nr_count_bump((unsigned)nr);
     za_spcache_put((long)syscall(SYS_gettid), (unsigned long long)za_horizon_regs[ZA_REG_SP]);
+    za_hle_enter(nr);
     long res = za_horizon_dispatch(a0, a1, a2, a3, a4, a5, a6, a7, nr);
+    za_hle_leave();
     // 返回值也记进轨迹：客机多数 svc 包装函数是
     //   svc #N ; <收尾> ; ret     —— 返回值直接进 x0/w0
     // 而 0x14457c 收尾前有 cbnz w0, <abort>；把 w0 记下来才能判定
