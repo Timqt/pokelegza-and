@@ -2968,6 +2968,7 @@ static void za_hook_m_jobsubmit(unsigned long long *r);
 static void za_hook_m_jobdispatch(unsigned long long *r);
 static void za_hook_m_jobpost(unsigned long long *r);
 static void za_hook_m_dequeue(unsigned long long *r);
+static void za_hook_m_enq2(unsigned long long *r);
 static void za_hook_m_jobenqueue(unsigned long long *r);
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
@@ -3136,6 +3137,7 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd270ec, ZA_MPROBE_STUB + 0x380, ZA_MPROBE_SLOT + 0x38, za_hook_m_jobpost);
         za_install_main_probe(base, 0x1bab3a0, ZA_MPROBE_STUB + 0x400, ZA_MPROBE_SLOT + 0x40, za_hook_m_dequeue);
         za_install_main_probe(base, 0xd848fc, ZA_MPROBE_STUB + 0x480, ZA_MPROBE_SLOT + 0x48, za_hook_m_jobenqueue);
+        za_install_main_probe(base, 0xd80ce0, ZA_MPROBE_STUB + 0x500, ZA_MPROBE_SLOT + 0x50, za_hook_m_enq2);
         // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
         //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
         //   main 的 BSS（pc=main+0x76b732c）。call 类指令不适合这套探针，已移除。
@@ -3598,6 +3600,18 @@ static void za_hook_m_jobpost(unsigned long long *r)
 
 // worker 出队入口（main+0x1bab3a0）：x0 = 队列对象。
 // [obj+0x2f8] = 待取数量、[obj+0x330] = 另一个计数。数量为 0 还能进来 = 空转。
+// 入队函数 main+0xd80bf0 的内层：0xd80210（先调）与 0xd80ce0（后调）。
+// worker 在 main+0x1bac828 里等的是 `[[x+0x400]+0x308]` 这个队列对象；
+// 只要把这里收到的对象打出来，就能判断「提交到底推给了哪个队列」，
+// 以及它是不是 worker 在等的那个。
+static void za_hook_m_enq2(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 6) return;
+    ZLOGI("★ 入队内层 0xd80ce0: x0=%#llx x1=%#llx x2=%#llx x3=%#llx",
+          r[0], r[1], r[2], r[3]);
+}
+
 // 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。
 // 紧随其后 main 就 `bl 0x413b8` 等这个任务 —— 这里就是「任务交给谁」的唯一入口。
 static void za_hook_m_jobsubmit2(unsigned long long *r)
@@ -3763,6 +3777,11 @@ int za_guest_relocate(unsigned char *base, za_guest_t *out)
             const char *name = (r->host_index < ZA_IMPORT_COUNT)
                              ? za_imports[r->host_index].name : NULL;
             void *p = name ? za_resolve(name, r->host_index) : NULL;
+            // ★ 2026-10-28：nn::mem 的几个符号解析到哪个地址 —— 用来确认
+            //   `StandardAllocator::Initialize` 拿到的是 SDK 真实现（而非桩），
+            //   以便下一步直接在它的入口装探针。
+            if (name && strstr(name, "nn3mem"))
+                ZLOGI("mem 导入 %s -> %p（base=%p）", name, p, (void *)base);
             if (p)
             {
                 // 分清「真实现」和「自动桩」：桩的地址落在 za_stub_table 里
