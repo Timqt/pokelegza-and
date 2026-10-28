@@ -3012,6 +3012,7 @@ static void za_hook_m_jobdispatch(unsigned long long *r);
 static void za_hook_m_jobpost(unsigned long long *r);
 static void za_hook_m_dequeue(unsigned long long *r);
 static void za_hook_m_enq2(unsigned long long *r);
+static void za_hook_m_enq3(unsigned long long *r);
 static void za_hook_m_jobenqueue(unsigned long long *r);
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
@@ -3180,7 +3181,8 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd270ec, ZA_MPROBE_STUB + 0x380, ZA_MPROBE_SLOT + 0x38, za_hook_m_jobpost);
         za_install_main_probe(base, 0x1bab3a0, ZA_MPROBE_STUB + 0x400, ZA_MPROBE_SLOT + 0x40, za_hook_m_dequeue);
         za_install_main_probe(base, 0xd848fc, ZA_MPROBE_STUB + 0x480, ZA_MPROBE_SLOT + 0x48, za_hook_m_jobenqueue);
-        za_install_main_probe(base, 0xd80ce0, ZA_MPROBE_STUB + 0x500, ZA_MPROBE_SLOT + 0x50, za_hook_m_enq2);
+        za_install_main_probe(base, 0x16ffd70, ZA_MPROBE_STUB + 0x500, ZA_MPROBE_SLOT + 0x50, za_hook_m_enq2);
+        za_install_main_probe(base, 0x16ffeb0, ZA_MPROBE_STUB + 0x580, ZA_MPROBE_SLOT + 0x58, za_hook_m_enq3);
         // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
         //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
         //   main 的 BSS（pc=main+0x76b732c）。call 类指令不适合这套探针，已移除。
@@ -3685,9 +3687,18 @@ static void za_hook_m_jobpost(unsigned long long *r)
 static void za_hook_m_enq2(unsigned long long *r)
 {
     static int n;
-    if (n++ >= 6) return;
-    ZLOGI("★ 入队内层 0xd80ce0: x0=%#llx x1=%#llx x2=%#llx x3=%#llx",
-          r[0], r[1], r[2], r[3]);
+    if (n++ >= 8) return;
+    unsigned int flag = 0;
+    if (ZA_PTR_OK(r[0])) memcpy(&flag, (const void *)(uintptr_t)(r[0] + 0x120), 1);
+    ZLOGI("★ 提交 0x16ffd70: 队列=%#llx job+0x38=%#llx [+0x120]=%u tid=%ld",
+          r[0], r[1], flag, (long)syscall(SYS_gettid));
+}
+
+static void za_hook_m_enq3(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 8) return;
+    ZLOGI("★ 真正入队 0x16ffeb0: x0=%#llx x1=%#llx x2=%#llx", r[0], r[1], r[2]);
 }
 
 // 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。
