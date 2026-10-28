@@ -3598,16 +3598,22 @@ void za_scan_job_in_heap(void)
     ZLOGE("★ 堆扫描：%s", verdict);
 }
 
-// 把卡住的任务强制标成「完成（5）」。开关：files/za-forcejob 或 ZA_FORCEJOB。
-// 只动 JobWait 探针真实记录过的对象（环形里最多 16 个），且当前 state != 5。
-static void za_force_stuck_jobs(void)
+// 强制完成任务实验的开关：files/za-forcejob 或 ZA_FORCEJOB。
+int za_forcejob_on(void)
 {
     static int on = -1;
     if (on < 0)
         on = getenv("ZA_FORCEJOB") ? 1 :
              (access("/data/user/0/org.pokelegza.android.port/files/za-forcejob", F_OK) == 0);
-    if (!on) return;
+    return on;
+}
+
+// 把卡住的任务强制标成「完成（5）」。
+// 只动 JobWait 探针真实记录过的对象（环形里最多 16 个），且当前 state != 5。
+static void za_force_stuck_jobs(void)
+{
     static int first;
+    if (!za_forcejob_on()) return;
     if (!first) {
         first = 1;
         ZLOGE("★ 强制任务：开关=开，环内记录 %u 条", (unsigned)za_job_pos);
@@ -3817,6 +3823,10 @@ static void za_hook_m_jobwait(unsigned long long *r)
         memcpy(&a,  (const void *)(uintptr_t)(o + 0x168), 8);
         memcpy(&b,  (const void *)(uintptr_t)(o + 0x170), 8);
         memcpy(&p,  (const void *)(uintptr_t)(o + 0x38), 8);
+        // ★ 实验记录（保留结论，不启用）：「在 job-wait 那一刻就把 state 写成 5」
+        //   太粗暴——任务体没跑，结果字段是空的，调用方随后空指针解引用
+        //   （真机 main+0x193bd0c 崩在 addr=0）。只有 state>=2（已经有人在跑）
+        //   的任务强制完成才勉强安全，且要留到停摆快照里做。
     }
     {
         unsigned long lr = (unsigned long)r[19];
