@@ -2772,6 +2772,52 @@ static unsigned za_oe_no(void) { return 0; }                 // IsUserInactivity
 static unsigned za_oe_pop_message(unsigned *out) { if (out) *out = 0; return 0; }
 static unsigned za_oe_pseudo_id(void *uuid) { if (uuid) memset(uuid, 0, 16); return 0; }
 
+// ── nn::hid 输入（按参考实现 d2r-mobile 的做法）─────────────────────
+// 真机上 hid 靠 InitializeNpad 建立的**共享内存**；我们把 InitializeNpad
+// 接管成「成功」却没建共享内存，随后 SDK 的 GetNpadState 就会去读一块
+// 从未映射/从未填充的状态 ⇒ 读到垃圾甚至卡住。参考实现（dm/host/hle_hid.c）
+// 的做法是连查询接口一起接管，直接给「没有输入」。
+// NpadFullKeyState / NpadHandheldState 都是 0x28 字节：
+//   +0x00 sampling(u64) +0x08 buttons(u64) +0x10 lx,ly,rx,ry(i32×4)
+//   +0x20 attributes(u32) +0x24 pad(u32)
+static void za_hid_fill_npad(void *s)
+{
+    if (!s) return;
+    memset(s, 0, 0x28);
+    static unsigned long long seq;
+    *(unsigned long long *)s = ++seq;          // sampling：每帧递增
+}
+static void za_hid_npad_fullkey(void *s, const unsigned *id) { (void)id; za_hid_fill_npad(s); }
+static void za_hid_npad_handheld(void *s, const unsigned *id) { (void)id; za_hid_fill_npad(s); }
+static unsigned za_hid_style_set(const unsigned *id) { (void)id; return 0; }   // 没有手柄
+static unsigned za_hid_vib_handles(void *out, int max, const unsigned *id, unsigned style)
+{ (void)out; (void)max; (void)id; (void)style; return 0; }                     // 0 个振动设备
+static void za_hid_want_zero(unsigned v) { (void)v; }
+static void za_hid_vib_zero(const void *a, const void *b) { (void)a; (void)b; }
+
+// nn::err::ShowError：真机要连 err 服务弹错误框；宿主没有服务，直接吞掉
+// （否则一条错误路径会把线程卡在 IPC 上）。参考实现同样接管。
+static void za_err_show(unsigned long result) { (void)result; }
+
+// ── nn::ngc::ProfanityFilter（玩家名敏感词过滤）──────────────────────
+// 真机上词库放在**系统数据存档**里、经 IPC 挂载；宿主没有这个存档，
+// SDK 自己的 Initialize 会失败并把内部表留成 NULL，之后
+// CheckProfanityWords 在这张空表上查哈希就直接崩
+// （真机实测 main+0x1757a70：ldr x8,[x8,#0x58]，[obj+0x1f8] == 0）。
+// 参考实现（dm/host/hle_misc.c）的做法：整个类接管，恒判「无敏感词」。
+static void za_ngc_ctor(void *self) { (void)self; }
+static void za_ngc_dtor(void *self) { (void)self; }
+static unsigned za_ngc_init(void *self, void *work, unsigned long long sz)
+{ (void)self; (void)work; (void)sz; return 0; }
+static unsigned za_ngc_version(void *self) { (void)self; return 0; }
+static unsigned za_ngc_check(void *self, unsigned *masks, unsigned pat,
+                             const char **words, unsigned long long n)
+{
+    (void)self; (void)pat; (void)words;
+    for (unsigned long long i = 0; i < n; i++) masks[i] = 0;
+    return 0;
+}
+
 static const za_host_sym_t za_host_syms[] = {
     // loader 提供的「runtime object file」（真机由 nnrtld 提供）
     { "__nnDetailNintendoSdkRuntimeObjectFile", (void *)za_host_runtime_object_file },
@@ -2833,6 +2879,22 @@ static const za_host_sym_t za_host_syms[] = {
     { "_ZN2nn2oe17FinishStartupLogoEv",                  (void *)za_oe_ok },
     { "_ZN2nn2oe31EnterExitRequestHandlingSectionEv",    (void *)za_oe_ok },
     { "_ZN2nn2oe31LeaveExitRequestHandlingSectionEv",    (void *)za_oe_ok },
+
+    // ── hid 查询侧（必须一起接管，见上面的注释）───────────────────────
+    { "_ZN2nn3hid12GetNpadStateEPNS0_16NpadFullKeyStateERKj",  (void *)za_hid_npad_fullkey },
+    { "_ZN2nn3hid12GetNpadStateEPNS0_17NpadHandheldStateERKj",  (void *)za_hid_npad_handheld },
+    { "_ZN2nn3hid15GetNpadStyleSetERKj",                        (void *)za_hid_style_set },
+    { "_ZN2nn3hid25GetVibrationDeviceHandlesEPNS0_21VibrationDeviceHandleEiRKjNS_4util10BitFlagSetILi32ENS0_12NpadStyleTagEEE", (void *)za_hid_vib_handles },
+    { "_ZN2nn3hid18SendVibrationValueERKNS0_21VibrationDeviceHandleERKNS0_14VibrationValueE", (void *)za_hid_vib_zero },
+    { "_ZN2nn3hid29SetNpadHandheldActivationModeENS0_26NpadHandheldActivationModeE", (void *)za_hid_want_zero },
+    { "_ZN2nn3err9ShowErrorENS_6ResultE",                       (void *)za_err_show },
+
+    // ── ngc 敏感词过滤（整类接管，见上面注释）─────────────────────────
+    { "_ZN2nn3ngc15ProfanityFilterC1Ev",                       (void *)za_ngc_ctor },
+    { "_ZN2nn3ngc15ProfanityFilterD1Ev",                       (void *)za_ngc_dtor },
+    { "_ZN2nn3ngc15ProfanityFilter10InitializeEPvm",           (void *)za_ngc_init },
+    { "_ZN2nn3ngc15ProfanityFilter17GetContentVersionEv",      (void *)za_ngc_version },
+    { "_ZN2nn3ngc15ProfanityFilter19CheckProfanityWordsEPjjPPKcm", (void *)za_ngc_check },
 
     // NVN 图形入口（图形层未接：回陷阱桩，客机一调就知道缺哪个）
     { "nvnBootstrapLoader", (void *)za_nvn_bootstrap_loader },
