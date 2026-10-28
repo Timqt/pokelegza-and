@@ -3432,7 +3432,11 @@ void za_fs_vt_free(void *obj, void *ptr, unsigned long size, unsigned long align
 static int za_fakewake_on(void)
 {
     static int cached = -1;
-    if (cached < 0) cached = access("/data/local/tmp/za-fakewake", F_OK) == 0;
+    if (cached < 0) {
+        cached = access("/data/local/tmp/za-fakewake", F_OK) == 0 ||
+                 access("/data/user/0/org.pokelegza.android.port/files/za-fakewake", F_OK) == 0;
+        ZLOGI("看门狗伪唤醒：%s", cached ? "开" : "关");
+    }
     return cached;
 }
 
@@ -3621,6 +3625,14 @@ void za_dump_progress_stall(void)
                 unsigned long long b = *(volatile unsigned long long *)(uintptr_t)(q + off + 8);
                 ZLOGE("   enq+%#llx: %#llx %#llx", off, a, b);
             }
+        }
+        // 「谁认识这个池对象」：扫全线程栈找出持有它的线程。
+        //   只被 worker 认识 ⇒ 生产方从来没拿到过这个池（问题在池的分发侧）；
+        //   主线程栈上也有 ⇒ 主线程就是该 push 的人，顺着它的 fp 链就能定位代码。
+        if (ZA_PTR_OK(w)) {
+            extern void za_sync_scan_for_addr(unsigned long long val);
+            ZLOGE("★ 扫线程栈找池对象 %#llx 的持有者：", w);
+            za_sync_scan_for_addr(w);
         }
     }
     za_dump_task_stats();
