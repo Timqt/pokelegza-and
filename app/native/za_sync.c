@@ -34,6 +34,7 @@
 // 允许伪唤醒，调用方会重判条件）。锁交接本身是原子的（在自旋锁里完成）。
 #include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -772,6 +773,18 @@ void za_sync_scan_for_addr(unsigned long long val)
                       zs_slots[i].tag);
             else
                 ZLOGI("        ↳ 它**没有**在等待表里（kind=0）⇒ 可能正是它持有锁");
+            // 关键：它停在客机哪条调用链上。队满时「谁认识这个队列」这条线程
+            // 的 fp 链直接告诉我们是哪个 handler 卡住了消费。
+            {
+                long tv = t;
+                zs_slot_t *ws = NULL;
+                for (int k = 0; k < ZS_MAX; k++)
+                    if (__atomic_load_n(&zs_slots[k].tid, __ATOMIC_RELAXED) == tv) { ws = &zs_slots[k]; break; }
+                if (ws && (ws->gfp || ws->gsp))
+                    za_sync_dump_guest_chain(ws->gfp, ws->gsp, ws->gpc);
+                else
+                    ZLOGI("        （没有客机 sp/fp 记录，无法回溯调用链）");
+            }
             za_dump_ret_ring_for(t);
         }
     }
@@ -846,6 +859,64 @@ void za_sync_dump_lq_pairs(void)
         ZLOGE("      ↳ 扫线程栈找工作队列对象 %#llx（=q-0x40）的持有者：", fullq[i]);
         za_sync_scan_for_addr(fullq[i]);
     }
+}
+
+// ── 满队列扩容（实验）────────────────────────────────────────────────
+// 死锁形状：消费者卡在处理内部 → 队列塞满 100/100 → 所有生产者堵在 Send。
+// 这里在停摆时把「满且有人等」的队列原地扩到 4 倍容量：
+//   新数组按 head 顺序把现有 used 条抄过去，cap*=4、head=0、used 不变。
+// 语义上等价于「这个队列一开始就开得更大」，不丢消息。
+// ⚠ 新数组是宿主 malloc 的；引擎 finalize 时可能会用自己的分配器去 free 它
+//   （届时可能崩在退出阶段，可接受）。仅用于判断「满队列是不是死锁的那一环」。
+int za_sync_grow_full_lq(void)
+{
+    unsigned long long qs[8];
+    int nq = 0, grown = 0;
+    zs_lock();
+    for (int i = 0; i < ZS_MAX; i++) {
+        zs_slot_t *w = &zs_slots[i];
+        if (!__atomic_load_n(&w->tid, __ATOMIC_RELAXED)) continue;
+        if (w->kind != 3 || !w->addr) continue;
+        // 等待字是 q+0x20（发送方）或 q+0x28（接收方），两种都当候选，
+        // 后面再用 cap/used 的有效性筛一遍。
+        unsigned long long cand[2] = { w->addr - 0x20, w->addr - 0x28 };
+        for (int k = 0; k < 2; k++) {
+            int j = 0;
+            while (j < nq && qs[j] != cand[k]) j++;
+            if (j == nq && nq < 8) qs[nq++] = cand[k];
+        }
+    }
+    for (int i = 0; i < nq; i++) {
+        unsigned long long q = qs[i];
+        unsigned long long arr = 0;
+        unsigned int cap = 0, used = 0, head = 0;
+        if (!za_sync_read(&arr, q, 8)) continue;
+        if (!za_sync_read(&cap, q + 8, 4)) continue;
+        if (!za_sync_read(&used, q + 0xc, 4)) continue;
+        if (!za_sync_read(&head, q + 0x10, 4)) continue;
+        if (!cap || cap > 0x10000 || used != cap) continue;     // 只扩「满」的
+        if (cap >= 0x10000) continue;
+        unsigned int ncap = cap * 4;
+        unsigned long long *na = calloc(ncap, 8);
+        if (!na) continue;
+        int ok = 1;
+        for (unsigned int k = 0; k < used; k++) {
+            unsigned long long v = 0;
+            unsigned long src = arr + (unsigned long)((head + k) % cap) * 8;
+            if (!za_sync_read(&v, src, 8)) { ok = 0; break; }
+            na[k] = v;
+        }
+        if (!ok) { free(na); continue; }
+        __atomic_store_n((unsigned long long *)(uintptr_t)q, (unsigned long long)(uintptr_t)na,
+                         __ATOMIC_RELEASE);
+        __atomic_store_n((unsigned int *)(uintptr_t)(q + 8), ncap, __ATOMIC_RELEASE);
+        __atomic_store_n((unsigned int *)(uintptr_t)(q + 0xc), used, __ATOMIC_RELEASE);
+        __atomic_store_n((unsigned int *)(uintptr_t)(q + 0x10), 0u, __ATOMIC_RELEASE);
+        ZLOGE("★ 满队列扩容 %#llx：%u/100 → %u，%u 条消息已搬移", q, used, ncap, used);
+        grown++;
+    }
+    zs_unlock();
+    return grown;
 }
 
 void za_sync_dump(void)

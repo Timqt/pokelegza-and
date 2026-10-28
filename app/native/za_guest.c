@@ -849,10 +849,38 @@ static unsigned long long za_fake_table[0x20];
 static char za_fake_name[8] __attribute__((aligned(8)));
 static volatile int za_fake_ready;
 
+// 「合法名字结构」：引擎解出来的名字是自相对偏移格式（反汇编 main+0x17389a0）：
+//   P  = 返回的指针
+//   base = P - (int32)[P]          ; 头部偏移
+//   w10  = u16[base]     ; < 7 视为无效
+//   off  = u16[base+6]   ; 为 0 视为无效
+//   x8   = P + off
+//   x8  += u32[x8]
+//   data = x8 + 4        ; 交给调用方的字符串地址
+// 下面构造 A：u16[A]=7、u16[A+6]=4、u32[A+8]=4、字符区 A+16 = "\0"，返回 P=A+4
+// ⇒ data = A+16，指向空串。任何一次「取名字」都会得到一个合法但空的名字。
+static unsigned char za_fake_name_entry[64] __attribute__((aligned(16)));
+static unsigned long long za_fake_name_ptr;
+
 static void za_build_fake_nametable(void)
 {
     if (__atomic_exchange_n(&za_fake_ready, 1, __ATOMIC_ACQ_REL)) return;
     za_fake_name[0] = 0;
+    {
+        unsigned char *A = za_fake_name_entry;
+        // 结构（自相对偏移）：
+        //   P = A+8；base = P - (int32)[P] = A+8-8 = A
+        //   u16[A]   = 7   （>=7 才不是「无效」）
+        //   u16[A+6] = 8   （非 0 ⇒ x8 = P + 8 = A+16）
+        //   u32[A+16]= 4   ⇒ x8 = A+20，+4 ⇒ data = A+24
+        //   A+24     = 0   （空字符串）
+        *(volatile unsigned short *)(A + 0) = 7;
+        *(volatile unsigned short *)(A + 6) = 8;
+        *(volatile unsigned int *)(A + 8) = 8;
+        *(volatile unsigned int *)(A + 16) = 4;
+        A[24] = 0;
+        za_fake_name_ptr = (unsigned long long)(uintptr_t)(A + 8);
+    }
     za_fake_entry[0x60 / 8] = (unsigned long long)(uintptr_t)za_fake_name;
     for (int i = 0; i < ZA_FAKE_SLOTS; i++)
         za_fake_array[i] = (unsigned long long)(uintptr_t)za_fake_entry;
@@ -895,6 +923,37 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
         extern unsigned char *za_guest_base;
         ucontext_t *ucx = (ucontext_t *)ctx;
         unsigned long pcx = (unsigned long)ucx->uc_mcontext.pc;
+        unsigned long gb0 = (unsigned long)(uintptr_t)za_guest_base;
+        // ★★ 首选修复：**直接跳到该访问器自己的「没有名字」返回分支**，
+        //   一个字节的游戏对象都不改。
+        //   为什么不用「装假表 + 重执指令」：那条路会让游戏带着假数据继续跑，
+        //   最后在消息处理里把假名字当对象解引用（真机崩在 main+0x250b0b8，
+        //   x8 指向未映射的 0x...6ee36451a8）。返回空名字才是这条路径的本意。
+        if (gb0) {
+            struct { unsigned int fault, target; int zero_x0; } fix[] = {
+                // main+0x1757a6c: 失败分支在 0x1757a8c（返回静态空串）
+                { 0x1757a70u, 0x1757a8cu, 0 },
+                // main+0x1757a98: 失败分支在 0x1757ab0（mov w0,wzr; ret）
+                { 0x1757a98u, 0x1757ab0u, 1 },
+                // main+0x173e6b4: `ldr x0,[x8,#0x58]`，函数尾 0x173e6c4 (ret) → w0=0
+                { 0x173e6b8u, 0x173e6c4u, 1 },
+            };
+            for (unsigned i = 0; i < sizeof fix / sizeof fix[0]; i++) {
+                if (pcx != gb0 + fix[i].fault) continue;
+                static int nfix;
+                if (fix[i].zero_x0) ucx->uc_mcontext.regs[0] = 0;
+                ucx->uc_mcontext.pc = gb0 + fix[i].target;
+                if (nfix++ < 6) {
+                    char b[160];
+                    char *q = b;
+                    q = za_put_str(q, "ZaGuest: ★ 名字表缺失→直接返回空 pc=+");
+                    q = za_put_hex(q, (unsigned long long)fix[i].fault);
+                    q = za_put_str(q, "\n");
+                    za_fatal_write(b, (size_t)(q - b));
+                }
+                return;
+            }
+        }
         unsigned long prev = pcx >= 4 ? *(volatile unsigned int *)(uintptr_t)(pcx - 4) : 0;
         unsigned long fi = *(volatile unsigned int *)(uintptr_t)pcx;
         // 故障指令：`ldr Rt,[Xn,#0x58]`（imm12=0x58/8=0xB，任意 Rt）
@@ -921,7 +980,9 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 //   main+0x17577d0 看到 [obj+0x1e8] 的 bit32..39 非零且
                 //   [obj+0x1f0] 非零时，**跳过** main+0x1757810（那个函数会
                 //   拿 [table+0x30] 当 nn::util::BinaryFileHeader 去解二进制）。
-                *(volatile unsigned long long *)(uintptr_t)(self + 0x1e8) = 0x0000000100000000ull;
+                // 缓存字段塞「合法名字指针」：两个懒建表入口看到缓存非零就早退，
+                // 返回这个指针，下游按「无名字」处理而不是解引用垃圾。
+                *(volatile unsigned long long *)(uintptr_t)(self + 0x1e8) = za_fake_name_ptr;
                 *(volatile unsigned int *)(uintptr_t)(self + 0x1f0) = 1u;
                 ucx->uc_mcontext.regs[rn] = (unsigned long)(uintptr_t)za_fake_table;
             }
@@ -959,15 +1020,12 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             unsigned long long self = ucx->uc_mcontext.regs[0];
             static int nnm2;
             if (self && ZA_PTR_OK(self)) {
-                unsigned long long c = 0;
-                memcpy(&c, (const void *)(uintptr_t)(self + 0x1e8), 8);
-                c |= 0x0000000100000000ull;
-                *(volatile unsigned long long *)(uintptr_t)(self + 0x1e8) = c;
+                *(volatile unsigned long long *)(uintptr_t)(self + 0x1e8) = za_fake_name_ptr;
                 *(volatile unsigned int *)(uintptr_t)(self + 0x1f0) = 1u;
             }
-            // 直接返回：x0 = x19(=旧 +0x1e8)，x1 = w20(=旧 +0x1f0)
-            ucx->uc_mcontext.regs[0] = ucx->uc_mcontext.regs[19];
-            ucx->uc_mcontext.regs[1] = (unsigned long)ucx->uc_mcontext.regs[20];
+            // 直接返回：x0 = 合法名字指针，x1 = 1（缓存非零）
+            ucx->uc_mcontext.regs[0] = za_fake_name_ptr;
+            ucx->uc_mcontext.regs[1] = 1;
             ucx->uc_mcontext.pc = (unsigned long)(uintptr_t)za_guest_base + 0x173df10ul;
             if (nnm2 < 4) {
                 char b[160];
@@ -3303,6 +3361,12 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
               (unsigned)ZA_TLS_VAR_OFF, (unsigned)(ZA_TLS_DESC_OFF + 0x1000));
     }
 
+    // ── 「名字查询懒建表」两个入口的说明（不改指令）───────────────────
+    //   main+0x173ded0 与 main+0x17577d0 在资源（obj+0x1e0）缺失时都会解引用空指针。
+    //   两个函数开头都有「缓存命中就早退」的分支（要求 obj+0x1e8 非零），所以
+    //   由崩溃恢复统一给它们塞一个**合法的名字结构指针**（见 za_fake_name_ptr），
+    //   而不是改指令让它们返回 0 —— 实测返回 0 会被下游当指针解引用
+    //   （真机崩在 main+0x17389a4，addr=0）。
     // mrs TPIDR_EL0 全量替换：`b <桩>`，桩里内联算线程 TLS 基址（10,193 条）：
     //    mrs x16,tpidr ; and ~0x1FFF ; ldr x17,[x16,#0x98] ; add x16,x16,x17,lsl3
     // ⚠ 桩内联、**不调用 C 函数**：调 C 会按 AAPCS 改掉 x0–x17，而 mrs 只写目标寄存器。
@@ -3747,35 +3811,47 @@ static int za_snap_main_regs(unsigned long *pc, unsigned long *regs)
     return 0;
 }
 
+typedef struct { volatile long tid; volatile unsigned long pc; volatile unsigned long regs[31]; } za_samp_slot_t;
+extern za_samp_slot_t za_samp_tab[32];
+
 // 主线程「等任务完成」的自旋（main+0xcc080：`ldrb w8,[x20,#3]` /
 // `ldr w8,[x19,#0x158]`；x19 = 任务对象，state 要等于 5）。
 // 任务永远没人执行 ⇒ 它自旋 100% CPU 且一个 svc 都不发。
 // 这里把它的任务对象直接标成完成，让它走出这个循环（实验性恢复）。
+// ⚠ 自旋的**不一定是主线程**（实测常常是某个 worker 线程），所以扫
+//   所有线程的寄存器快照，谁在那个 PC 区间里就修谁。
 static void za_unstick_main_job_spin(void)
 {
-    unsigned long pc = 0, regs[32];
-    if (!za_snap_main_regs(&pc, regs)) return;
     unsigned long gb = (unsigned long)(uintptr_t)za_guest_base;
-    if (!gb || pc < gb) return;
-    unsigned long off = pc - gb;
-    if (off < 0xcc060 || off > 0xcc0a0) return;      // 不是那个自旋
-    unsigned long long job = regs[19];
-    if (!ZA_PTR_OK(job)) return;
-    unsigned int st = 0xffffffffu;
-    {
-        struct iovec li = { &st, 4 }, ri = { (void *)(uintptr_t)(job + 0x158), 4 };
-        process_vm_readv(getpid(), &li, 1, &ri, 1, 0);
-    }
-    if (st == 5) return;
-    {
-        unsigned int done = 5;
-        struct iovec lo = { &done, 4 }, ro = { (void *)(uintptr_t)(job + 0x158), 4 };
-        process_vm_writev(getpid(), &lo, 1, &ro, 1, 0);
-    }
+    if (!gb) return;
     static int n;
-    if (n++ < 12)
-        ZLOGE("★ 主线程自旋在 main+%#lx 等任务：强制 job=%#llx state %#x → 5",
-              off, job, st);
+    for (int i = 0; i < 32; i++) {
+        za_samp_slot_t *sl = &za_samp_tab[i];
+        long tid = sl->tid;
+        if (tid <= 0) continue;
+        unsigned long pc = sl->pc;
+        if (pc < gb) continue;
+        unsigned long off = pc - gb;
+        // 这个自旋回路从 0xcc040（自旋锁）到 0xcc0dc（判 state）、0xcc0f4（重试）
+        // 都算；真机采样点实测落在 0xcc080 与 0xcc0d0 两处。
+        if (off < 0xcc030 || off > 0xcc140) continue;
+        unsigned long long job = sl->regs[19];
+        if (!ZA_PTR_OK(job)) continue;
+        unsigned int st = 0xffffffffu;
+        {
+            struct iovec li = { &st, 4 }, ri = { (void *)(uintptr_t)(job + 0x158), 4 };
+            process_vm_readv(getpid(), &li, 1, &ri, 1, 0);
+        }
+        if (st == 5) continue;
+        {
+            unsigned int done = 5;
+            struct iovec lo = { &done, 4 }, ro = { (void *)(uintptr_t)(job + 0x158), 4 };
+            process_vm_writev(getpid(), &lo, 1, &ro, 1, 0);
+        }
+        if (n++ < 12)
+            ZLOGE("★ tid=%ld 自旋在 main+%#lx 等任务：强制 job=%#llx state %#x → 5",
+                  tid, off, job, st);
+    }
 }
 
 // 自旋型停摆的快照。客机自旋时 svc 计数一直在涨，旧的 no_progress 判定
@@ -3784,10 +3860,26 @@ static void za_unstick_main_job_spin(void)
 void za_dump_progress_stall(void)
 {
     extern void za_sample_all_threads(void);
-    // 先做实验性恢复（不依赖「主线程是否在 svc 等待里」这个条件——
-    // 主线程常常是纯自旋，`lb` 为 0，条件块根本进不去）。
+    // ★ 先采样（拿到每条线程此刻的 PC + 寄存器快照），再做恢复：
+    //   「谁在等任务完成的自旋里」只能从抽样寄存器里看出来，用上一轮的旧样本
+    //   会打偏（真机实测：卡在 main+0xcc080，但恢复没触发）。
+    za_sample_all_threads();
+    { struct timespec t = { 0, 40 * 1000 * 1000 }; nanosleep(&t, NULL); }
+    // 实验性恢复（不依赖「主线程是否在 svc 等待里」这个条件——
+    // 自旋的线程根本不在等待表里）。
     za_force_stuck_jobs();
     za_unstick_main_job_spin();
+    {
+        // 实验开关：files/za-lqgrow —— 把塞满的消息队列扩容，破「队满→生产者全堵」。
+        static int lg = -1;
+        if (lg < 0)
+            lg = access("/data/user/0/org.pokelegza.android.port/files/za-lqgrow", F_OK) == 0;
+        if (lg) {
+            extern int za_sync_grow_full_lq(void);
+            static int n;
+            if (n < 8) { int g = za_sync_grow_full_lq(); if (g) n++; }
+        }
+    }
     {
         extern int za_sync_force_signal_stuck(void);
         static int fsn;
@@ -4575,6 +4667,9 @@ volatile unsigned long za_pc_ring_pos;
 volatile unsigned long za_samp_pc;
 volatile unsigned long za_samp_regs[32];
 volatile long za_samp_tid;
+// 按线程分槽（tid & 31）——停摆时要找的是「正在那个自旋回路里的线程」，
+// 它不一定是主线程（实测常常是某个 worker）。类型定义在文件前部。
+za_samp_slot_t za_samp_tab[32];
 
 static void za_pc_sample_handler(int sig, siginfo_t *info, void *ctx)
 {
@@ -4592,6 +4687,13 @@ static void za_pc_sample_handler(int sig, siginfo_t *info, void *ctx)
     za_samp_pc = pc;
     za_samp_tid = (long)syscall(SYS_gettid);
     for (int i = 0; i < 31; i++) za_samp_regs[i] = (unsigned long)uc->uc_mcontext.regs[i];
+    {
+        long t = za_samp_tid;
+        za_samp_slot_t *sl = &za_samp_tab[t & 31];
+        sl->tid = t;
+        sl->pc = pc;
+        for (int i = 0; i < 31; i++) sl->regs[i] = (unsigned long)uc->uc_mcontext.regs[i];
+    }
     // ★ 2026-10-28：**所有**样本都记（不再只记客机映像内的）。停摆时真正要回答的
     //   是「每条线程此刻停在哪」；把落在 libc/驱动里的样本丢掉，等于把
     //   正在 futex/驱动里等的那十几条线程全滤掉，只剩一堆旧样本。
