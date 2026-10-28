@@ -68,7 +68,7 @@ static void za_sync_dump_guest_chain(unsigned long long sp, unsigned long long p
           (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? pc - mb
               : (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? pc - za_sdk_base : pc);
     int hits = 0;
-    for (int k = 0; k < 512 && hits < 12; k++) {
+    for (int k = 0; k < 2048 && hits < 24; k++) {
         unsigned long long v = 0;
         if (!za_sync_read(&v, sp + (unsigned long)k * 8, 8)) break;
         if (v >= mb && v < mb + ZA_IMAGE_SIZE) { ZLOGI("        main+%#llx", v - mb); hits++; }
