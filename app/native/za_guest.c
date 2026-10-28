@@ -25,13 +25,17 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
+#include <dirent.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/ptrace.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1813,6 +1817,148 @@ void za_svc41_trace(unsigned long pc, long id)
 // za_stack_region_t 由 za_guest_api.h 提供，这里只放存储
 static za_stack_region_t za_stack_regions[ZA_STACK_REGIONS];
 
+// ── 每线程 CPU 时间：找出「在自旋而不是在睡」的那条线程 ────────────────
+// 停摆时 18 条线程全在等待表里，但持锁者可能压根没进 svc —— 它可能在
+// sdk+0x13a630 的 `wfe` 自旋里。那种线程的 utime 会明显高于别人。
+void za_dump_task_stats(void)
+{
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return;
+    ZLOGE("★ 每线程 CPU 时间（utime/stime 单位=10ms；自旋者明显偏高）：");
+    struct dirent *de;
+    int n = 0;
+    while ((de = readdir(d)) && n < 40) {
+        long tid = atol(de->d_name);
+        if (tid <= 0) continue;
+        char path[64], buf[1024], comm[64] = "?";
+        snprintf(path, sizeof path, "/proc/self/task/%ld/stat", tid);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        ssize_t r = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (r <= 0) continue;
+        buf[r] = 0;
+        char *lp = strchr(buf, '('), *rp = strrchr(buf, ')');
+        if (lp && rp && rp > lp) {
+            size_t cl = (size_t)(rp - lp - 1);
+            if (cl >= sizeof comm) cl = sizeof comm - 1;
+            memcpy(comm, lp + 1, cl);
+            comm[cl] = 0;
+        }
+        // ')' 之后的字段：[0]=state [1]=ppid … [11]=utime [12]=stime
+        char state = '?';
+        unsigned long long ut = 0, st = 0;
+        if (rp) {
+            char *tok[16];
+            int nt = 0;
+            for (char *s = strtok(rp + 2, " "); s && nt < 16; s = strtok(NULL, " "))
+                tok[nt++] = s;
+            if (nt > 12) {
+                state = tok[0][0];
+                ut = strtoull(tok[11], NULL, 10);
+                st = strtoull(tok[12], NULL, 10);
+            }
+        }
+        ZLOGE("    tid=%ld %-16s state=%c utime=%llu stime=%llu", tid, comm, state, ut, st);
+        n++;
+    }
+    closedir(d);
+}
+
+// 把信号打到「CPU 时间最高的那条线程」。
+// 停摆时若某条线程在客机代码里自旋（例如 SDK 的 wfe 临界区循环），它根本
+// 不发 svc ⇒ 等待表/探针都看不见它。SIGSEGV 会让致命处理器把它那一刻的
+// pc/sp/x29 整份倒出来 —— 这是唯一能看到「自旋在哪」的办法。
+long za_tgkill_hottest(int sig)
+{
+    DIR *d = opendir("/proc/self/task");
+    if (!d) return -1;
+    long self = (long)syscall(SYS_gettid);
+    long best = -1;
+    unsigned long long best_cpu = 0;
+    struct dirent *de;
+    int n = 0;
+    while ((de = readdir(d)) && n < 80) {
+        long tid = atol(de->d_name);
+        if (tid <= 0 || tid == self) continue;
+        char path[64], buf[1024];
+        snprintf(path, sizeof path, "/proc/self/task/%ld/stat", tid);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) continue;
+        ssize_t r = read(fd, buf, sizeof buf - 1);
+        close(fd);
+        if (r <= 0) continue;
+        buf[r] = 0;
+        char *rp = strrchr(buf, ')');
+        if (!rp) continue;
+        char *tok[16];
+        int nt = 0;
+        for (char *s = strtok(rp + 2, " "); s && nt < 16; s = strtok(NULL, " "))
+            tok[nt++] = s;
+        if (nt <= 12) continue;
+        unsigned long long cpu = strtoull(tok[11], NULL, 10) + strtoull(tok[12], NULL, 10);
+        if (cpu > best_cpu) { best_cpu = cpu; best = tid; }
+        n++;
+    }
+    closedir(d);
+    if (best <= 0) return -1;
+    ZLOGE("★ 取 CPU 最高的线程 tid=%ld（utime+stime=%llu）⇒ 投递信号 %d",
+          best, best_cpu, sig);
+    return syscall(SYS_tgkill, (int)getpid(), (int)best, sig);
+}
+
+// ── ptrace 自附加：读任意线程的真实寄存器现场 ────────────────────────
+// 主线程的门不写 regs[]（实测 pc/sp/x29 全 0），所以从门的槽位拿不到它。
+// ptrace(PTRACE_ATTACH) 同进程自附加可直接读内核保存的 pc/sp/x29 ——
+// 这是「谁在跑、谁卡在哪条指令」最可靠的手段，其它线程也能一起看。
+typedef struct {
+    unsigned long long regs[31];
+    unsigned long long sp;
+    unsigned long long pc;
+    unsigned long long pstate;
+} za_pt_regs_t;
+
+static int za_ptrace_regs(long tid, za_pt_regs_t *out)
+{
+    if (ptrace(PTRACE_ATTACH, tid, 0, 0) != 0) return -1;
+    int st = 0;
+    waitpid((pid_t)tid, &st, __WALL);
+    struct iovec iov = { out, sizeof *out };
+    int r = ptrace(PTRACE_GETREGSET, tid, (void *)(long)1 /* NT_PRSTATUS */, &iov);
+    ptrace(PTRACE_DETACH, tid, 0, 0);
+    return r;
+}
+
+void za_ptrace_dump_all(void)
+{
+    extern unsigned char *za_guest_base;
+    extern volatile unsigned long za_sdk_base, za_sdk_size;
+    unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+    DIR *d = opendir("/proc/self/task");
+    if (!d) { ZLOGE("ptrace: 打不开 /proc/self/task (errno=%d)", errno); return; }
+    ZLOGE("★ ptrace 全线程寄存器现场：");
+    struct dirent *de;
+    int n = 0, fails = 0;
+    while ((de = readdir(d)) && n < 40) {
+        long tid = atol(de->d_name);
+        if (tid <= 0) continue;
+        if (tid == (long)syscall(SYS_gettid)) continue;   // 不能附加自己
+        za_pt_regs_t r;
+        if (za_ptrace_regs(tid, &r) != 0) { fails++; continue; }
+        const char *w;
+        unsigned long long off = 0;
+        if (r.pc >= mb && r.pc < mb + ZA_IMAGE_SIZE) { w = "main+"; off = r.pc - mb; }
+        else if (za_sdk_base && r.pc >= za_sdk_base && r.pc < za_sdk_base + za_sdk_size)
+        { w = "sdk+"; off = r.pc - za_sdk_base; }
+        else { w = ""; off = r.pc; }
+        ZLOGE("    tid=%ld pc=%s%#llx sp=%#llx fp=%#llx lr=%#llx",
+              tid, w, off, r.sp, r.regs[29], r.regs[30]);
+        n++;
+    }
+    closedir(d);
+    ZLOGE("    （%d 条线程，%d 条 attach 失败）", n, fails);
+}
+
 void za_stack_register(long tid, unsigned long lo, unsigned long hi, const char *who)
 {
     for (int i = 0; i < ZA_STACK_REGIONS; i++)
@@ -3424,8 +3570,11 @@ static void *za_sampler_watchdog(void *arg)
                         dumped = 1;
                         ZLOGE("★ 客机 30 秒几乎不动（%lu svc/s）⇒ 倒客机栈（tid=%ld）",
                               rate, za_guest_tid);
-                        if (za_guest_tid > 0)
-                            syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, 11);
+                        {
+                            extern long za_tgkill_hottest(int sig);
+                            if (za_tgkill_hottest(11) < 0 && za_guest_tid > 0)
+                                syscall(SYS_tgkill, (int)getpid(), (int)za_guest_tid, 11);
+                        }
                     }
                 } else {
                     slow_secs = 0;
@@ -3468,6 +3617,12 @@ static void *za_sampler_watchdog(void *arg)
                         extern void za_sync_dump_chain_for(long tid);
                         ZLOGE("★ 主线程(tid=%ld)最近 svc：", za_guest_tid);
                         za_dump_ret_ring_for(za_guest_tid);
+                        {
+                            extern void za_ptrace_dump_all(void);
+                            extern void za_dump_task_stats(void);
+                            za_dump_task_stats();
+                            za_ptrace_dump_all();
+                        }
                         if (za_guest_tid > 0) za_sync_dump_chain_for(za_guest_tid);
                         // 主线程阻塞在哪个锁上 ⇒ 扫所有线程栈找持有者
                         {

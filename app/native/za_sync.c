@@ -663,6 +663,24 @@ void za_sync_dump_chain_for(long tid)
 void za_sync_scan_for_addr(unsigned long long val)
 {
     if (!val) return;
+    // ① 锁对象本身：把 ±0x40 打出来。nn::os 的互斥对象里除了锁字还有
+    //    内部临界区、计数器和**持有者记录**，靠它能直接认出持有者。
+    {
+        unsigned char raw[0x80];
+        if (za_sync_read(raw, val - 0x40, sizeof raw)) {
+            ZLOGI("      ★ 锁对象 %#llx ±0x40：", val);
+            for (int r = 0; r < 8; r++)
+                ZLOGI("        %+#04x: %02x %02x %02x %02x %02x %02x %02x %02x"
+                      "  %02x %02x %02x %02x %02x %02x %02x %02x",
+                      r * 16 - 0x40,
+                      raw[r*16+0], raw[r*16+1], raw[r*16+2], raw[r*16+3],
+                      raw[r*16+4], raw[r*16+5], raw[r*16+6], raw[r*16+7],
+                      raw[r*16+8], raw[r*16+9], raw[r*16+10], raw[r*16+11],
+                      raw[r*16+12], raw[r*16+13], raw[r*16+14], raw[r*16+15]);
+        } else {
+            ZLOGI("      ★ 锁对象 %#llx 不可读", val);
+        }
+    }
     int hits = 0;
     for (int i = 0; i < ZS_MAX; i++) {
         long t = __atomic_load_n(&zs_slots[i].tid, __ATOMIC_RELAXED);
@@ -673,7 +691,8 @@ void za_sync_scan_for_addr(unsigned long long val)
         unsigned long long lo = hi - 0x40000ull;      // 栈顶 256KB
         if (lo < (unsigned long long)sr->lo) lo = (unsigned long long)sr->lo;
         static unsigned char b2[4096 + 8];
-        for (unsigned long long a = lo; a < hi; ) {
+        int found = 0;
+        for (unsigned long long a = lo; a < hi && found < 3; ) {
             size_t len = (size_t)((hi - a) < 4096 ? (hi - a) : 4096);
             if (!za_sync_read(b2, a, len)) { a += 4096; continue; }
             for (size_t o = 0; o + 8 <= len; o += 8) {
@@ -682,10 +701,22 @@ void za_sync_scan_for_addr(unsigned long long val)
                 if (x == val) {
                     ZLOGI("      ↳ tid=%ld 栈上出现该锁地址（%#llx，距栈顶 %+#llx）",
                           t, a + o, (unsigned long long)(a + o) - hi);
+                    found++;
                     hits++;
+                    if (found >= 3) break;
                 }
             }
             a += len;
+        }
+        if (found) {
+            // 这条线程自己此刻在等什么（kind=1 等锁 / 2 等条件变量 / 3 等地址）
+            if (zs_slots[i].kind)
+                ZLOGI("        ↳ 它的等待：kind=%d lock=%#llx key=%#llx tag=%#x",
+                      zs_slots[i].kind, zs_slots[i].addr, zs_slots[i].key,
+                      zs_slots[i].tag);
+            else
+                ZLOGI("        ↳ 它**没有**在等待表里（kind=0）⇒ 可能正是它持有锁");
+            za_dump_ret_ring_for(t);
         }
     }
     ZLOGI("      ↳ 全线程栈扫描：%d 处命中", hits);

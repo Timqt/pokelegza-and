@@ -125,6 +125,22 @@ unsigned long long *za_regs_get(void)
             __builtin_memcpy(&p, (const void *)(uintptr_t)(hdr + 0xA0), 8);
             if (p && *(unsigned long long *)(uintptr_t)(p + 31 * 8) == ZA_REGS_MAGIC)
                 return (unsigned long long *)(uintptr_t)p;
+            // ★ 2026-10-28：魔数不符时**仍然返回同一个地址**。
+            //   门桩是照 `[TP+0x40] → [+0xA0]` 取的，C 侧若在这里退到全局兜底槽，
+            //   两侧读写的就不是同一块内存 ⇒ 该线程的 sp/x30/x29 在 C 侧永远是 0
+            //   （真机实测：主线程 pc=sp=fp=0，而所有工作线程正常）。
+            //   一致性比「安全」重要：至少能读到门桩真正写下的值。
+            if (p && !(p & 7)) {
+                static volatile int warned2;
+                if (!warned2) {
+                    warned2 = 1;
+                    ZLOGI("svc 寄存器槽：tid=%ld 的槽没有魔数（p=%#llx，读到 %#llx）"
+                          "⇒ 门桩与 C 侧地址不一致，改按门桩的地址读写",
+                          (long)syscall(SYS_gettid), (unsigned long long)p,
+                          *(unsigned long long *)(uintptr_t)(p + 31 * 8));
+                }
+                return (unsigned long long *)(uintptr_t)p;
+            }
         }
     }
     // 一发式诊断：谁落到了全局兜底槽。**主线程**如果出现在这里，说明门桩
@@ -1487,6 +1503,13 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                                    (unsigned long long)za_horizon_regs[ZA_REG_FP]);
         }
         int slices = 0;
+        unsigned long long deadline = 0;
+        if (ns >= 0) {
+            struct timespec tv0;
+            clock_gettime(CLOCK_MONOTONIC, &tv0);
+            deadline = (unsigned long long)tv0.tv_sec * 1000000000ull +
+                       (unsigned long long)tv0.tv_nsec + (unsigned long long)ns;
+        }
         for (;;)
         {
             unsigned int cur = __atomic_load_n(p, __ATOMIC_ACQUIRE);
@@ -1522,37 +1545,27 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 ts.tv_sec = 0;
                 ts.tv_nsec = 20 * 1000 * 1000;
             }
-            int rc = (int)syscall(SYS_futex, (int *)p, FUTEX_WAIT_PRIVATE, (int)cur, &ts, NULL, 0);
-            if (rc == 0) { za_sync_addr_wait_done(); return 0; }     // 被唤醒
-            if (errno == EAGAIN || errno == EINTR) continue;   // 值变了/被信号打断 ⇒ 重判
-            if (ns < 0) {
-                // ★ 陈旧持锁兜底：sdk+0x13a684 是 mutex 慢路径
-                //   WaitForAddress(addr, GreaterThan(2), 1) —— 等锁字变成 2。
-                //   锁字一直停在 1 说明持锁者再也不会解锁（线程挂了/自己也在等）。
-                //   等够 1 秒就把它强制清零并唤醒：宁可短暂破坏互斥，也不能整条线停死。
-                if (za_stale_check((unsigned long long)a0)) {
-                    static int nforce;
-                    unsigned int wv = __atomic_load_n(p, __ATOMIC_ACQUIRE);
-                    // ★ 2026-10-28：写回**等待者正在等的那个值**，而不是一律清零。
-                    //   SDK 的互斥字语义（sdk+0x13a5d0 反汇编）：
-                    //     0 = 空闲   1 = 已锁   2 = 交接给等待者
-                    //   等待者 13a670 调 WaitForAddress(addr, GreaterThan, 1)
-                    //   就是在等 2；解锁路径 13a7e4 把 2 清回 0。
-                    //   以前这里写 0 ⇒ 等待者永远等不到 >1，只能每秒被强推一次。
-                    unsigned int nv = 0;
-                    if (type == 2 && v == 1 && wv == 1) nv = 2;
-                    if (nforce++ < 6)
-                        ZLOGE("svc#52 1s 未解锁 addr=%#llx word=%#x ⇒ 写入 %#x（交接）",
-                              (unsigned long long)a0, wv, nv);
-                    __atomic_store_n(p, nv, __ATOMIC_RELEASE);
-                    syscall(SYS_futex, (int *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
+            int rc = (int)syscall(SYS_futex, (int *)p, FUTEX_WAIT_PRIVATE, (int)cur, &ts,
+                                  NULL, 0);
+            // ★ 2026-10-28：**被唤醒后必须重判条件**，不能直接 return 0。
+            //   以前 `if (rc == 0) return 0;` 会把「值变了但条件仍不成立」当成成功
+            //   返回给 SDK，SDK 便按「已获得」继续，随后的 CAS 失败又会绕回来，
+            //   表现为无限循环且 svc 计数停滞。
+            //   同样，**不再**在等满 1 秒后强行改锁字：2 只有解锁路径会清，
+            //   我们写 2 等于自己制造永久死锁（真机实测写入后永远停在 2/1）。
+            //   内核语义就是「条件成立才返回」，其余一律继续等（分片重判）。
+            (void)rc;
+            if (errno == EINVAL) return 0xFA01u;   // 地址非法：交给调用方
+            if (ns >= 0) {
+                struct timespec tv1;
+                clock_gettime(CLOCK_MONOTONIC, &tv1);
+                if ((unsigned long long)tv1.tv_sec * 1000000000ull +
+                    (unsigned long long)tv1.tv_nsec >= deadline) {
                     za_sync_addr_wait_done();
-                    return 0;
+                    return 0xEA01u;                // 真超时
                 }
-                continue;                           // 分片到期 ⇒ 重判条件（伪唤醒）
             }
-            za_sync_addr_wait_done();
-            return 0xEA01u;                         // 真超时
+            continue;
         }
     }
     case 54: // SynchronizeToAddress / 慢路径让出 CPU（SDK 临界区忙等里调）
@@ -1565,11 +1578,17 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     }
     case 53: // SignalToAddress(addr=x0, type=w1, value=w2)
     {
-        // 唤醒该地址上的所有等待者；type/value 的过滤由等待者自己重判条件完成
-        // （内核按条件过滤，这里多唤醒是安全的：条件不成立的会立刻再睡）。
+        // ★ 2026-10-28：**这条 svc 不是「只唤醒」——它要在内存上执行操作。**
+        //   Horizon 的 SignalType：
+        //     0 = Signal            只唤醒（count 个）
+        //     1 = Increment         *addr += value，然后唤醒
+        //     2 = SignalAndIncrement 两者都做
+        //     3 = SignalAndModifyByWaitingCount  按等待者数量改
+        //   以前这里只 futex_wake、一个字节都不改 ⇒ 等待方的条件永远不成立。
+        //   真机现象：主线程在 sdk+0x13a684 反复
+        //     WaitForAddress(addr, GreaterThan, 1)，而 addr 恒为 1
+        //   ——因为与之配对的 svc#53(type=1) 从来没有把 1 变成 2。
         unsigned int *p = (unsigned int *)(uintptr_t)a0;
-        // 诊断：完整采样信号参数（每秒最多 12 行）。要回答的问题是
-        // 「到底有没有人给这些被监视的地址发过信号、发的什么 type/value」。
         {
             static unsigned long long win;
             static unsigned nl;
@@ -1585,7 +1604,21 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                       (unsigned long)za_horizon_regs[ZA_REG_PC] - (unsigned long)za_sdk_base);
             }
         }
-        if (p) syscall(SYS_futex, (int *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
+        if (p) {
+            unsigned int type = (unsigned int)a1;
+            unsigned int val = (unsigned int)a2;
+            unsigned int add = 0;
+            switch (type) {
+                case 1: add = val; break;           // Increment
+                case 2: add = val; break;           // SignalAndIncrement
+                case 3:                             // SignalAndModifyByWaitingCount
+                    add = val ? val : 1u;
+                    break;
+                default: break;                     // Signal：只唤醒
+            }
+            if (add) __atomic_add_fetch(p, add, __ATOMIC_ACQ_REL);
+            syscall(SYS_futex, (int *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
+        }
         return 0;
     }
 
