@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/ptrace.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
@@ -875,6 +876,13 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             if (self && ZA_PTR_OK(self)) {
                 *(volatile unsigned long long *)(uintptr_t)(self + 0x1f8) =
                     (unsigned long long)(uintptr_t)za_fake_nametable;
+                // 同时把「名字查询缓存」置成非零，短路另一条路径：
+                //   main+0x17577d0 看到 [obj+0x1e8] 的 bit32..39 非零且
+                //   [obj+0x1f0] 非零时，**跳过** main+0x1757810（那个函数会
+                //   拿 [table+0x30] 当 nn::util::BinaryFileHeader 去解二进制，
+                //   空表下必崩）。缓存值只用于查名字，假值最多查出空名字。
+                *(volatile unsigned long long *)(uintptr_t)(self + 0x1e8) = 0x0000000100000000ull;
+                *(volatile unsigned int *)(uintptr_t)(self + 0x1f0) = 1u;
             }
             if (nnm < 8)
             {
@@ -3590,12 +3598,66 @@ void za_scan_job_in_heap(void)
     ZLOGE("★ 堆扫描：%s", verdict);
 }
 
+// 把卡住的任务强制标成「完成（5）」。开关：files/za-forcejob 或 ZA_FORCEJOB。
+// 只动 JobWait 探针真实记录过的对象（环形里最多 16 个），且当前 state != 5。
+static void za_force_stuck_jobs(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = getenv("ZA_FORCEJOB") ? 1 :
+             (access("/data/user/0/org.pokelegza.android.port/files/za-forcejob", F_OK) == 0);
+    if (!on) return;
+    static int first;
+    if (!first) {
+        first = 1;
+        ZLOGE("★ 强制任务：开关=开，环内记录 %u 条", (unsigned)za_job_pos);
+    }
+    static unsigned long long forced[ZA_JOBRING];
+    static int forced_n;
+    unsigned pos = za_job_pos;
+    unsigned n = pos < ZA_JOBRING ? pos : ZA_JOBRING;
+    int changed = 0;
+    for (unsigned i = 0; i < n; i++) {
+        unsigned long long o = za_job_objs[(pos - 1 - i) % ZA_JOBRING];
+        if (!ZA_PTR_OK(o)) continue;
+        int skip = 0;
+        for (unsigned k = 0; k < forced_n; k++)
+            if (forced[k] == o) { skip = 1; break; }
+        if (skip) continue;
+        unsigned int st = 0;
+        struct iovec li = { &st, 4 }, ri = { (void *)(uintptr_t)(o + 0x158), 4 };
+        if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) != 4) continue;
+        if (st == 5) continue;
+        unsigned int done = 5;
+        struct iovec lo = { &done, 4 }, ro = { (void *)(uintptr_t)(o + 0x158), 4 };
+        if (process_vm_writev(getpid(), &lo, 1, &ro, 1, 0) != 4) continue;
+        if (forced_n < ZA_JOBRING) forced[forced_n++] = o;
+        ZLOGE("★ 强制完成任务 obj=%#llx：state %#x → 5（让同步 submit 返回）", o, st);
+        changed++;
+    }
+    if (changed) {
+        extern unsigned za_sync_poke_all(void);
+        za_sync_poke_all();
+    }
+}
+
 // 自旋型停摆的快照。客机自旋时 svc 计数一直在涨，旧的 no_progress 判定
 // 永远不会触发；但 NVN 一个提交都没有，说明它其实没前进。
 // 由 NVN 帧驱动每 10 秒调一次，倒出「每条线程此刻停在哪」。
 void za_dump_progress_stall(void)
 {
     extern void za_sample_all_threads(void);
+    // 先做实验性恢复（不依赖「主线程是否在 svc 等待里」这个条件——
+    // 主线程常常是纯自旋，`lb` 为 0，条件块根本进不去）。
+    za_force_stuck_jobs();
+    {
+        extern int za_sync_force_signal_stuck(void);
+        static int fsn;
+        if (fsn < 20) {
+            int fs = za_sync_force_signal_stuck();
+            if (fs) ZLOGE("   ↳ 强制交接：动了 %d 个等待字（第 %d 轮）", fs, ++fsn);
+        }
+    }
     za_sample_all_threads();
     { struct timespec t = { 0, 40 * 1000 * 1000 }; nanosleep(&t, NULL); }
     ZLOGE("★ 10 秒无 NVN 进展快照（svc 在涨 ⇒ 客机在自旋）：");
@@ -3710,41 +3772,14 @@ void za_dump_progress_stall(void)
                         if (cv) ZLOGE("   ↳ 伪唤醒 %u 个条件变量等待者", cv);
                     }
                 }
-                // ★ 2026-10-28 实验：把「一直停在 state=0（新建）」的任务强制
-                //   标成完成（5）。调度器的 submit 是**同步**的（提交后就在这里
-                //   等这个任务跑完），而 worker 从来没被唤醒过、任务也没真正
-                //   入队 ⇒ 主线程永远等不到。强制完成后 submit 才会返回，
-                //   我们才能看到「下一段」到底是什么（哪怕画面内容还不正确）。
-                //   只动 JobWait 探针真实记录过的对象、且当前值必须是 0。
-                static int fj_on = -1;
-                if (fj_on < 0) fj_on = getenv("ZA_FORCEJOB") ? 1 : 0;
-                if (fj_on)
-                {
-                    static unsigned long long forced[ZA_JOBRING];
-                    unsigned pos = za_job_pos;
-                    unsigned n = pos < ZA_JOBRING ? pos : ZA_JOBRING;
-                    int changed = 0;
-                    for (unsigned i = 0; i < n; i++) {
-                        unsigned long long o = za_job_objs[(pos - 1 - i) % ZA_JOBRING];
-                        if (!ZA_PTR_OK(o)) continue;
-                        int skip = 0;
-                        for (unsigned k = 0; k < ZA_JOBRING; k++)
-                            if (forced[k] == o) { skip = 1; break; }
-                        if (skip) continue;
-                        unsigned int st = 0;
-                        struct iovec li = { &st, 4 }, ri = { (void *)(uintptr_t)(o + 0x158), 4 };
-                        if (process_vm_readv(getpid(), &li, 1, &ri, 1, 0) != 4) continue;
-                        if (st == 5) continue;          // 已经完成
-                        unsigned int done = 5;
-                        struct iovec lo = { &done, 4 }, ro = { (void *)(uintptr_t)(o + 0x158), 4 };
-                        if (process_vm_writev(getpid(), &lo, 1, &ro, 1, 0) != 4) continue;
-                        for (unsigned k = 0; k < ZA_JOBRING; k++)
-                            if (!forced[k]) { forced[k] = o; break; }
-                        ZLOGE("★ 强制完成任务 obj=%#llx：state %#x → 5（让同步 submit 返回）", o, st);
-                        changed++;
-                    }
-                    if (changed) za_sync_poke_all();   // 状态改完再叫醒它们
-                }
+                // （强制交接已经挪到 za_dump_progress_stall 开头：主线程常常
+                //  是纯自旋、`lb` 为 0，放在这个条件块里根本执行不到。）
+                // ★ 2026-10-28 实验：把卡住的任务强制标成完成（5）。调度器的
+                //   submit 是**同步**的（提交后就在这里等这个任务跑完），而 worker
+                //   从来没被唤醒过、任务也没真正入队 ⇒ 主线程永远等不到。
+                //   强制完成后 submit 才会返回，我们才能看到「下一段」。
+                //   只动 JobWait 探针真实记录过的对象。用标记文件打开。
+                za_force_stuck_jobs();
                 int pk = za_fakewake_on() ? za_sync_poke_addr_waiters() : 0;
                 if (pk) ZLOGE("   ↳ 伪唤醒了 %d 个地址等待者（第 %d 次）", pk, ++poke_n);
                 // 伪唤醒三次都没让系统动 ⇒ 等待的字确实没人写。做一次限定范围的
@@ -4298,6 +4333,10 @@ int za_guest_boot(za_guest_t *g)
 //   下一轮迭代就看不到上一轮遇到过什么。
 static int za_log_fd = -1;
 static pthread_mutex_t za_log_mtx = PTHREAD_MUTEX_INITIALIZER;
+// 落文件的上限：这个文件是**跨进程追加**的，反复重启会把平板写满
+// （实测累积到 514 MB，直接拖慢整机）。超过上限就只写 logcat。
+#define ZA_LOG_FILE_CAP (64ull << 20)
+static unsigned long long za_log_bytes;
 
 void za_log_print(int prio, const char *tag, const char *fmt, ...)
 {
@@ -4315,10 +4354,27 @@ void za_log_print(int prio, const char *tag, const char *fmt, ...)
     buf[n] = '\n';
     buf[n + 1] = 0;
     pthread_mutex_lock(&za_log_mtx);
-    if (za_log_fd < 0)
+    if (za_log_fd < 0) {
         za_log_fd = open("/data/data/org.pokelegza.android.port/files/za_log.txt",
                          O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
-    if (za_log_fd >= 0) { ssize_t w = write(za_log_fd, buf, (size_t)n + 1); (void)w; }
+        struct stat st;
+        if (za_log_fd >= 0 && fstat(za_log_fd, &st) == 0) {
+            za_log_bytes = (unsigned long long)st.st_size;
+            if (za_log_bytes > ZA_LOG_FILE_CAP) {      // 旧文件太大：清掉重新记
+                close(za_log_fd);
+                za_log_fd = open("/data/data/org.pokelegza.android.port/files/za_log.txt",
+                                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+                za_log_bytes = 0;
+            }
+        }
+    }
+    if (za_log_fd >= 0 && za_log_bytes < ZA_LOG_FILE_CAP) {
+        ssize_t w = write(za_log_fd, buf, (size_t)n + 1);
+        if (w > 0) za_log_bytes += (unsigned long long)w;
+        if (za_log_bytes >= ZA_LOG_FILE_CAP)
+            __android_log_print(ANDROID_LOG_WARN, "ZaGuest",
+                                "日志文件到 64MB 上限，之后只写 logcat");
+    }
     pthread_mutex_unlock(&za_log_mtx);
 }
 

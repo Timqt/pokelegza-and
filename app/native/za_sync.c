@@ -1167,6 +1167,50 @@ int za_sync_poke_addr_waiters(void)
     return n;
 }
 
+// 「按新协议交接」的强制唤醒：把等待字推到 value+1 再唤醒全部等待者。
+//
+// 为什么不能像 za_sync_force_release_stuck 那样清 0：SDK 的
+// InternalConditionVariable::Wait（sdk+0x13a5d0）醒来后的判定是
+//   0 → CAS 0→1 后**再睡**；1 → svc#52（睡在自己的等待标记上）；2 → 消费信号并返回。
+// 所以清 0 只会让等待者立刻又睡回去（真机实测：伪唤醒 19 个线程 × 多轮，毫无进展）。
+// 唯一能让它们真正返回的是把字写成 2（= 已通知）。
+//
+// 语义上等价于「持有者已经死了，代替它完成一次 Signal 交接」：会破坏互斥，
+// 只用于判定死锁性质。返回动了几个地址。
+int za_sync_force_signal_stuck(void)
+{
+    unsigned long long addrs[ZS_MAX];
+    unsigned int vals[ZS_MAX];
+    int cnt[ZS_MAX], na = 0, done = 0;
+    zs_lock();
+    for (int i = 0; i < ZS_MAX; i++) {
+        zs_slot_t *w = &zs_slots[i];
+        if (!__atomic_load_n(&w->tid, __ATOMIC_RELAXED)) continue;
+        if (w->kind != 3) continue;
+        int k = 0;
+        while (k < na && addrs[k] != w->addr) k++;
+        if (k == na) { addrs[na] = w->addr; vals[na] = w->tag; cnt[na] = 0; na++; }
+        cnt[k]++;
+    }
+    for (int k = 0; k < na; k++) {
+        unsigned int *p = (unsigned int *)(uintptr_t)addrs[k];
+        unsigned int cur = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+        if ((int)cur != (int)vals[k]) continue;      // 条件已不成立 ⇒ 等待者自己会走
+        unsigned int nv = cur + 1u;
+        __atomic_store_n(p, nv, __ATOMIC_RELEASE);
+        ZLOGE("★ 强制交接 %#llx：word %#x → %#x（%d 个等待者仍在等）",
+              addrs[k], cur, nv, cnt[k]);
+        for (;;) {
+            zs_slot_t *w = zs_pick(3, addrs[k]);
+            if (!w) break;
+            zs_wake(w);
+        }
+        done++;
+    }
+    zs_unlock();
+    return done;
+}
+
 // 诊断性强制解锁：只对「同一地址上 >= 2 个等待者」的锁字执行 SDK 解锁路径的
 // 动作（把 1 或 2 写成 0）再唤醒全部等待者。
 // ⚠ 这会破坏互斥（被保护的数据可能被两个线程同时改）。仅用于**判定死锁性质**：
