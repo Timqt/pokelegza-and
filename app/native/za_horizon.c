@@ -1359,7 +1359,12 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     }
     case 12: // GetThreadPriority(out_prio=x0, handle=x1) → W1
     {
-        unsigned int prio = 0x1000;   // Horizon 默认优先级
+        // ★ Horizon 的优先级是 **0..63 的小整数**（越小越高）。以前这里返回
+        //   0x1000（4096）—— 引擎侧拿它做合法区间判断时会被当成「无效句柄/无效
+        //   优先级」，进而影响它对自己线程池的登记（真机症状：worker 线程在跑，
+        //   但池里始终没有任务、入队也从不发条件变量信号）。
+        //   参考实现给主线程 prio=44；这里统一按默认 44 报。
+        unsigned int prio = 44;
         za_horizon_regs[ZA_REG_X1] = prio;
         if (a0) *(unsigned int *)(uintptr_t)a0 = prio;
         return 0;
@@ -1368,10 +1373,13 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         return 0;
     case 14: // GetThreadCoreMask(out_core=x0, out_mask=x1, handle=w2) → W1,W2
     {
+        // 掩码要与 svc#41 GetInfo(0)=CoreMask 报的一致（那边给 0x7）。
+        // 以前这里固定报 1（只有核 0）⇒ 引擎按掩码推算「有几个核可用」时
+        // 会算出 1 个，和它实际创建的 worker 数对不上。
         za_horizon_regs[ZA_REG_X1] = 0;
-        za_horizon_regs[ZA_REG_X2] = 1;
+        za_horizon_regs[ZA_REG_X2] = 7;
         if (a0) *(unsigned int *)(uintptr_t)a0 = 0;
-        if (a1) *(unsigned long long *)(uintptr_t)a1 = 1;
+        if (a1) *(unsigned long long *)(uintptr_t)a1 = 7;
         return 0;
     }
     case 15: // SetThreadCoreMask(handle=x0, mask=x1)

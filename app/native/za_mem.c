@@ -267,7 +267,10 @@ unsigned long long za_mem_getinfo(long id)
     switch (id)
     {
     case 0:  return 7;                                   // CoreMask：4 核可用
-    case 1:  return 0;                                   // PriorityMask
+    case 1:  return 0x3F;                                // PriorityMask：0..63 全可用
+                                                         // （以前返回 0 =「一个优先级都不允许」；
+                                                         //   引擎做 prio & mask 后会把线程优先级
+                                                         //   全压成无效值，影响线程池登记）
     case 2:  return (unsigned long long)(uintptr_t)g_alias;   // AliasAddr
     case 3:  return ZA_MEM_ALIAS_CAP;                    // AliasSize
     case 4:  return (unsigned long long)(uintptr_t)g_heap;    // HeapAddr
