@@ -17,14 +17,20 @@ unsigned long za_sync_signal_key(unsigned long long key, int count);
 // 对所有条件变量等待者做一次合法伪唤醒；返回被唤醒的线程数。
 unsigned za_sync_poke_all(void);
 
-// 记录进 svc#28 时的客机 sp / x30（等待点调用链用）
-void za_sync_note_guest(unsigned long long sp, unsigned long long pc);
+// 记录进 svc#28 时的客机 sp / x30 / x29（等待点调用链用）
+// fp = 客机 x29，门桩 `str x29,[x16,#136]`（regs[17]）。调用链靠它逐帧回溯，
+// 不再扫栈（扫栈会把映像内的数据指针误认成返回地址，已两次被反汇编证伪）。
+void za_sync_note_guest(unsigned long long sp, unsigned long long pc,
+                        unsigned long long fp);
 void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int type,
-                            unsigned long long sp, unsigned long long pc);
+                            unsigned long long sp, unsigned long long pc,
+                            unsigned long long fp);
 void za_sync_addr_wait_done(void);
 
 // 打印等待表快照（诊断用）
 void za_sync_dump(void);
 void za_sync_dump_chain_for(long tid);
+// 在所有客机线程栈里搜某个地址（找锁持有者用）
+void za_sync_scan_for_addr(unsigned long long val);
 
 #endif

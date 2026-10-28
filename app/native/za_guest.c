@@ -3469,6 +3469,16 @@ static void *za_sampler_watchdog(void *arg)
                         ZLOGE("★ 主线程(tid=%ld)最近 svc：", za_guest_tid);
                         za_dump_ret_ring_for(za_guest_tid);
                         if (za_guest_tid > 0) za_sync_dump_chain_for(za_guest_tid);
+                        // 主线程阻塞在哪个锁上 ⇒ 扫所有线程栈找持有者
+                        {
+                            extern unsigned long long za_last_blocked_addr(long tid);
+                            extern void za_sync_scan_for_addr(unsigned long long val);
+                            unsigned long long lb = za_last_blocked_addr(za_guest_tid);
+                            if (lb) {
+                                ZLOGE("★ 主线程阻塞地址 %#llx ⇒ 扫全线程栈找持有者：", lb);
+                                za_sync_scan_for_addr(lb);
+                            }
+                        }
                     }
                     za_nvn_dump_recent();   // 带客机 LR：最后几步 NVN 调用发生在哪
                 }

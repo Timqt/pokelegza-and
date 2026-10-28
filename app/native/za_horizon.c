@@ -127,6 +127,18 @@ unsigned long long *za_regs_get(void)
                 return (unsigned long long *)(uintptr_t)p;
         }
     }
+    // 一发式诊断：谁落到了全局兜底槽。**主线程**如果出现在这里，说明门桩
+    // 没把 sp/x30/x29 写进它自己的槽 ⇒ 它的调用链拿不到 fp（实测正是如此：
+    // 主线程 svc 的 pc=sp=fp=0）。
+    {
+        static volatile int warned;
+        if (!warned) {
+            warned = 1;
+            ZLOGI("svc 寄存器槽：tid=%ld 落到全局兜底槽（TP=%#lx）⇒ 该线程的 "
+                  "sp/x30/x29 不可用，调用链需靠反向 x29 重建",
+                  (long)syscall(SYS_gettid), (unsigned long)tp);
+        }
+    }
     return za_regs_fallback;   // 非客机线程（诊断路径）兜底
 }
 #define za_horizon_regs za_regs_get()
@@ -187,6 +199,11 @@ static volatile unsigned long za_svc_seq;
 // 客机 sp：门区 `str x17,[x16,#0x48]` ⇒ 下标 9。
 //   ⚠ 下标 10（+0x50）是**服务号**，11（+0x58）才是客机 x30。
 #define ZA_REG_SP 9
+// 客机 x29：门区 `str x29,[x16,#136]` ⇒ 下标 17。
+//   svc 包装函数不改 x29（它是 callee-saved），所以这就是**调用 svc 的那个
+//   函数自己的帧指针**：[fp] = 上一帧 fp，[fp+8] = 该函数的返回地址。
+//   调用链回溯必须走这条链；扫栈是启发式，会把映像内的数据指针当帧。
+#define ZA_REG_FP 17
 // 取客机在 svc 那一刻的 sp。用它可以直接量出「sp 漂移」——
 // 若两条 svc 之间客机代码没有动 sp，值必须完全一致；不一致就说明门区写坏了 sp。
 unsigned long za_horizon_guest_sp(void)
@@ -1415,7 +1432,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         return (long)za_sync_arbitrate_unlock((unsigned long long)a0);
     case 28: // WaitProcessWideKeyAtomic(lockaddr=x0, condkey=x1, tag=w2, timeout=x3)
         za_sync_note_guest((unsigned long long)za_horizon_regs[ZA_REG_SP],
-                           (unsigned long long)za_horizon_regs[ZA_REG_PC]);
+                           (unsigned long long)za_horizon_regs[ZA_REG_PC],
+                           (unsigned long long)za_horizon_regs[ZA_REG_FP]);
         // 诊断：高频重复等待时把参数打出来（每秒最多 8 行），
         // 用来区分「timeout=0 的空转」和「真的在睡」。
         {
@@ -1465,7 +1483,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             unsigned long long spv = (unsigned long long)za_horizon_regs[ZA_REG_SP];
             if (!spv) spv = za_spcache_get((long)syscall(SYS_gettid));
             za_sync_note_addr_wait((unsigned long long)a0, v, type, spv,
-                                   (unsigned long long)za_horizon_regs[ZA_REG_PC]);
+                                   (unsigned long long)za_horizon_regs[ZA_REG_PC],
+                                   (unsigned long long)za_horizon_regs[ZA_REG_FP]);
         }
         int slices = 0;
         for (;;)
@@ -1513,10 +1532,19 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 //   等够 1 秒就把它强制清零并唤醒：宁可短暂破坏互斥，也不能整条线停死。
                 if (za_stale_check((unsigned long long)a0)) {
                     static int nforce;
+                    unsigned int wv = __atomic_load_n(p, __ATOMIC_ACQUIRE);
+                    // ★ 2026-10-28：写回**等待者正在等的那个值**，而不是一律清零。
+                    //   SDK 的互斥字语义（sdk+0x13a5d0 反汇编）：
+                    //     0 = 空闲   1 = 已锁   2 = 交接给等待者
+                    //   等待者 13a670 调 WaitForAddress(addr, GreaterThan, 1)
+                    //   就是在等 2；解锁路径 13a7e4 把 2 清回 0。
+                    //   以前这里写 0 ⇒ 等待者永远等不到 >1，只能每秒被强推一次。
+                    unsigned int nv = 0;
+                    if (type == 2 && v == 1 && wv == 1) nv = 2;
                     if (nforce++ < 6)
-                        ZLOGE("svc#52 1s 未解锁 addr=%#llx word=%#x ⇒ 强制清零",
-                              (unsigned long long)a0, __atomic_load_n(p, __ATOMIC_ACQUIRE));
-                    __atomic_store_n(p, 0u, __ATOMIC_RELEASE);
+                        ZLOGE("svc#52 1s 未解锁 addr=%#llx word=%#x ⇒ 写入 %#x（交接）",
+                              (unsigned long long)a0, wv, nv);
+                    __atomic_store_n(p, nv, __ATOMIC_RELEASE);
                     syscall(SYS_futex, (int *)p, FUTEX_WAKE_PRIVATE, 0x7fffffff, NULL, NULL, 0);
                     za_sync_addr_wait_done();
                     return 0;
@@ -2200,6 +2228,23 @@ static za_rr_slot_t *za_rr_cur(void)
 }
 // 按 tid 倒出某个线程的 svc 环形记录（看门狗在等待表里用）。
 // ret == 0xdead 表示这条 svc **还没返回**（线程正阻塞在里面）。
+// 某线程当前阻塞在哪个地址（环形记录里最新一条 ret=0xdead 的 a0）。
+unsigned long long za_last_blocked_addr(long tid)
+{
+    for (unsigned i = 0; i < ZA_RR_SLOTS; i++) {
+        za_rr_slot_t *s = &za_rr_slots[i];
+        if (__atomic_load_n(&s->tid, __ATOMIC_ACQUIRE) != tid) continue;
+        unsigned h = __atomic_load_n(&s->head, __ATOMIC_RELAXED);
+        for (int k = 0; k < 4; k++) {
+            int j = (int)((h - 1 - k + ZA_RR * 2) % ZA_RR);
+            za_rr_t *e = &s->e[j];
+            if (e->ret != 0xdeadL) break;
+            if (e->a0 && (e->nr == 52 || e->nr == 28 || e->nr == 26)) return e->a0;
+        }
+    }
+    return 0;
+}
+
 void za_dump_ret_ring_for(long tid)
 {
     za_rr_slot_t *s = NULL;
@@ -2215,6 +2260,32 @@ void za_dump_ret_ring_for(long tid)
         ZLOGI("      svc#%ld ret=%s%#lx pc=%#llx a0=%#llx a1=%#llx",
               e->nr, e->ret == 0xdeadL ? "(未返回)" : "", (unsigned long)e->ret,
               e->pc, e->a0, e->a1);
+        // 阻塞中的那条：把**等待字当前的值**读出来。这决定死锁判断方向：
+        //   0/1  ⇒ 锁其实是空的，是我们把线程按住了（等待逻辑错）
+        //   >1   ⇒ 真有人在持有，要找持有者
+        if (k == 0 && e->ret == 0xdeadL && e->a0 &&
+            (e->nr == 52 || e->nr == 28 || e->nr == 26)) {
+            // ★ 必须走 process_vm_readv：环形记录里的地址可能已经失效
+            //   （实测直接解引用会把看门狗线程打死，整个进程跟着崩）。
+            unsigned int w = 0, c = 0;
+            struct iovec li = { &w, 4 };
+            struct iovec ri = { (void *)(uintptr_t)e->a0, 4 };
+            int okw = process_vm_readv((pid_t)syscall(SYS_getpid), &li, 1, &ri, 1, 0) == 4;
+            if (e->a1) {
+                struct iovec li2 = { &c, 4 };
+                struct iovec ri2 = { (void *)(uintptr_t)e->a1, 4 };
+                if (process_vm_readv((pid_t)syscall(SYS_getpid), &li2, 1, &ri2, 1, 0) != 4)
+                    c = 0;
+            }
+            if (!okw) {
+                ZLOGI("        ↳ 等待字[%#llx] 不可读（地址已失效）", e->a0);
+            } else {
+                ZLOGI("        ↳ 等待字[%#llx]=%#x  cv[%#llx]=%#x  ⇒ %s",
+                      e->a0, w, e->a1, c,
+                      w <= 1u ? "锁字是 0/1：实际无人持有，问题在我们这边"
+                              : "锁字 >1：有人持有，需找持有者");
+            }
+        }
     }
 }
 

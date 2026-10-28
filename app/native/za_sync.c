@@ -56,24 +56,40 @@ static int za_sync_read(void *dst, unsigned long long addr, size_t len)
     return process_vm_readv((pid_t)syscall(SYS_getpid), &l, 1, &r, 1, 0) == (ssize_t)len;
 }
 
-// 从客机 sp 往上扫，打印前 4 个落在 main/sdk 映像里的返回地址。
-// 这是「主线程到底卡在哪个游戏函数」最直接的证据：x29 我们拿不到
-// （svc 门只存 x8..x18/x30），但帧里的返回地址一定在栈上。
-static int za_scan_words = 2048;
-static void za_sync_dump_guest_chain(unsigned long long sp, unsigned long long pc)
+// 把地址翻译成 main+… / sdk+… 并打印。返回 1 = 落在映像内。
+static int za_sync_print_addr(const char *what, unsigned long long pc)
 {
     extern unsigned char *za_guest_base;
     unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
-    if (pc) {
-        ZLOGI("      客机等待点 x30=%s%#llx",
-              (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? "main+" :
-              (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? "sdk+" : "",
-              (pc >= mb && pc < mb + ZA_IMAGE_SIZE) ? pc - mb
-                  : (pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) ? pc - za_sdk_base : pc);
+    if (pc >= mb && pc < mb + ZA_IMAGE_SIZE) {
+        ZLOGI("      %s=main+%#llx", what, pc - mb);
+        return 1;
     }
-    // 先收集，再决定打印多少：**工作线程**的链里一定有 main+0x1bab754（工作循环）；
-    // 不含它的就是主线程（或别的非常规线程），那条链要全量打印 —— 这才是
-    // 「游戏到底停在哪个函数」的答案。
+    if (za_sdk_base && pc >= za_sdk_base && pc < za_sdk_base + za_sdk_size) {
+        ZLOGI("      %s=sdk+%#llx", what, pc - za_sdk_base);
+        return 1;
+    }
+    ZLOGI("      %s=%#llx", what, pc);
+    return 0;
+}
+
+static int za_sync_in_image(unsigned long long x)
+{
+    extern unsigned char *za_guest_base;
+    unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+    if (x >= mb && x < mb + ZA_IMAGE_SIZE) return 1;
+    if (za_sdk_base && x >= za_sdk_base && x < za_sdk_base + za_sdk_size) return 1;
+    return 0;
+}
+
+// 扫栈（**只作兜底**）：从 sp 往上找前若干个落在映像内的字。
+// ★ 这是启发式：映像内的数据指针也会命中，曾经两次把非调用点当成帧
+//   （main+0x1738a18 / main+0x173a01c 都被反汇编证伪）。有 fp 时不要用。
+static int za_scan_words = 2048;
+static void za_sync_scan_chain(unsigned long long sp, const char *why)
+{
+    extern unsigned char *za_guest_base;
+    unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
     unsigned long long v[24];
     int kind[24];   // 1 = main, 2 = sdk
     int n = 0, is_worker = 0;
@@ -88,10 +104,172 @@ static void za_sync_dump_guest_chain(unsigned long long sp, unsigned long long p
         }
     }
     int show = is_worker ? (n < 6 ? n : 6) : n;
-    if (!is_worker) ZLOGI("      ★ 非工作线程（链中无 0x1bab754 / 0x1bac54c）——全量 %d 帧：", n);
+    if (!is_worker) ZLOGI("      ★ 扫栈兜底（%s）——结果不可信，仅供参考：%d 帧", why, show);
     for (int i = 0; i < show; i++)
         ZLOGI("        %s%#llx", kind[i] == 1 ? "main+" : "sdk+", v[i]);
 }
+
+// ── 不依赖 svc 门的 x29 链重建 ─────────────────────────────────────────
+// 主线程的门没有把 x29 存进槽位（实测它的 sp/x30/x29 读出来全是 0），
+// 所以只能在它的栈区里**反向**把链拼回来：
+//   ① 扫栈，收集所有「像一帧」的候选：W 处 [W]=下一帧 fp、[W+8]=返回地址，
+//      且下一帧 fp > W（ARM64 栈向低地址增长，帧指针向高地址走）。
+//   ② 把候选按「下一帧 fp」首尾相接串成链；只认**接得最长**的那条。
+//   ③ 用线程入口校验：18 条工作线程的链尾都是 sdk+0xc90a50，主线程同一入口。
+// 这比「把所有像代码地址的字当返回地址」强得多：后者会命中映像内的数据指针。
+#define ZA_CAND_MAX 512
+typedef struct { unsigned long long fp, lr, next; } za_cand_t;
+static za_cand_t za_cands[ZA_CAND_MAX];
+
+static void za_sync_recover_chain(unsigned long long lo, unsigned long long hi)
+{
+    // 按 4KB 分块读，避免 8 字节一次 readv 的上万次系统调用
+    static unsigned char buf[4096 + 8];
+    int n = 0;
+    for (unsigned long long a = lo; a < hi && n < ZA_CAND_MAX; ) {
+        size_t len = (size_t)((hi - a) < 4096 ? (hi - a) : 4096);
+        if (!za_sync_read(buf, a, len)) { a += 4096; continue; }
+        for (size_t o = 0; o + 16 <= len && n < ZA_CAND_MAX; o += 8) {
+            unsigned long long fp = a + o;
+            unsigned long long next, lr;
+            memcpy(&next, buf + o, 8);
+            memcpy(&lr, buf + o + 8, 8);
+            if (!za_sync_in_image(lr)) continue;
+            if (next <= fp) continue;
+            if (next - fp > 0x100000ull) continue;
+            za_cands[n].fp = fp;
+            za_cands[n].lr = lr;
+            za_cands[n].next = next;
+            n++;
+        }
+        a += len;
+    }
+    if (!n) { ZLOGI("      （反向重建：栈区里没有任何合法帧）"); return; }
+
+    // 链：从某帧出发，反复找「fp == 当前帧的 next」的那一帧
+    int best = -1, bestlen = 0;
+    unsigned long long entry_lr = za_sdk_base ? za_sdk_base + 0xc90a50ull : 0;
+    for (int i = 0; i < n; i++) {
+        int cur = i, len = 1;
+        unsigned long long outer_lr = za_cands[i].lr;
+        for (int k = 0; k < 40; k++) {
+            int j = -1;
+            for (int t = 0; t < n; t++)
+                if (za_cands[t].fp == za_cands[cur].next) { j = t; break; }
+            if (j < 0) break;
+            cur = j; len++;
+            outer_lr = za_cands[cur].lr;
+        }
+        // 命中线程入口的链优先级最高
+        int hit_entry = (entry_lr && outer_lr == entry_lr);
+        if (hit_entry && bestlen < 1000) { best = i; bestlen = 1000 + len; continue; }
+        if (bestlen < 1000 && len > bestlen) { best = i; bestlen = len; }
+    }
+    if (best < 0) { ZLOGI("      （反向重建：链都没接上）"); return; }
+    int real_len = bestlen >= 1000 ? bestlen - 1000 : bestlen;
+    ZLOGI("      ★ 反向 fp 链（%s，共 %d 帧）：",
+          bestlen >= 1000 ? "已与线程入口 sdk+0xc90a50 对齐" : "未命中入口，仅按最长链接",
+          real_len);
+    {
+        extern unsigned char *za_guest_base;
+        unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+        int cur = best;
+        for (int k = 0; k < real_len && k < 40; k++) {
+            unsigned long long lr = za_cands[cur].lr;
+            if (lr >= mb && lr < mb + ZA_IMAGE_SIZE)
+                ZLOGI("        [%d] fp=%#llx lr=main+%#llx", k, za_cands[cur].fp, lr - mb);
+            else
+                ZLOGI("        [%d] fp=%#llx lr=sdk+%#llx", k, za_cands[cur].fp, lr - za_sdk_base);
+            int j = -1;
+            for (int t = 0; t < n; t++)
+                if (za_cands[t].fp == za_cands[cur].next) { j = t; break; }
+            if (j < 0) break;
+            cur = j;
+        }
+    }
+    // 帧内容：每帧 prologue 都会把 callee-saved 寄存器（x19/x20/…）压进帧里。
+    // 把帧底往下 0x40 字节的**指针**挑出来打印 —— 主线程等的那个对象
+    // （`[self+0x158]` 状态机）就在其中某个 x19/x20 槽里。
+    {
+        extern unsigned char *za_guest_base;
+        unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+        ZLOGI("      ★ 帧内指针（x19/x20… 的溢出槽，找等待对象用）：");
+        int cur2 = best;
+        for (int k = 0; k < real_len && k < 10; k++) {
+            unsigned long long fp = za_cands[cur2].fp;
+            unsigned long long w[8];
+            if (fp < 0x60 || !za_sync_read(w, fp - 0x40, sizeof w)) {
+                /* 跳过 */
+            } else {
+                for (int t = 0; t < 8; t++) {
+                    unsigned long long x = w[t];
+                    if (!x) continue;
+                    int is_code = za_sync_in_image(x);
+                    int is_heap = (x >> 40) == 0xb40000ull;
+                    if (!is_code && !is_heap) continue;
+                    ZLOGI("        [%d] fp%+#x = %#llx%s", k, t * 8 - 0x40, x,
+                          is_code ? "（代码）" : "（客机堆）");
+                }
+            }
+            int j = -1;
+            for (int t = 0; t < n; t++)
+                if (za_cands[t].fp == za_cands[cur2].next) { j = t; break; }
+            if (j < 0) break;
+            cur2 = j;
+        }
+    }
+}
+
+// 沿 x29 帧指针链回溯。ARM64 标准帧布局：
+//     [fp + 0] = 调用者的 fp
+//     [fp + 8] = 返回地址（本函数的 lr）
+// 门桩把 svc 那一刻的客机 x29 存进 regs[17]，所以起点是**真实的帧指针**。
+// 停止条件：fp 未对齐 / 不可读 / 不递增 / 跨度异常 / 该帧的 lr 不在映像内。
+static void za_sync_dump_guest_chain(unsigned long long fp, unsigned long long sp,
+                                     unsigned long long pc)
+{
+    if (pc) za_sync_print_addr("客机等待点 x30", pc);
+    if (!fp) {
+        ZLOGI("      （没有 fp：退回扫栈）");
+        if (sp) za_sync_scan_chain(sp, "无 fp");
+        return;
+    }
+    unsigned long long cur = fp, prev = 0;
+    int i, stop = 0, printed = 0;
+    for (i = 0; i < 32; i++) {
+        if (!cur || (cur & 7u)) { stop = 1; break; }               // 未对齐
+        unsigned long long hdr[2] = { 0, 0 };
+        if (!za_sync_read(hdr, cur, sizeof hdr)) { stop = 2; break; }  // 不可读
+        unsigned long long next = hdr[0], lr = hdr[1];
+        int in_img = za_sync_in_image(lr);
+        if (in_img) {
+            extern unsigned char *za_guest_base;
+            unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+            if (lr >= mb && lr < mb + ZA_IMAGE_SIZE)
+                ZLOGI("        [%d] fp=%#llx lr=main+%#llx", i, cur, lr - mb);
+            else
+                ZLOGI("        [%d] fp=%#llx lr=sdk+%#llx", i, cur, lr - za_sdk_base);
+            printed++;
+        } else {
+            ZLOGI("        [%d] fp=%#llx lr=%#llx（不在映像内，链在此断）", i, cur, lr);
+            stop = 5;
+            break;
+        }
+        // 只有当前帧的 lr 合法才继续往上走
+        if (next <= cur) { stop = 3; break; }                     // 必须向高地址
+        if (next - cur > 0x100000ull) { stop = 4; break; }        // 跨度异常
+        prev = cur;
+        cur = next;
+    }
+    if (!printed) {
+        ZLOGI("      （fp 链解不动：fp=%#llx stop=%d）→ 退回扫栈", fp, stop);
+        if (sp) za_sync_scan_chain(sp, "fp 链失败");
+    } else {
+        ZLOGI("      ↑ fp 链共 %d 帧（stop=%d，起点 fp=%#llx，末帧 fp=%#llx）",
+              printed, stop, fp, prev ? prev : fp);
+    }
+}
+
 
 // za_horizon.c：按 tid 倒出 svc 环形记录（阻塞中的那条 ret 是哨兵 0xdead）
 void za_dump_ret_ring_for(long tid);
@@ -119,6 +297,7 @@ typedef struct {
     unsigned long long key;       // 条件键地址
     unsigned int tag;             // 我的 tag
     unsigned long long gsp, gpc;  // 进 svc#28 时的客机 sp / x30（等待点调用链用）
+    unsigned long long gfp;       // 进 svc#28 时的客机 x29（真正的帧指针）
 } zs_slot_t;
 
 static zs_slot_t zs_slots[ZS_MAX];
@@ -421,7 +600,8 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
 // 这条路径以前完全在表外 —— 真机实测卡住时有线程睡在这里，而看门狗只看到
 // 「0 个/1 个线程」，伪唤醒打不到它。
 void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int type,
-                            unsigned long long sp, unsigned long long pc)
+                            unsigned long long sp, unsigned long long pc,
+                            unsigned long long fp)
 {
     zs_slot_t *w = zs_self();
     if (!w) return;
@@ -431,6 +611,7 @@ void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int typ
     w->tag = (unsigned int)value;
     w->gsp = sp;   // ★ 真正的客机 sp（以前这里存的是 type，导致扫栈永远 0 帧）
     w->gpc = pc;   // 调用方客机 pc：谁在等这个地址
+    w->gfp = fp;   // 调用方 x29：fp 链回溯的起点
     __atomic_store_n(&w->granted, 0, __ATOMIC_RELEASE);
 }
 
@@ -441,11 +622,13 @@ void za_sync_addr_wait_done(void)
     if (w->kind == 3) w->kind = 0;
 }
 
-void za_sync_note_guest(unsigned long long sp, unsigned long long pc)
+void za_sync_note_guest(unsigned long long sp, unsigned long long pc,
+                        unsigned long long fp)
 {
     zs_slot_t *w = zs_self();
     w->gsp = sp;
     w->gpc = pc;
+    w->gfp = fp;
 }
 
 void za_sync_dump_chain_for(long tid)
@@ -455,21 +638,57 @@ void za_sync_dump_chain_for(long tid)
     for (int i = 0; i < ZS_MAX; i++)
         if (__atomic_load_n(&zs_slots[i].tid, __ATOMIC_RELAXED) == tid) { w = &zs_slots[i]; break; }
     unsigned long long sp = w ? w->gsp : 0, pc = w ? w->gpc : 0;
+    unsigned long long fp = w ? w->gfp : 0;
     int kind = w ? w->kind : 0;
     zs_unlock();
-    ZLOGI("      主线程链（tid=%ld kind=%d sp=%#llx）：", tid, kind, sp);
-    if (!sp) {
-        // 主线程走的是另一条 svc 门，没记录客机 sp ⇒ 改用已登记的栈区间
-        // 从栈顶向下找（返回地址总在栈顶附近）。
+    ZLOGI("      主线程链（tid=%ld kind=%d sp=%#llx fp=%#llx）：", tid, kind, sp, fp);
+    // 没有 fp（主线程的门不写槽）：在它自己的栈区里反向重建 x29 链。
+    if (!fp) {
         extern const za_stack_region_t *za_stack_find(long tid);
         const za_stack_region_t *sr = za_stack_find(tid);
         if (sr && sr->hi > sr->lo) {
-            sp = (unsigned long long)sr->hi - 0x100000;   // 栈顶向下 1MB
-            za_scan_words = 131072;             // 512KB
-            ZLOGI("      （sp 未记录，整段扫栈 [%#lx,%#lx)）", sr->lo, sr->hi);
+            ZLOGI("      （无 fp ⇒ 反向重建栈区 [%#lx,%#lx)）", sr->lo, sr->hi);
+            za_sync_recover_chain((unsigned long long)sr->lo, (unsigned long long)sr->hi);
+        } else {
+            ZLOGI("      （无 fp，且找不到栈区）");
         }
     }
-    if (sp) za_sync_dump_guest_chain(sp, pc);
+    if (pc) za_sync_print_addr("客机等待点 x30", pc);
+    if (fp) za_sync_dump_guest_chain(fp, sp, 0);
+}
+
+// 找出「谁还可能握着这个地址」：扫描所有已登记客机线程的栈，
+// 看哪条栈上出现过该锁地址。持有者一定在某个 callee-saved 寄存器
+// （x19..x28）里拿着它，而它们在 prologue 里都会被溢出到帧内。
+void za_sync_scan_for_addr(unsigned long long val)
+{
+    if (!val) return;
+    int hits = 0;
+    for (int i = 0; i < ZS_MAX; i++) {
+        long t = __atomic_load_n(&zs_slots[i].tid, __ATOMIC_RELAXED);
+        if (!t) continue;
+        const za_stack_region_t *sr = za_stack_find(t);
+        if (!sr || sr->hi <= sr->lo) continue;
+        unsigned long long hi = (unsigned long long)sr->hi;
+        unsigned long long lo = hi - 0x40000ull;      // 栈顶 256KB
+        if (lo < (unsigned long long)sr->lo) lo = (unsigned long long)sr->lo;
+        static unsigned char b2[4096 + 8];
+        for (unsigned long long a = lo; a < hi; ) {
+            size_t len = (size_t)((hi - a) < 4096 ? (hi - a) : 4096);
+            if (!za_sync_read(b2, a, len)) { a += 4096; continue; }
+            for (size_t o = 0; o + 8 <= len; o += 8) {
+                unsigned long long x;
+                memcpy(&x, b2 + o, 8);
+                if (x == val) {
+                    ZLOGI("      ↳ tid=%ld 栈上出现该锁地址（%#llx，距栈顶 %+#llx）",
+                          t, a + o, (unsigned long long)(a + o) - hi);
+                    hits++;
+                }
+            }
+            a += len;
+        }
+    }
+    ZLOGI("      ↳ 全线程栈扫描：%d 处命中", hits);
 }
 
 void za_sync_dump(void)
@@ -478,7 +697,7 @@ void za_sync_dump(void)
     int kind[ZS_MAX], granted[ZS_MAX];
     unsigned long long addr[ZS_MAX], key[ZS_MAX];
     unsigned int tag[ZS_MAX], word[ZS_MAX];
-    unsigned long long gsp[ZS_MAX], gpc[ZS_MAX];
+    unsigned long long gsp[ZS_MAX], gpc[ZS_MAX], gfp[ZS_MAX];
     int n = 0;
     zs_lock();
     for (int i = 0; i < ZS_MAX; i++) {
@@ -490,9 +709,14 @@ void za_sync_dump(void)
         addr[n] = zs_slots[i].addr;
         key[n] = zs_slots[i].key;
         tag[n] = zs_slots[i].tag;
-        word[n] = addr[n] ? __atomic_load_n((unsigned int *)(uintptr_t)addr[n], __ATOMIC_RELAXED) : 0;
+        word[n] = 0;
+        if (addr[n]) {
+            unsigned int wv = 0;
+            if (za_sync_read(&wv, addr[n], 4)) word[n] = wv;
+        }
         gsp[n] = zs_slots[i].gsp;
         gpc[n] = zs_slots[i].gpc;
+        gfp[n] = zs_slots[i].gfp;
         n++;
     }
     zs_unlock();
@@ -502,9 +726,11 @@ void za_sync_dump(void)
         ZLOGI("    tid=%ld kind=%d granted=%d lock=%#llx(word=%#x) key=%#llx tag=%#x pc=%#llx",
               tid[i], kind[i], granted[i], addr[i], word[i], key[i], tag[i], gpc[i]);
         if (kind[i] != 2 || i < 6) za_dump_ret_ring_for(tid[i]);   // 它最后几条 svc
-        // 客机侧调用链：x30 + 从 sp 往上扫到的前 4 个映像内返回地址
-        if (kind[i] != 2 && i < 8 && gsp[i]) za_sync_dump_guest_chain(gsp[i], gpc[i]);
-        else if (kind[i] == 2 && i < 4 && gsp[i]) za_sync_dump_guest_chain(gsp[i], gpc[i]);
+        // 客机侧调用链：x30 + 沿 x29 链逐帧回溯（无 fp 时才退回扫栈）
+        if (kind[i] != 2 && i < 8 && (gfp[i] || gsp[i]))
+            za_sync_dump_guest_chain(gfp[i], gsp[i], gpc[i]);
+        else if (kind[i] == 2 && i < 4 && (gfp[i] || gsp[i]))
+            za_sync_dump_guest_chain(gfp[i], gsp[i], gpc[i]);
         // ★ 锁对象前后的内存：nn::os 的 EventType 是「若干状态字节 + 计数器 +
         //   临界区 + 两个条件变量」，cs/cv 的相对位置固定。把它打出来才能找到
         //   `signaled` 那一字节 —— 如果它一直是 0，就说明游戏在等一个
