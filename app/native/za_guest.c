@@ -3464,8 +3464,9 @@ static void *za_sampler_watchdog(void *arg)
                     // 主线程最近 24 次 svc：它才是「游戏卡在哪」的直接答案。
                     {
                         extern void za_dump_all_ret_rings(void);
-                        ZLOGE("★ 各线程最近 svc：");
-                        za_dump_all_ret_rings();
+                        extern void za_dump_ret_ring_for(long tid);
+                        ZLOGE("★ 主线程(tid=%ld)最近 svc：", za_guest_tid);
+                        za_dump_ret_ring_for(za_guest_tid);
                     }
                     za_nvn_dump_recent();   // 带客机 LR：最后几步 NVN 调用发生在哪
                 }
