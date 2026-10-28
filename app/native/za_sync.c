@@ -507,7 +507,17 @@ unsigned za_sync_poke_all(void)
             continue;
         }
         if (w->kind != 2) continue;
-        if (w->key) __atomic_store_n((unsigned int *)(uintptr_t)w->key, 1u, __ATOMIC_RELEASE);
+        // ★ 伪唤醒也要**递减等待者计数**：以前这里只把 kind 清 0 并往 *cv 写 1，
+        //   而退出路径靠 `kind == 2` 判断要不要减 —— 被 poke 过的槽位从此不再递减，
+        //   *cv 只增不减。SDK 的 SignalConditionVariable 先读 *cv 决定要不要发
+        //   svc#29，计数虚高会让它一直以为「还有人在等」，而真正的等待者已经
+        //   被我们自己唤醒过一轮 ⇒ 主线程等的那个键永远等不到有效信号。
+        if (w->key) {
+            unsigned int *cv = (unsigned int *)(uintptr_t)w->key;
+            unsigned int cur = __atomic_load_n(cv, __ATOMIC_RELAXED);
+            while (cur && !__atomic_compare_exchange_n(cv, &cur, cur - 1, 0,
+                                                       __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) { }
+        }
         w->kind = 0;
         zs_acquire_for_locked(w, w->addr, w->tag);
         n++;
