@@ -2096,7 +2096,7 @@ void za_os_install_tls_descriptor(void)
     //   所以逐页往上找空位（找不到就退回任意地址并明确报出来）。
     // ★ 每线程块 = [头页 D(4KB)] [TLS 变量区 A(4MB)] [RO 页 ...]
     //   [TP+0x40] = D；D+0x98 = (A-D)/8 ⇒ helper 的 `ldr; add` 自然算出 A。
-    size_t area = 4 * 1024 * 1024 + 0x1000;
+    size_t area = 4 * 1024 * 1024 + 0x1000 + 0x100000;   // 多留 1MB 给下面的 id 偏移
     void *t = MAP_FAILED;
     for (unsigned long k = 0x8000; k <= 0x400000; k += 0x4000)
     {
@@ -2112,6 +2112,29 @@ void za_os_install_tls_descriptor(void)
               (long long)((unsigned long)(uintptr_t)t - b16));
     }
     memset(t, 0, area);
+    // ★★ 2026-10-28 根因修复：**每线程唯一 id**。
+    //   客机用手写自旋锁，所有者判定是
+    //       ubfx w24, TPIDR_EL0, #13, #7      ; id = (TLS >> 13) & 0x7f
+    //       ldrb w8, [obj, #0xa] ; cmp w8, #0x5f ; cmp w8, w24
+    //   见 main+0xd84490（真机反汇编）。也就是说线程 id 只能取 7 位，
+    //   而 0x5f('_') 被占用作「已锁」哨兵。
+    //   我们的 TLS 区域原来总是落在 b16+0x8000 附近、彼此又按 4MB 间隔
+    //   （4MB/8KB = 0x200，&0x7f 后完全抵消）⇒ **多条线程算出同一个 id**，
+    //   实测撞车：0x12/0x1a/0x4d 各出现两次，甚至有一条算出 0x5f。
+    //   id 撞车 ⇒ 「这把锁是不是我持有的」判定错 ⇒ 锁永远解不开、全体停等。
+    //   办法：把整块布局在 1MB 窗口内平移，强制 id 等于本线程的唯一槽号。
+    {
+        static volatile unsigned za_tls_slot;
+        unsigned slot = __atomic_fetch_add(&za_tls_slot, 1, __ATOMIC_RELAXED);
+        slot = slot % 0x7eu;                 // 1..=0x7e
+        slot += 1;
+        if (slot >= 0x5fu) slot += 1;        // 跳过 0x5f（'_' 哨兵）→ 最大 0x7f
+        unsigned long id0 = ((unsigned long)(uintptr_t)t >> 13) & 0x7fu;
+        unsigned long delta = ((slot - id0) & 0x7fu) * 0x2000ul;
+        t = (void *)((char *)t + delta);
+        ZLOGI("客机 TLS id 分配: tid=%ld slot=%#x（(A>>13)&0x7f 将等于该值）",
+              (long)syscall(SYS_gettid), slot);
+    }
     za_tls_state_t *st = za_tls_cur();
     st->tp16 = (unsigned long)b16;      // 仅诊断：不要拿它去读写内存
     st->tp = b;
@@ -2204,6 +2227,18 @@ void za_os_install_tls_descriptor(void)
         if (rd) memcpy(&slot, (void *)(uintptr_t)(rd + 0x98), 8);
         ZLOGI("客机 TLS 自检: [TP+0x40]=%#llx（应=%p） slot=%#llx ⇒ A=%#llx（应=%p）",
               rd, (void *)hdr, slot, rd + slot * 8, (void *)area_p);
+        // ★ 2026-10-28：主线程链里的 main+0xd84490 用
+        //     ubfx w24, TPIDR_EL0, #13, #7   ⇒ 线程 id = (TP>>13)&0x7f
+        //   做一把以 0x5f('_') 为哨兵的用户态自旋锁的**所有者判定**。
+        //   两条线程算出同一个 id 就会互相把对方当成「自己」或永远等不到，
+        //   所以这里把 id 打出来查重。
+        ZLOGI("线程 id 采样: tid=%ld  id(b)=%#lx id(hdr)=%#lx id(A)=%#lx"
+              "  (b=%#lx hdr=%#lx A=%#lx)",
+              (long)syscall(SYS_gettid),
+              (unsigned long)(((unsigned long)b >> 13) & 0x7f),
+              (unsigned long)(((unsigned long)hdr >> 13) & 0x7f),
+              (unsigned long)(((unsigned long)area_p >> 13) & 0x7f),
+              (unsigned long)b, (unsigned long)hdr, (unsigned long)area_p);
     }
     ZLOGI("客机 TLS: tp=%p 变量区=%p RO页=%p", b, t, st->ro);
 
