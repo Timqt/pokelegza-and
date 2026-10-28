@@ -591,6 +591,22 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
         }
     }
     zs_unlock();
+    // ★★ 2026-10-28：Horizon 的 WaitProcessWideKeyAtomic **返回时互斥已重新持有**。
+    //   内核在唤醒等待者的同时把 `tag` 写回锁字（这正是 tag 的用途）。
+    //   以前这里只把自己从等待表摘掉就 return 0 ⇒ SDK 以为还拿着锁，而锁字
+    //   实际是 0（空闲），别的线程可以抢走；随后本线程 Unlock 会写坏一把
+    //   不属于自己的锁 —— 表现为锁字在 0/1 之间乱跳、所有人互相等。
+    if (lock) {
+        for (int spin = 0; spin < 400; spin++) {
+            unsigned int expect = 0;
+            if (__atomic_compare_exchange_n(lock, &expect, tag, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+                break;                                   // 取到了
+            if ((expect & ~ZA_WAITERS_BIT) == tag) break; // 本来就是我的
+            struct timespec tv = { 0, 2000000 };          // 2ms
+            syscall(SYS_futex, (int *)lock, FUTEX_WAIT_PRIVATE, expect, &tv, NULL, 0);
+        }
+    }
     return 0;
 }
 
