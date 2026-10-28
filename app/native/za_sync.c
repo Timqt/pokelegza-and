@@ -42,6 +42,7 @@
 #include <sys/uio.h>
 
 #include "za_common.h"
+#include "za_guest_api.h"
 #include "za_sync.h"
 #include "za_guest_info.h"
 
@@ -58,6 +59,7 @@ static int za_sync_read(void *dst, unsigned long long addr, size_t len)
 // 从客机 sp 往上扫，打印前 4 个落在 main/sdk 映像里的返回地址。
 // 这是「主线程到底卡在哪个游戏函数」最直接的证据：x29 我们拿不到
 // （svc 门只存 x8..x18/x30），但帧里的返回地址一定在栈上。
+static int za_scan_words = 2048;
 static void za_sync_dump_guest_chain(unsigned long long sp, unsigned long long pc)
 {
     extern unsigned char *za_guest_base;
@@ -75,7 +77,7 @@ static void za_sync_dump_guest_chain(unsigned long long sp, unsigned long long p
     unsigned long long v[24];
     int kind[24];   // 1 = main, 2 = sdk
     int n = 0, is_worker = 0;
-    for (int k = 0; k < 2048 && n < 24; k++) {
+    for (int k = 0; k < za_scan_words && n < 24; k++) {
         unsigned long long x = 0;
         if (!za_sync_read(&x, sp + (unsigned long)k * 8, 8)) break;
         if (x >= mb && x < mb + ZA_IMAGE_SIZE) {
@@ -456,6 +458,17 @@ void za_sync_dump_chain_for(long tid)
     int kind = w ? w->kind : 0;
     zs_unlock();
     ZLOGI("      主线程链（tid=%ld kind=%d sp=%#llx）：", tid, kind, sp);
+    if (!sp) {
+        // 主线程走的是另一条 svc 门，没记录客机 sp ⇒ 改用已登记的栈区间
+        // 从栈顶向下找（返回地址总在栈顶附近）。
+        extern const za_stack_region_t *za_stack_find(long tid);
+        const za_stack_region_t *sr = za_stack_find(tid);
+        if (sr && sr->hi > sr->lo) {
+            sp = (unsigned long long)sr->hi - 0x100000;   // 栈顶向下 1MB
+            za_scan_words = 131072;             // 512KB
+            ZLOGI("      （sp 未记录，整段扫栈 [%#lx,%#lx)）", sr->lo, sr->hi);
+        }
+    }
     if (sp) za_sync_dump_guest_chain(sp, pc);
 }
 
