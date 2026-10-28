@@ -3078,8 +3078,7 @@ static void za_hook_m_jobwait(unsigned long long *r);
 static void za_hook_m_jobsubmit(unsigned long long *r);
 static void za_hook_m_jobdispatch(unsigned long long *r);
 static void za_hook_m_jobpost(unsigned long long *r);
-static void za_hook_m_dequeue(unsigned long long *r);
-static void za_hook_m_enq2(unsigned long long *r);
+static void za_hook_m_dequeue(unsigned long long *r);static void za_hook_m_enq2(unsigned long long *r);
 static void za_hook_m_enq3(unsigned long long *r);
 static void za_hook_m_jobenqueue(unsigned long long *r);
 static void za_hook_m_openfile(unsigned long long *r);
@@ -3459,6 +3458,13 @@ static volatile unsigned long long za_job_caller[ZA_JOBRING];
 static volatile unsigned za_job_pos;
 // 按线程记「正在等哪个任务对象」（共享环形会被别的线程覆盖）。
 volatile unsigned long long za_job_by_tid[64];
+// 入队探针（main+0x16ffeb0）记录的「被入队的队列对象」与累计次数，
+// 以及 worker 侧最近一次出队轮询的对象 —— 停摆时两者对照即可区分
+// 「任务没进这个队列」和「进了但没人取」。
+volatile unsigned long long za_enq_queue;
+volatile unsigned long long za_enq_count;
+volatile unsigned long long za_worker_obj;
+volatile unsigned long long za_worker_polls;
 
 // 停摆时做一次（仅一次）：在客机堆里搜主线程等的那个任务对象。
 //   找得到 ⇒ 它确实被挂进了某个队列（该队列的 worker 才是该被唤醒的人）；
@@ -3513,6 +3519,24 @@ void za_dump_progress_stall(void)
     za_sample_all_threads();
     { struct timespec t = { 0, 40 * 1000 * 1000 }; nanosleep(&t, NULL); }
     ZLOGE("★ 10 秒无 NVN 进展快照（svc 在涨 ⇒ 客机在自旋）：");
+    {
+        extern volatile unsigned long long za_enq_queue, za_enq_count;
+        unsigned long long q = za_enq_queue;
+        ZLOGE("★ 任务队列 %#llx（累计入队 %llu 次）：", q, (unsigned long long)za_enq_count);
+        if (ZA_PTR_OK(q)) {
+            unsigned long long v[8];
+            memcpy(v, (const void *)(uintptr_t)(q + 0xe0), sizeof v);
+            ZLOGE("   +0xe0: %#llx %#llx %#llx %#llx", v[0], v[1], v[2], v[3]);
+            ZLOGE("   +0x100: %#llx %#llx %#llx %#llx", v[4], v[5], v[6], v[7]);
+            memcpy(v, (const void *)(uintptr_t)(q + 0x60), sizeof v);
+            ZLOGE("   +0x60: %#llx %#llx %#llx %#llx %#llx %#llx %#llx %#llx",
+                  v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7]);
+            for (unsigned long long off = 0x2f0; off <= 0x300; off += 0x10) {
+                memcpy(v, (const void *)(uintptr_t)(q + off), 16);
+                ZLOGE("   +%#llx: %#llx %#llx", off, v[0], v[1]);
+            }
+        }
+    }
     za_dump_task_stats();
     {
         extern void za_sync_dump_top_spinner(void);
@@ -3764,8 +3788,15 @@ static void za_hook_m_enq2(unsigned long long *r)
           disp, vt, tgt, (long)syscall(SYS_gettid));
 }
 
+// 最近一次真正入队的队列对象（停摆时装它的内部状态用）。
+// 主线程把 16 个任务「入队」后，worker 却一直报队列数 0 —— 到底是
+// ① 任务没进这个队列，还是 ② 进了但没人取，看这几个字段就能分辨。
+// （变量本体定义在 za_job_by_tid 旁边，供停摆快照跨函数读取。）
+
 static void za_hook_m_enq3(unsigned long long *r)
 {
+    za_enq_queue = r[0];
+    __atomic_add_fetch(&za_enq_count, 1, __ATOMIC_RELAXED);
     static int n;
     if (n++ >= 8) return;
     ZLOGI("★ 真正入队 0x16ffeb0: x0=%#llx x1=%#llx x2=%#llx", r[0], r[1], r[2]);
@@ -3795,6 +3826,8 @@ static void za_hook_m_dequeue(unsigned long long *r)
     unsigned long long k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
     unsigned long long o = r[0];
     unsigned int cnt = 0, cnt2 = 0;
+    za_worker_obj = o;
+    __atomic_store_n(&za_worker_polls, k, __ATOMIC_RELAXED);
     if (ZA_PTR_OK(o)) {
         memcpy(&cnt, (const void *)(uintptr_t)(o + 0x2f8), 4);
         memcpy(&cnt2, (const void *)(uintptr_t)(o + 0x330), 4);
