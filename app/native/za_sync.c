@@ -419,7 +419,7 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
 // 这条路径以前完全在表外 —— 真机实测卡住时有线程睡在这里，而看门狗只看到
 // 「0 个/1 个线程」，伪唤醒打不到它。
 void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int type,
-                            unsigned long long pc)
+                            unsigned long long sp, unsigned long long pc)
 {
     zs_slot_t *w = zs_self();
     if (!w) return;
@@ -427,7 +427,7 @@ void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int typ
     w->addr = addr;
     w->key = 0;
     w->tag = (unsigned int)value;
-    w->gsp = (unsigned long long)type;
+    w->gsp = sp;   // ★ 真正的客机 sp（以前这里存的是 type，导致扫栈永远 0 帧）
     w->gpc = pc;   // 调用方客机 pc：谁在等这个地址
     __atomic_store_n(&w->granted, 0, __ATOMIC_RELEASE);
 }
@@ -475,9 +475,10 @@ void za_sync_dump(void)
     {
         ZLOGI("    tid=%ld kind=%d granted=%d lock=%#llx(word=%#x) key=%#llx tag=%#x pc=%#llx",
               tid[i], kind[i], granted[i], addr[i], word[i], key[i], tag[i], gpc[i]);
-        if (kind[i] == 2) za_dump_ret_ring_for(tid[i]);   // 它最后几条 svc
+        if (kind[i] != 2 || i < 6) za_dump_ret_ring_for(tid[i]);   // 它最后几条 svc
         // 客机侧调用链：x30 + 从 sp 往上扫到的前 4 个映像内返回地址
-        if (kind[i] == 2 && i < 4 && gsp[i]) za_sync_dump_guest_chain(gsp[i], gpc[i]);
+        if (kind[i] != 2 && i < 8 && gsp[i]) za_sync_dump_guest_chain(gsp[i], gpc[i]);
+        else if (kind[i] == 2 && i < 4 && gsp[i]) za_sync_dump_guest_chain(gsp[i], gpc[i]);
         // ★ 锁对象前后的内存：nn::os 的 EventType 是「若干状态字节 + 计数器 +
         //   临界区 + 两个条件变量」，cs/cv 的相对位置固定。把它打出来才能找到
         //   `signaled` 那一字节 —— 如果它一直是 0，就说明游戏在等一个

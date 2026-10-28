@@ -20,7 +20,7 @@ unsigned za_sync_poke_all(void);
 // 记录进 svc#28 时的客机 sp / x30（等待点调用链用）
 void za_sync_note_guest(unsigned long long sp, unsigned long long pc);
 void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int type,
-                            unsigned long long pc);
+                            unsigned long long sp, unsigned long long pc);
 void za_sync_addr_wait_done(void);
 
 // 打印等待表快照（诊断用）
