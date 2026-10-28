@@ -158,6 +158,16 @@ static int za_fatal_fd_cached = -1;
 static void za_fatal_write(const char *buf, size_t len)
 {
     ssize_t w0 = write(2, buf, len); (void)w0;          // 万一 fd 2 被接到 logcat
+    // ★ 安卓应用进程的 fd 2 是 /dev/null，/data/local/tmp 又常常因 SELinux 写不进去
+    //   ⇒ 致命现场曾经一条都没留下来（真机崩了但 logcat 里没有 FATAL-ENTER）。
+    //   再往 logd 写一份：__android_log_write 只做一次 socket 写，信号处理器里可用。
+    {
+        char tmp[400];
+        size_t n = len < sizeof tmp - 1 ? len : sizeof tmp - 1;
+        memcpy(tmp, buf, n);
+        tmp[n] = 0;
+        __android_log_write(ANDROID_LOG_ERROR, "ZaFatal", tmp);
+    }
     if (za_fatal_fd_cached < 0)
         za_fatal_fd_cached = open(ZA_FATAL_PATH, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
     if (za_fatal_fd_cached >= 0)
@@ -3619,6 +3629,12 @@ void za_dump_progress_stall(void)
         za_sync_dump_top_spinner();
     }
     za_sync_dump();
+    {
+        // 「worker 睡在键 K 上，有没有人 SignalProcessWideKey(K)」——
+        // 这是区分「没人发信号」与「发到了别的键」的唯一直接证据。
+        extern void za_sync_dump_key_stats(void);
+        za_sync_dump_key_stats();
+    }
     {
         unsigned long pos = za_pc_ring_pos;
         unsigned long n = pos < ZA_PC_RING ? pos : ZA_PC_RING;

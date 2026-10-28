@@ -312,6 +312,9 @@ static void zs_lock(void)
 }
 static void zs_unlock(void) { __atomic_store_n(&zs_spin, 0u, __ATOMIC_RELEASE); }
 
+// 键级统计（定义在文件后半，svc#1C/#1D 要用）
+static void zs_key_note(unsigned long long key, int is_sig);
+
 static zs_slot_t *zs_self(void)
 {
     long tid = (long)syscall(SYS_gettid);
@@ -550,6 +553,7 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
     //   用户态抢到锁、改完条件、读到键 0 就不唤醒，本线程随后挂上去永远等不到
     //   —— 这正是之前 15 条线程一起睡死的机制。
     __atomic_store_n(cond, 1u, __ATOMIC_RELEASE);
+    zs_key_note(key, 0);
     w->kind = 2;
     w->addr = addr;
     w->key = key;
@@ -872,6 +876,7 @@ unsigned long za_sync_signal_key(unsigned long long key, int count)
     zs_lock();
     // 照参考版（svc 0x1D）：按内核顺序挑 kind 2，唤醒并把锁交给它；
     // 已经没有 kind 2 等待者时把条件键清 0（SDK 靠它决定要不要发 signal）。
+    zs_key_note(key, 1);
     for (int n = 0; count <= 0 || n < count; n++) {
         zs_slot_t *w = zs_pick(2, key);
         if (!w) break;
@@ -999,6 +1004,41 @@ static void zs_sig_note(unsigned long long addr, int woke)
         if (s->addr == addr) { s->sig++; if (woke > 0) s->woke += (unsigned)woke; return; }
         if (!s->addr) { s->addr = addr; s->sig = 1; if (woke > 0) s->woke = (unsigned)woke; return; }
     }
+}
+
+// ── svc#28 / svc#29 的「键级」统计 ───────────────────────────────────
+// 回答「worker 睡在条件键 K 上，到底有没有人 SignalProcessWideKey(K)」。
+// 以前只有 svc#53（地址唤醒）有统计，svc#29 完全没有 ⇒ 无法区分
+// 「没人发信号」和「发到了别的键」。
+typedef struct {
+    unsigned long long key;
+    unsigned int waits, sigs;
+} zs_key_stat_t;
+#define ZS_KEYSTAT_N 48
+static zs_key_stat_t zs_key_stat[ZS_KEYSTAT_N];
+
+// 调用方必须持 zs_lock。
+static void zs_key_note(unsigned long long key, int is_sig)
+{
+    if (!key) return;
+    for (int i = 0; i < ZS_KEYSTAT_N; i++) {
+        zs_key_stat_t *s = &zs_key_stat[i];
+        if (s->key == key) { if (is_sig) s->sigs++; else s->waits++; return; }
+        if (!s->key) { s->key = key; if (is_sig) s->sigs = 1; else s->waits = 1; return; }
+    }
+}
+
+void za_sync_dump_key_stats(void)
+{
+    zs_lock();
+    int n = 0;
+    for (int i = 0; i < ZS_KEYSTAT_N; i++) if (zs_key_stat[i].key) n++;
+    ZLOGE("★ 条件变量键统计（%d 个）：键 / 等待 / 信号", n);
+    for (int i = 0; i < ZS_KEYSTAT_N; i++)
+        if (zs_key_stat[i].key)
+            ZLOGE("    %#llx  W=%u  S=%u%s", zs_key_stat[i].key, zs_key_stat[i].waits,
+                  zs_key_stat[i].sigs, zs_key_stat[i].sigs ? "" : "  ← 从没人发");
+    zs_unlock();
 }
 
 int za_sync_sig_stat(unsigned long long addr, unsigned int *sig, unsigned int *woke)
