@@ -3181,7 +3181,7 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd270ec, ZA_MPROBE_STUB + 0x380, ZA_MPROBE_SLOT + 0x38, za_hook_m_jobpost);
         za_install_main_probe(base, 0x1bab3a0, ZA_MPROBE_STUB + 0x400, ZA_MPROBE_SLOT + 0x40, za_hook_m_dequeue);
         za_install_main_probe(base, 0xd848fc, ZA_MPROBE_STUB + 0x480, ZA_MPROBE_SLOT + 0x48, za_hook_m_jobenqueue);
-        za_install_main_probe(base, 0x16ffd70, ZA_MPROBE_STUB + 0x500, ZA_MPROBE_SLOT + 0x50, za_hook_m_enq2);
+        za_install_main_probe(base, 0xd821a0, ZA_MPROBE_STUB + 0x500, ZA_MPROBE_SLOT + 0x50, za_hook_m_enq2);
         za_install_main_probe(base, 0x16ffeb0, ZA_MPROBE_STUB + 0x580, ZA_MPROBE_SLOT + 0x58, za_hook_m_enq3);
         // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
         //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
@@ -3688,10 +3688,17 @@ static void za_hook_m_enq2(unsigned long long *r)
 {
     static int n;
     if (n++ >= 8) return;
-    unsigned int flag = 0;
-    if (ZA_PTR_OK(r[0])) memcpy(&flag, (const void *)(uintptr_t)(r[0] + 0x120), 1);
-    ZLOGI("★ 提交 0x16ffd70: 队列=%#llx job+0x38=%#llx [+0x120]=%u tid=%ld",
-          r[0], r[1], flag, (long)syscall(SYS_gettid));
+    // 0xd821a0 入口：x0 是调度器/队列对象。探针桩只保存 x0..x17，
+    // 所以这里只能用 x0（x21 之类的 callee-saved 寄存器读不到）。
+    unsigned long long o = r[0];
+    unsigned long long arr = 0, cnt = 0, fast = 0;
+    if (ZA_PTR_OK(o)) {
+        memcpy(&arr,  (const void *)(uintptr_t)(o + 0x2d0), 8);
+        memcpy(&cnt,  (const void *)(uintptr_t)(o + 0x2f8), 8);
+        memcpy(&fast, (const void *)(uintptr_t)(o + 0x330), 8);
+    }
+    ZLOGI("★ 提交后 x21=%#llx 队列[+2d0]=%#llx [+2f8]=%llu [+330]=%llu tid=%ld",
+          o, arr, cnt, fast, (long)syscall(SYS_gettid));
 }
 
 static void za_hook_m_enq3(unsigned long long *r)
