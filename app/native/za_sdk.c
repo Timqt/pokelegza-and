@@ -162,8 +162,48 @@ static void za_hook_abort_entry(unsigned long long *r)
 // LockMutex / UnlockMutex 追踪：只盯出问题的那个队列锁（0x452000308）。
 // 目的：确认 worker 线程到底有没有真的锁上，以及谁把 owner/count 清掉了。
 #define ZA_TRACE_MUTEX 0x452000308ull
+// ★ 2026-10-28：改为**环形记录最近 64 次 lock/unlock**。
+//   停摆时倒出来就能直接回答「这把互斥是谁拿的、谁没还」——
+//   主线程卡在全局单例 main+0x4f0d700 的 [+0x228] 互斥上，锁字停在 1。
+#define ZA_MTRACE_N 64
+static struct {
+    unsigned long long m;
+    long tid;
+    unsigned int word;
+    unsigned char tag;      // 1 = lock, 2 = unlock
+} za_mtrace[ZA_MTRACE_N];
+static volatile unsigned za_mtrace_pos;
+
+static void za_mtrace_add(int tag, unsigned long long m, unsigned int word)
+{
+    unsigned i = __atomic_fetch_add(&za_mtrace_pos, 1, __ATOMIC_RELAXED);
+    unsigned k = i % ZA_MTRACE_N;
+    za_mtrace[k].m = m;
+    za_mtrace[k].tid = (long)syscall(SYS_gettid);
+    za_mtrace[k].word = word;
+    za_mtrace[k].tag = (unsigned char)tag;
+}
+
+void za_dump_mutex_trace(void)
+{
+    unsigned pos = __atomic_load_n(&za_mtrace_pos, __ATOMIC_RELAXED);
+    unsigned n = pos < ZA_MTRACE_N ? pos : ZA_MTRACE_N;
+    ZLOGE("★ 互斥 trace（最近 %u 次，L=lock U=unlock）：", n);
+    for (unsigned i = 0; i < n; i++) {
+        unsigned k = (pos - n + i) % ZA_MTRACE_N;
+        ZLOGE("    %s mutex=%#llx word=%#x tid=%ld",
+              za_mtrace[k].tag == 1 ? "L" : "U", za_mtrace[k].m,
+              za_mtrace[k].word, za_mtrace[k].tid);
+    }
+}
+
 static void za_trace_mutex(const char *tag, unsigned long long m)
 {
+    if (m) {
+        unsigned int w = 0;
+        memcpy(&w, (const void *)(uintptr_t)m, 4);
+        za_mtrace_add(tag[0] == 'l' ? 1 : 2, m, w);
+    }
     if (m != ZA_TRACE_MUTEX) return;
     unsigned int count = 0, recursive = 0;
     unsigned long long owner = 0;
@@ -189,6 +229,25 @@ static void za_probe_threadtype(const char *tag, unsigned long long t)
 static void za_hook_startthread(unsigned long long *r)   { za_probe_threadtype("os::StartThread", r[0]); }
 static void za_hook_startimpl(unsigned long long *r)     { za_probe_threadtype("Impl::StartThread", r[0]); }
 static void za_hook_lockmutex(unsigned long long *r)     { za_trace_mutex("lock", r[0]); }
+// sdk+0x13a5d0：nn::os 的慢路径互斥（主线程就卡在这条路径的
+// sdk+0x13a684 WaitForAddress 上）。x0 = 对象，锁字在 obj+0x20
+// （反汇编 `add x21,x20,#0x20`）。记 (对象, 锁字, tid, 调用者 x30)。
+static void za_hook_mutex_slow(unsigned long long *r)
+{
+    static int n;
+    if (n >= 32 && (n % 200) != 0) { n++; return; }
+    n++;
+    unsigned long long obj = r[0];
+    unsigned int word = 0, next = 0;
+    if (obj) {
+        memcpy(&word, (const void *)(uintptr_t)(obj + 0x20), 4);
+        memcpy(&next, (const void *)(uintptr_t)(obj + 0x28), 4);
+    }
+    ZLOGE("★ mutex-slow: obj=%#llx word(+0x20)=%#x next(+0x28)=%#x "
+          "tid=%ld caller=sdk+%#llx",
+          obj, word, next, (long)syscall(SYS_gettid),
+          (unsigned long long)(r[19] > 0x200000000ull ? r[19] - 0x200000000ull : r[19]));
+}
 // SDK 内部的「Result 检查器」：0x500180 `bl <fn>; cbnz w0, abort`。
 // 在 0x500194（cbnz 之前）探针，直接拿到失败的错误码。
 static void za_hook_rescheck(unsigned long long *r)
@@ -862,6 +921,8 @@ int za_sdk_load(za_mod_t *sdk,
         za_install_entry_probe(base, 0x145efc, 0xc90b80, 0xc90bf8, za_hook_csenter);
         za_install_entry_probe(base, 0x13c100, 0xc90c00, 0xc90c78, za_hook_lockmutex);
         za_install_entry_probe(base, 0x13c1c0, 0xc90c80, 0xc90cf8, za_hook_unlockmutex);
+        // sdk+0x13a5d0：慢路径互斥（主线程卡在它内部的 0x13a684 WaitForAddress）
+        za_install_entry_probe(base, 0x13a5d0, 0xc91080, 0xc910f8, za_hook_mutex_slow);
         // ⚠ 探针在一个函数的**中间指令**上（0x500194 = `cbnz w0, abort`）时，
         //   hook 的返回值/寄存器约定必须和原指令自洽 —— 实测这条探针让执行流
         //   落进了 hook 槽中间（sdk+0xc90d7c），SIGILL。已移除。

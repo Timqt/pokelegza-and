@@ -3657,6 +3657,10 @@ static void *za_sampler_watchdog(void *arg)
                             extern void za_dump_task_stats(void);
                             za_dump_task_stats();
                             za_ptrace_dump_all();
+                            {
+                                extern void za_dump_mutex_trace(void);
+                                za_dump_mutex_trace();
+                            }
                         }
                         if (za_guest_tid > 0) za_sync_dump_chain_for(za_guest_tid);
                         // 主线程阻塞在哪个锁上 ⇒ 扫所有线程栈找持有者
