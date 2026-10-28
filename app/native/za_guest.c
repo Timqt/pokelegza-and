@@ -3896,6 +3896,10 @@ static void *za_sampler_watchdog(void *arg)
                             if (lb) {
                                 ZLOGE("★ 主线程阻塞地址 %#llx ⇒ 扫全线程栈找持有者：", lb);
                                 za_sync_scan_for_addr(lb);
+                                {
+                                    extern void za_dump_mtx_hist(unsigned long long addr);
+                                    za_dump_mtx_hist(lb);
+                                }
                                 // ★ 2026-10-28：慢路径（sdk+0x13a5d0）探针实测，
                                 //   锁字经常停在 **2（交接态）**；解锁路径的动作就是
                                 //   `cmp #2 ; stlxr wzr` 把它清回 0。对所有被探针记录过

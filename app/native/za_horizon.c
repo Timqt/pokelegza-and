@@ -478,6 +478,49 @@ long za_horizon_svc(long a0, long a1, long a2, long a3,
 // 只读 TLS 页地址由 za_sdk.c 在装载时填好，这里通过导出变量取。
 extern volatile unsigned long za_ro_tls_page;
 unsigned long long za_dbg_last_wait;   // 最近一次 WaitForAddress 的地址
+// ── 锁字「谁拿走了」的线索 ──────────────────────────────────────────
+// 客机侧的 0/1/2 互斥字是纯用户态 CAS，我们看不到谁把它置成 1。
+// 唯一能观察到的窗口是 svc#52 的**返回**：返回时锁字非 0 ⇒ 本次调用之后
+// 这个线程很可能成了持有者。停摆时据此把「最后几个摸过这把锁的线程」倒出来。
+#define ZA_MTX_HIST 32
+typedef struct {
+    unsigned long long addr;
+    long tid;
+    unsigned int word;
+    unsigned long long ns;
+} za_mtx_hist_t;
+static za_mtx_hist_t za_mtx_hist[ZA_MTX_HIST];
+static volatile unsigned za_mtx_hist_pos;
+
+static void za_mtx_hint(unsigned long long addr)
+{
+    if (!addr || (addr & 3)) return;
+    unsigned int w = __atomic_load_n((const unsigned int *)(uintptr_t)addr, __ATOMIC_RELAXED);
+    unsigned p = za_mtx_hist_pos;
+    za_mtx_hist_t *h = &za_mtx_hist[p % ZA_MTX_HIST];
+    h->addr = addr;
+    h->tid = (long)syscall(SYS_gettid);
+    h->word = w;
+    h->ns = za_now_ns();
+    za_mtx_hist_pos = p + 1;
+}
+
+// 停摆：把最近摸过 addr 的线程按时间倒序列出。
+void za_dump_mtx_hist(unsigned long long addr)
+{
+    unsigned pos = za_mtx_hist_pos;
+    unsigned n = pos < ZA_MTX_HIST ? pos : ZA_MTX_HIST;
+    int hit = 0;
+    for (unsigned i = 1; i <= n; i++) {
+        za_mtx_hist_t *h = &za_mtx_hist[(pos - i) % ZA_MTX_HIST];
+        if (h->addr != addr) continue;
+        if (hit == 0) ZLOGE("    ↑ svc#52 返回时摸过这把锁的线程（新→旧）：");
+        if (hit++ >= 6) break;
+        ZLOGE("      tid=%ld word=%#x (+%llums)", h->tid, h->word,
+              h->ns ? (za_now_ns() - h->ns) / 1000000ull : 0);
+    }
+    if (!hit) ZLOGE("    ↑ 近期没有线程在 svc#52 上摸过这把锁");
+}
 unsigned long long za_dbg_last_phys_addr, za_dbg_last_phys_size;
 unsigned long long za_dbg_last_break_info, za_dbg_last_break_size;
 static unsigned int za_current_owner_id(void)
@@ -1490,6 +1533,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     {
         unsigned int *p = (unsigned int *)(uintptr_t)a0;
         za_dbg_last_wait = (unsigned long long)a0;   // 崩溃 dump 用
+        // 每条返回路径都留一条「此刻锁字是多少」的记录（谁在摸这把锁）。
+#define ZA_W52_RET(v) do { za_mtx_hint((unsigned long long)a0); return (long)(v); } while (0)
         if (!p) return 0xFA01u;
         int type = (int)a1;
         unsigned int v = (unsigned int)a2;
@@ -1526,7 +1571,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 case 2: wait = (cur <= v); break;   // GreaterThan：等到 > value
                 default: wait = (cur != v); break;  // NotEqual：等到 == value
             }
-            if (!wait) { za_stale_clear((unsigned long long)a0); za_sync_addr_wait_done(); return 0xFA01u; }
+            if (!wait) { za_stale_clear((unsigned long long)a0); za_sync_addr_wait_done(); ZA_W52_RET(0xFA01u); }
             struct timespec ts;
             if (ns >= 0)
             {
@@ -1555,7 +1600,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
             //   我们写 2 等于自己制造永久死锁（真机实测写入后永远停在 2/1）。
             //   内核语义就是「条件成立才返回」，其余一律继续等（分片重判）。
             (void)rc;
-            if (errno == EINVAL) return 0xFA01u;   // 地址非法：交给调用方
+            if (errno == EINVAL) ZA_W52_RET(0xFA01u);   // 地址非法：交给调用方
             // ★ 2026-10-28：**无限等待也要有界**（对 #52 同样成立）。
             //   SDK 的锁慢路径（sdk+0x13a684）明确把 0xFA01 当成「值有变化，重判」：
             //       and w8,w0,#0x3fffff ; cmp w8,#0xfa01 ; b.eq <重试>
@@ -1575,7 +1620,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                     if ((unsigned long long)t1.tv_sec * 1000000000ull +
                         (unsigned long long)t1.tv_nsec >= deadline) {
                         za_sync_addr_wait_done();
-                        return 0xFA01u;
+                        ZA_W52_RET(0xFA01u);
                     }
                 }
             }
@@ -1585,7 +1630,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 if ((unsigned long long)tv1.tv_sec * 1000000000ull +
                     (unsigned long long)tv1.tv_nsec >= deadline) {
                     za_sync_addr_wait_done();
-                    return 0xEA01u;                // 真超时
+                    ZA_W52_RET(0xEA01u);          // 真超时
                 }
             }
             continue;
