@@ -1575,13 +1575,66 @@ static void za_probe_libart(void)
     }
 }
 
+
+// ── nn::async 作业计数探针 ─────────────────────────────────────────────
+// 在 ExecutionScheduler::Enqueue(sdk+0x8d2c0) 与 DequeueAndCall(sdk+0x8d550)
+// 首指令处装计数探针：入口改成 b <桩>，桩做「计数 → 补执行原首指令 → 回入口+4」。
+// 桩里的字面量存宿主函数地址，用 ldr/br 跳（blr 可跨任意距离，避开 b 的 ±128MB）。
+volatile unsigned long za_async_enq, za_async_exec;
+static void za_async_inc_enq(void) { __atomic_add_fetch(&za_async_enq, 1, __ATOMIC_RELAXED); }
+static void za_async_inc_exec(void) { __atomic_add_fetch(&za_async_exec, 1, __ATOMIC_RELAXED); }
+static int za_async_probe_done;
+
+void za_install_async_probe(void)
+{
+    extern volatile unsigned long za_sdk_base, za_sdk_size;
+    if (za_async_probe_done || !za_sdk_base) return;
+    za_async_probe_done = 1;
+    unsigned char *sb = (unsigned char *)(uintptr_t)za_sdk_base;
+    // 桩区：sdk+16MB，b 偏移在 ±128MB 内（入口在 sdk+0x8d2c0 附近）
+    unsigned char *stub = MAP_FAILED;
+    // 依次尝试几个「SDK 映像之外、但离入口 <128MB」的位置
+    static const unsigned long cands[] = { 0x4000000ul, 0x8000000ul, 0x2000000ul, 0x6000000ul };
+    for (unsigned ci = 0; ci < 4 && stub == MAP_FAILED; ci++)
+        stub = (unsigned char *)mmap((void *)(uintptr_t)(za_sdk_base + cands[ci]), 0x1000,
+                                     PROT_READ | PROT_WRITE | PROT_EXEC,
+                                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (stub == MAP_FAILED) { ZLOGE("async 探针桩区映射失败"); return; }
+    static const unsigned long entries[2] = { 0x8d2c0, 0x8d550 };
+    void (*fns[2])(void) = { za_async_inc_enq, za_async_inc_exec };
+    for (int i = 0; i < 2; i++) {
+        unsigned int *ep = (unsigned int *)(sb + entries[i]);
+        unsigned int orig = *ep;
+        unsigned int *st = (unsigned int *)(stub + i * 0x20);
+        st[0] = 0x58000050u;                      // ldr x16,[pc,#8]
+        st[1] = 0xD63F0200u;                      // blr x16
+        *(void **)(st + 2) = (void *)fns[i];      // 字面量
+        st[4] = orig;                             // 原首指令
+        long off = ((long)(sb + entries[i] + 4) - (long)((unsigned char *)&st[5])) >> 2;
+        st[5] = 0x14000000u | ((unsigned long)off & 0x3FFFFFFu);   // b 入口+4
+        // 入口：b 桩
+        long boff = ((long)((unsigned char *)st) - (long)(sb + entries[i])) >> 2;
+        if (mprotect((void *)((uintptr_t)(sb + entries[i]) & ~0xfffull), 0x1000,
+                     PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            ZLOGE("async 探针 mprotect 失败"); return;
+        }
+        *ep = 0x14000000u | ((unsigned long)boff & 0x3FFFFFFu);
+        __builtin___clear_cache((char *)ep, (char *)ep + 4);
+    }
+    __builtin___clear_cache((char *)stub, (char *)stub + 0x40);
+    ZLOGI("★ async 计数探针已装：enq@%#x exec@%#x（桩 %p）",
+          entries[0], entries[1], (void *)stub);
+}
+
 // 装好致命信号的处理器（SIGSEGV/BUS/ILL/FPE/ABRT/SYS）。
 // ⚠ 必须每次 svc 后重装：SDK 初始化会**替换**掉我们装的 SIGSEGV 处理器
 //   ⇒ 客机崩了就没人接，直接被内核杀掉（连日志都没有）。
+void za_install_async_probe(void);
 void za_reinstall_signal_handlers(void)
 {
     za_install_altstack();
     za_probe_libart();
+    za_install_async_probe();
     if (!za_self_base) za_compute_self_range();
     struct sigaction sa;
     memset(&sa, 0, sizeof sa);
@@ -3398,8 +3451,14 @@ static void *za_sampler_watchdog(void *arg)
                 {
                     {
                         extern volatile unsigned long za_thread_created, za_thread_started;
-                        ZLOGE("★ 停摆快照（%lu svc/s）：CreateThread=%lu StartThread=%lu",
-                              cnt, za_thread_created, za_thread_started);
+                        {
+                            extern volatile unsigned long za_async_enq, za_async_exec;
+                            ZLOGE("★ 停摆快照（%lu svc/s）：CreateThread=%lu StartThread=%lu "
+                                  "async enq=%lu exec=%lu 差=%ld",
+                                  cnt, za_thread_created, za_thread_started,
+                                  za_async_enq, za_async_exec,
+                                  (long)za_async_enq - (long)za_async_exec);
+                        }
                     }
                     za_sync_dump();
                     // 主线程最近 24 次 svc：它才是「游戏卡在哪」的直接答案。
