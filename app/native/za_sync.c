@@ -446,6 +446,19 @@ void za_sync_note_guest(unsigned long long sp, unsigned long long pc)
     w->gpc = pc;
 }
 
+void za_sync_dump_chain_for(long tid)
+{
+    zs_slot_t *w = NULL;
+    zs_lock();
+    for (int i = 0; i < ZS_MAX; i++)
+        if (__atomic_load_n(&zs_slots[i].tid, __ATOMIC_RELAXED) == tid) { w = &zs_slots[i]; break; }
+    unsigned long long sp = w ? w->gsp : 0, pc = w ? w->gpc : 0;
+    int kind = w ? w->kind : 0;
+    zs_unlock();
+    ZLOGI("      主线程链（tid=%ld kind=%d sp=%#llx）：", tid, kind, sp);
+    if (sp) za_sync_dump_guest_chain(sp, pc);
+}
+
 void za_sync_dump(void)
 {
     long tid[ZS_MAX];

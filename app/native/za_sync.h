@@ -25,5 +25,6 @@ void za_sync_addr_wait_done(void);
 
 // 打印等待表快照（诊断用）
 void za_sync_dump(void);
+void za_sync_dump_chain_for(long tid);
 
 #endif

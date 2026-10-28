@@ -3465,8 +3465,10 @@ static void *za_sampler_watchdog(void *arg)
                     {
                         extern void za_dump_all_ret_rings(void);
                         extern void za_dump_ret_ring_for(long tid);
+                        extern void za_sync_dump_chain_for(long tid);
                         ZLOGE("★ 主线程(tid=%ld)最近 svc：", za_guest_tid);
                         za_dump_ret_ring_for(za_guest_tid);
+                        if (za_guest_tid > 0) za_sync_dump_chain_for(za_guest_tid);
                     }
                     za_nvn_dump_recent();   // 带客机 LR：最后几步 NVN 调用发生在哪
                 }
