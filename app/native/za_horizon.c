@@ -55,6 +55,40 @@
 #include "za_nvn.h"
 #include "za_sync.h"
 
+// ── svc#52 陈旧持锁兜底（按地址记时间戳）────────────────────────────
+// 该等待会被 20ms 分片反复重新进入，函数内计数器每次都从 0 开始，
+// 所以原先 slices >= 50 的兜底永远达不到、从未生效（真机确认）。
+#define ZA_STALE_N 32
+static struct { unsigned long long addr; unsigned long long since; } za_stale[ZA_STALE_N];
+static unsigned long long za_stale_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned long long)ts.tv_sec * 1000000000ull + (unsigned long long)ts.tv_nsec;
+}
+static int za_stale_check(unsigned long long addr)
+{
+    unsigned long long now = za_stale_now();
+    int slot = -1, free_slot = -1;
+    for (int i = 0; i < ZA_STALE_N; i++) {
+        if (za_stale[i].addr == addr) { slot = i; break; }
+        if (!za_stale[i].addr && free_slot < 0) free_slot = i;
+    }
+    if (slot < 0) {
+        if (free_slot < 0) return 0;
+        za_stale[free_slot].addr = addr;
+        za_stale[free_slot].since = now;
+        return 0;
+    }
+    if (now - za_stale[slot].since > 1000000000ull) { za_stale[slot].addr = 0; return 1; }
+    return 0;
+}
+static void za_stale_clear(unsigned long long addr)
+{
+    for (int i = 0; i < ZA_STALE_N; i++)
+        if (za_stale[i].addr == addr) { za_stale[i].addr = 0; return; }
+}
+
 // SDK 映像基址/大小（定义在 za_guest.c）：崩溃与断言回溯时用来把地址换算成模块偏移
 extern volatile unsigned long za_sdk_base;
 extern volatile unsigned long za_sdk_size;
@@ -1444,7 +1478,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 case 2: wait = (cur <= v); break;   // GreaterThan：等到 > value
                 default: wait = (cur != v); break;  // NotEqual：等到 == value
             }
-            if (!wait) { za_sync_addr_wait_done(); return 0xFA01u; }  // InvalidState
+            if (!wait) { za_stale_clear((unsigned long long)a0); za_sync_addr_wait_done(); return 0xFA01u; }
             struct timespec ts;
             if (ns >= 0)
             {
@@ -1471,7 +1505,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
                 //   WaitForAddress(addr, GreaterThan(2), 1) —— 等锁字变成 2。
                 //   锁字一直停在 1 说明持锁者再也不会解锁（线程挂了/自己也在等）。
                 //   等够 1 秒就把它强制清零并唤醒：宁可短暂破坏互斥，也不能整条线停死。
-                if (++slices >= 50) {
+                if (za_stale_check((unsigned long long)a0)) {
                     static int nforce;
                     if (nforce++ < 6)
                         ZLOGE("svc#52 1s 未解锁 addr=%#llx word=%#x ⇒ 强制清零",
