@@ -1416,7 +1416,8 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         unsigned int v = (unsigned int)a2;
         long long ns = (long long)a3;      // 纳秒，< 0 = 无限
         // 登记进等待表：看门狗伪唤醒才够得着（以前这条路径完全在表外）。
-        za_sync_note_addr_wait((unsigned long long)a0, v, type);
+        za_sync_note_addr_wait((unsigned long long)a0, v, type,
+                               (unsigned long long)za_horizon_regs[ZA_REG_PC]);
         for (;;)
         {
             unsigned int cur = __atomic_load_n(p, __ATOMIC_ACQUIRE);

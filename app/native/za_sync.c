@@ -403,7 +403,8 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
 // svc#52 WaitForAddress 的等待者：登记进同一张表，让看门狗的伪唤醒够得着。
 // 这条路径以前完全在表外 —— 真机实测卡住时有线程睡在这里，而看门狗只看到
 // 「0 个/1 个线程」，伪唤醒打不到它。
-void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int type)
+void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int type,
+                            unsigned long long pc)
 {
     zs_slot_t *w = zs_self();
     if (!w) return;
@@ -412,6 +413,7 @@ void za_sync_note_addr_wait(unsigned long long addr, unsigned int value, int typ
     w->key = 0;
     w->tag = (unsigned int)value;
     w->gsp = (unsigned long long)type;
+    w->gpc = pc;   // 调用方客机 pc：谁在等这个地址
     __atomic_store_n(&w->granted, 0, __ATOMIC_RELEASE);
 }
 
