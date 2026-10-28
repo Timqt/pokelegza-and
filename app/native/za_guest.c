@@ -3396,7 +3396,11 @@ static void *za_sampler_watchdog(void *arg)
                 //   紧跟着 dump 就只会看到「0 个线程」（踩过一次）。
                 if ((no_progress % 2000) == 40)
                 {
-                    ZLOGE("★ 停摆快照（%lu svc/s 级别的静默）", cnt);
+                    {
+                        extern volatile unsigned long za_thread_created, za_thread_started;
+                        ZLOGE("★ 停摆快照（%lu svc/s）：CreateThread=%lu StartThread=%lu",
+                              cnt, za_thread_created, za_thread_started);
+                    }
                     za_sync_dump();
                     // 主线程最近 24 次 svc：它才是「游戏卡在哪」的直接答案。
                     {

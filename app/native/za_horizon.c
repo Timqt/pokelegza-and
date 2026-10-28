@@ -189,6 +189,7 @@ typedef struct
 
 #define ZA_MAX_HANDLES 512
 static za_handle_t g_handles[ZA_MAX_HANDLES];
+volatile unsigned long za_thread_created, za_thread_started;
 static pthread_mutex_t g_handles_mtx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t g_handle_cond = PTHREAD_COND_INITIALIZER;
 
@@ -1167,6 +1168,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     case 8: // CreateThread(out_handle=x0, entry=x1, arg=x2, stack_bottom=x3, prio=w4, core=w5)
     {
         int id = za_handle_alloc(ZA_H_THREAD);
+        __atomic_add_fetch(&za_thread_created, 1, __ATOMIC_RELAXED);
         ZLOGI("svc#8 CreateThread: out=%#lx entry=%#lx arg=%#lx stack=%#lx prio=%ld core=%ld -> handle=%d",
               (unsigned long)a0, (unsigned long)a1, (unsigned long)a2, (unsigned long)a3,
               (long)a4, (long)a5, id);
@@ -1205,6 +1207,7 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
         if (!h || h->type != ZA_H_THREAD) return 1;
         if (h->started) return 0;
         h->started = 1;
+        __atomic_add_fetch(&za_thread_started, 1, __ATOMIC_RELAXED);
         za_thread_start_t *ts = (za_thread_start_t *)malloc(sizeof *ts);
         if (!ts) return 1;
         ts->h = h;
