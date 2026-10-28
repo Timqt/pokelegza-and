@@ -17,4 +17,13 @@ void za_log_print(int prio, const char *tag, const char *fmt, ...)
 #define ZLOGI(...) za_log_print(ANDROID_LOG_INFO, "ZaGuest", __VA_ARGS__)
 #define ZLOGE(...) za_log_print(ANDROID_LOG_ERROR, "ZaGuest", __VA_ARGS__)
 
+// ★ 客机指针带 tag：真机实测大量指针形如 0xb400006f9b1cadd0，顶字节是
+//   ARM TBI/MTE 的 tag，去掉 tag 后是 0x6f9b1cadd0（有效堆地址）。
+//   以前各处用「0x4_0000_0000 .. 0xD_0000_0000」判「像不像指针」，
+//   带 tag 的值全部落在窗口外 ⇒ 判据永远为假，诊断静默失效。
+//   典型症状：调度器单例被报成 vtable=0；等待环修复一次都不触发。
+#define ZA_PTR_MASK(p)  ((unsigned long long)(p) & 0x00FFFFFFFFFFFFFFull)
+#define ZA_PTR_OK(p)    (ZA_PTR_MASK(p) >= 0x10000ull && \
+                         ZA_PTR_MASK(p) < 0x0001000000000000ull)
+
 #endif

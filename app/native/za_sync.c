@@ -1058,6 +1058,56 @@ unsigned long za_sync_signal_addr(unsigned long long addr, int type, int val, in
     return r;
 }
 
+// ── 修复「等待环被写满」的锁 ──────────────────────────────────────────
+// SDK 的阻塞互斥对象布局（反汇编 0x13a790 确认）：
+//   +0x00 = 等待者数组指针   +0x08 = 容量   +0x0c = 已用   +0x10 = 头下标
+// 入队路径被 `cmp 已用, 容量 ; b.ge 跳过` 卡住 —— 一旦「已用」涨到容量，
+// 新等待者再也登记不进去，持有者的交接也就找不到人，整把锁永久停摆。
+// 真机实测：卡死的互斥对象都是 100/100，而同一时刻只有 2~6 个线程真的在等
+// ⇒ 里面 90 多个是陈旧条目（等待者被唤醒/重试后没有出队）。
+// 这里只把「已用」清 0，不动数组内容、不碰锁字本身 —— 陈旧条目再也不会被读到，
+// 也不会释放任何指针，所以不会破坏互斥保护的数据。
+// 返回修复了几个对象。
+int za_sync_repair_full_wait_ring(void)
+{
+    unsigned long long addrs[ZS_MAX];
+    int na = 0, fixed = 0;
+    zs_lock();
+    for (int i = 0; i < ZS_MAX; i++) {
+        zs_slot_t *w = &zs_slots[i];
+        if (!__atomic_load_n(&w->tid, __ATOMIC_RELAXED)) continue;
+        if (w->kind != 3) continue;
+        int k = 0;
+        while (k < na && addrs[k] != w->addr) k++;
+        if (k == na) { addrs[na++] = w->addr; }
+    }
+    for (int k = 0; k < na; k++) {
+        for (int d = 0x20; d <= 0x28; d += 8) {
+            unsigned long long base = addrs[k] - (unsigned long long)d;
+            unsigned long long arr = 0;
+            unsigned int cap = 0, used = 0;
+            if (!za_sync_read(&arr, base, 8)) continue;
+            if (!za_sync_read(&cap, base + 8, 4)) continue;
+            if (!za_sync_read(&used, base + 0xc, 4)) continue;
+            if (!ZA_PTR_OK(arr)) continue;
+            if (cap == 0 || cap > 4096) continue;
+            if (used < cap) continue;                 // 没满，不管
+            __atomic_store_n((unsigned int *)(uintptr_t)(base + 0xc), 0u, __ATOMIC_RELEASE);
+            ZLOGE("★ 等待环写满：%#llx (obj=%#llx) 已用 %u/%u ⇒ 清 0 并唤醒全部等待者",
+                  addrs[k], base, used, cap);
+            for (;;) {
+                zs_slot_t *x = zs_pick(3, addrs[k]);
+                if (!x) break;
+                zs_wake(x);
+            }
+            fixed++;
+            break;
+        }
+    }
+    zs_unlock();
+    return fixed;
+}
+
 // 伪唤醒所有「地址等待」(kind=3) 线程。内核允许伪唤醒，调用方必须重判条件，
 // 所以这在语义上是合法的。用途是**分辨两种停摆**：
 //   伪唤醒后系统能推进 ⇒ 是我们丢了一次唤醒（真 bug 在信号侧）；

@@ -3250,7 +3250,7 @@ static void za_hook_m_openfile(unsigned long long *r)
     char txt[128];
     int ok = 0;
     unsigned long long gb = (unsigned long long)(uintptr_t)za_guest_base;
-    if (p && ((p >= 0x400000000ull && p < 0xd00000000ull) ||
+    if (p && ((ZA_PTR_OK(p)) ||
               (p >= 0xb400000000000000ull && p < 0xb400010000000000ull) ||
               (gb && p >= gb && p < gb + ZA_IMAGE_SIZE)))
     {
@@ -3382,7 +3382,10 @@ void za_dump_progress_stall(void)
             // 伪唤醒一次：语义合法，用来区分「我们丢了唤醒」和「对方没释放」。
             {
                 extern int za_sync_poke_addr_waiters(void);
+                extern int za_sync_repair_full_wait_ring(void);
                 static int poke_n;
+                int rp = za_sync_repair_full_wait_ring();
+                if (rp) ZLOGE("   ↳ 本轮修好 %d 个写满的等待环", rp);
                 int pk = za_sync_poke_addr_waiters();
                 if (pk) ZLOGE("   ↳ 伪唤醒了 %d 个地址等待者（第 %d 次）", pk, ++poke_n);
                 // 伪唤醒三次都没让系统动 ⇒ 等待的字确实没人写。做一次限定范围的
@@ -3415,7 +3418,7 @@ static void za_hook_m_jobwait(unsigned long long *r)
     }
     if (n++ >= 24) return;
     unsigned long long st = 0, a = 0, b = 0, p = 0;
-    if (o >= 0x400000000ull && o < 0xd00000000ull) {
+    if (ZA_PTR_OK(o)) {
         memcpy(&st, (const void *)(uintptr_t)(o + 0x158), 8);
         memcpy(&a,  (const void *)(uintptr_t)(o + 0x168), 8);
         memcpy(&b,  (const void *)(uintptr_t)(o + 0x170), 8);
@@ -3459,7 +3462,7 @@ void za_dump_job_states(void)
         unsigned long long o = za_job_objs[k];
         unsigned long lr = (unsigned long)za_job_caller[k];
         unsigned long long st = 0, m = 0, cv = 0;
-        if (o >= 0x400000000ull && o < 0xd00000000ull)
+        if (ZA_PTR_OK(o))
         {
             memcpy(&st, (const void *)(uintptr_t)(o + 0x158), 8);
             memcpy(&m, (const void *)(uintptr_t)(o + 0x118), 8);
@@ -3499,7 +3502,7 @@ static void za_hook_m_jobdispatch(unsigned long long *r)
     if (gb)
     {
         memcpy(&g, (const void *)(uintptr_t)(page + 0x800), 8);
-        if (g >= 0x400000000ull && g < 0xd00000000ull)
+        if (ZA_PTR_OK(g))
         {
             memcpy(&vt, (const void *)(uintptr_t)g, 8);
             if (vt) memcpy(&fn, (const void *)(uintptr_t)(vt + 0x10), 8);
@@ -3529,7 +3532,7 @@ static void za_hook_m_dequeue(unsigned long long *r)
     unsigned long long k = __atomic_add_fetch(&n, 1, __ATOMIC_RELAXED);
     unsigned long long o = r[0];
     unsigned int cnt = 0, cnt2 = 0;
-    if (o >= 0x400000000ull && o < 0xd00000000ull) {
+    if (ZA_PTR_OK(o)) {
         memcpy(&cnt, (const void *)(uintptr_t)(o + 0x2f8), 4);
         memcpy(&cnt2, (const void *)(uintptr_t)(o + 0x330), 4);
     }
@@ -3545,7 +3548,7 @@ static void za_hook_m_jobenqueue(unsigned long long *r)
     static int n;
     if (n++ >= 4) return;
     unsigned long long vt = r[8], fn = 0;
-    if (vt >= 0x400000000ull && vt < 0xd00000000ull)
+    if (ZA_PTR_OK(vt))
         memcpy(&fn, (const void *)(uintptr_t)(vt + 0x50), 8);
     {
         char a[48], b[48];
@@ -3563,9 +3566,9 @@ void za_dump_dispatch_state(void)
     unsigned long long g = 0, vt = 0, f10 = 0, f50 = 0;
     if (gb) {
         memcpy(&g, (const void *)(uintptr_t)(gb + 0x3d80800), 8);
-        if (g >= 0x400000000ull && g < 0xd00000000ull) {
+        if (ZA_PTR_OK(g)) {
             memcpy(&vt, (const void *)(uintptr_t)g, 8);
-            if (vt >= 0x400000000ull && vt < 0xd00000000ull) {
+            if (ZA_PTR_OK(vt)) {
                 memcpy(&f10, (const void *)(uintptr_t)(vt + 0x10), 8);
                 memcpy(&f50, (const void *)(uintptr_t)(vt + 0x50), 8);
             }
