@@ -980,11 +980,51 @@ unsigned long za_sync_wait_addr(unsigned long long addr, int type, int val, long
     }
 }
 
+// ── 每个等待地址收到过多少信号 ────────────────────────────────────────
+// 用来回答「消费者睡在队列上，到底有没有人 signal 过它」。
+// 没有信号 ⇒ 生产方根本没入队；有信号但没唤醒 ⇒ 值/CAS 对不上。
+typedef struct {
+    unsigned long long addr;
+    unsigned int sig, woke;
+} zs_sig_stat_t;
+#define ZS_SIGSTAT_N 64
+static zs_sig_stat_t zs_sig_stat[ZS_SIGSTAT_N];
+
+// 调用方必须持 zs_spin。
+static void zs_sig_note(unsigned long long addr, int woke)
+{
+    if (!addr) return;
+    for (int i = 0; i < ZS_SIGSTAT_N; i++) {
+        zs_sig_stat_t *s = &zs_sig_stat[i];
+        if (s->addr == addr) { s->sig++; if (woke > 0) s->woke += (unsigned)woke; return; }
+        if (!s->addr) { s->addr = addr; s->sig = 1; if (woke > 0) s->woke = (unsigned)woke; return; }
+    }
+}
+
+int za_sync_sig_stat(unsigned long long addr, unsigned int *sig, unsigned int *woke)
+{
+    int found = 0;
+    if (sig) *sig = 0;
+    if (woke) *woke = 0;
+    zs_lock();
+    for (int i = 0; i < ZS_SIGSTAT_N; i++) {
+        if (zs_sig_stat[i].addr == addr) {
+            if (sig) *sig = zs_sig_stat[i].sig;
+            if (woke) *woke = zs_sig_stat[i].woke;
+            found = 1;
+            break;
+        }
+    }
+    zs_unlock();
+    return found;
+}
+
 unsigned long za_sync_signal_addr(unsigned long long addr, int type, int val, int count)
 {
-    volatile unsigned int *p = (volatile unsigned int *)(uintptr_t)addr;
     unsigned long r = 0;
     int nw = 0;
+    int woke = 0;
+    volatile unsigned int *p = (volatile unsigned int *)(uintptr_t)addr;
     if (!addr) return 0xFA01u;
     zs_lock();
     for (int i = 0; i < ZS_MAX; i++) {
@@ -1010,8 +1050,10 @@ unsigned long za_sync_signal_addr(unsigned long long addr, int type, int val, in
             zs_slot_t *w = zs_pick(3, addr);
             if (!w) break;
             zs_wake(w);
+            woke++;
         }
     }
+    zs_sig_note(addr, woke);
     zs_unlock();
     return r;
 }

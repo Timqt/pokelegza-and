@@ -2379,10 +2379,15 @@ void za_dump_ret_ring_for(long tid)
             if (!okw) {
                 ZLOGI("        ↳ 等待字[%#llx] 不可读（地址已失效）", e->a0);
             } else {
-                ZLOGI("        ↳ 等待字[%#llx]=%#x  cv[%#llx]=%#x  ⇒ %s",
+                unsigned int sg = 0, wk = 0;
+                extern int za_sync_sig_stat(unsigned long long addr, unsigned int *sig,
+                                            unsigned int *woke);
+                za_sync_sig_stat(e->a0, &sg, &wk);
+                ZLOGI("        ↳ 等待字[%#llx]=%#x  cv[%#llx]=%#x  ⇒ %s"
+                      "（该地址累计 svc#53 %u 次、唤醒 %u 个）",
                       e->a0, w, e->a1, c,
                       w <= 1u ? "锁字是 0/1：实际无人持有，问题在我们这边"
-                              : "锁字 >1：有人持有，需找持有者");
+                              : "锁字 >1：有人持有，需找持有者", sg, wk);
             }
         }
     }
