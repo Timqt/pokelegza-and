@@ -29,6 +29,10 @@ ACT = PKG + "/android.app.NativeActivity"
 MARKS = ["takeover", "quarantine", "nop-fill", "null-dangle", "kill-thread",
          "lqgrow", "fakewake", "no-lqgrow", "no-nullrecover"]
 LOG_DIR = ROOT / "work" / "device"
+# ⚠ 必须用**绝对路径**：run-as 的 sh -c 经过 adb 再转一层引号后，相对路径
+#   `files/za-x` 会创建失败而**不报错**（实测 22:0x 那几轮所谓「接管/隔离」
+#   全是基线，free 计数为 0 就是这个原因）。建完再 ls 回读校验。
+FILES = "/data/user/0/%s/files" % PKG
 
 
 def adb(*args, **kw):
@@ -38,15 +42,24 @@ def adb(*args, **kw):
 
 
 def run_as(shell_cmd):
-    return adb("shell", "run-as", PKG, "sh", "-c", shell_cmd)
+    # ⚠ adb shell 会把参数用空格拼起来给**设备上的** shell，所以 `sh -c <cmd>`
+    #   必须自己带引号，否则设备 shell 把 cmd 当成 $0，`sh -c` 只收到一个词。
+    quoted = shell_cmd.replace("'", "'\\''")
+    return adb("shell", "run-as %s sh -c '%s'" % (PKG, quoted))
 
 
 def set_marks(active):
-    run_as("rm -f " + " ".join("files/za-" + m for m in MARKS) + " 2>/dev/null; echo ok")
     for m in active:
         if m not in MARKS:
             sys.exit("未知开关: %s（可用：%s）" % (m, ", ".join(MARKS)))
-        run_as("touch files/za-" + m)
+    run_as("rm -f %s/za-* 2>/dev/null; echo ok" % FILES)
+    for m in active:
+        run_as("touch %s/za-%s" % (FILES, m))
+    # 回读校验：开关没建上就干脆别跑，否则结论全是假的
+    got = run_as("ls %s 2>/dev/null" % FILES).stdout or ""
+    for m in active:
+        if ("za-" + m) not in got:
+            sys.exit("开关文件没建上：%s/za-%s（run-as 权限或路径问题）" % (FILES, m))
 
 
 def main():

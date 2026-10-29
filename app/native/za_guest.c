@@ -141,8 +141,9 @@ static void za_maps_near(unsigned long long a, char *out, size_t cap)
     size_t used = 0;
     unsigned long long prev_lo = 0, prev_hi = 0;
     unsigned long long next_lo = 0;
-    char prev_name[72] = "", next_name[72] = "";
-    char prev_perm[5] = "", next_perm[5] = "";
+    unsigned long long in_lo = 0, in_hi = 0;
+    char prev_name[72] = "", next_name[72] = "", in_name[72] = "";
+    char prev_perm[5] = "", next_perm[5] = "", in_perm[5] = "";
     if (!cap) return;
     if (busy) { out[0] = 0; return; }
     busy = 1;
@@ -179,7 +180,11 @@ static void za_maps_near(unsigned long long a, char *out, size_t cap)
                     while (*q == ' ') q++;
                 }
                 nm = q;
-                if (hi <= a) {
+                if (lo <= a && a < hi) {          // ★ 必须单独处理「地址就在这条映射里」
+                    in_lo = lo; in_hi = hi;
+                    memcpy(in_perm, perm, 5);
+                    snprintf(in_name, sizeof in_name, "%.71s", nm);
+                } else if (hi <= a) {
                     prev_lo = lo; prev_hi = hi;
                     memcpy(prev_perm, perm, 5);
                     snprintf(prev_name, sizeof prev_name, "%.71s", nm);
@@ -195,7 +200,20 @@ static void za_maps_near(unsigned long long a, char *out, size_t cap)
     {
         char *q = out;
         char *end = out + cap - 1;
-        q = za_put_str(q, "前一个=[");
+        if (in_lo) {
+            q = za_put_str(q, "包含=[");
+            q = za_put_hex(q, in_lo);
+            q = za_put_str(q, "-");
+            q = za_put_hex(q, in_hi);
+            q = za_put_str(q, " ");
+            q = za_put_str(q, in_perm);
+            q = za_put_str(q, " ");
+            q = za_put_str(q, in_name);
+            q = za_put_str(q, "]");
+        } else {
+            q = za_put_str(q, "未映射（在空洞里）");
+        }
+        q = za_put_str(q, " 前一个=[");
         q = za_put_hex(q, prev_lo);
         q = za_put_str(q, "-");
         q = za_put_hex(q, prev_hi);
@@ -204,7 +222,6 @@ static void za_maps_near(unsigned long long a, char *out, size_t cap)
         q = za_put_str(q, " ");
         q = za_put_str(q, prev_name);
         q = za_put_str(q, "]");
-        if (a >= prev_lo && a < prev_hi) { q = za_put_str(q, "← 地址落在里面"); }
         if (next_lo) {
             q = za_put_str(q, " 后一个=[");
             q = za_put_hex(q, next_lo);
@@ -3298,6 +3315,102 @@ static void *za_host_runtime_object_file(void)
     return base + mod0;
 }
 
+// ── BinaryFileHeader 重定位诊断（2026-10-29 真机）────────────────────
+// 首帧那块 BNSH 容器（magic `grsc`）的 [blk+0x28] 每次都比正确值**大
+// 0x100000000（= main 装载基址，4GB）**，说明容器的内部指针被多重定位了一次。
+// 这三个 API 是 main 从 SDK 导入的，我们能在导入表里接管成「透传 + 打日志」：
+// 直接看到头指针、块指针、是否已重定位，以及容器头部的签名。
+// Pass-through hooks around the SDK's BinaryFileHeader relocation API.
+static za_mod_t za_sdk_mod;   // 前置声明（真正定义在后面，带初始化）
+static int (*za_bin_hdr_isreloc)(const void *);
+static void *(*za_bin_hdr_first)(const void *);
+static void *(*za_bin_hdr_reltab)(const void *);
+static void za_bfh_log(const char *what, const void *hdr, unsigned long long out)
+{
+    unsigned char q[0x30];
+    struct iovec lo = { q, sizeof q }, ro = { (void *)(uintptr_t)hdr, sizeof q };
+    int ok = hdr && process_vm_readv(getpid(), &lo, 1, &ro, 1, 0) == (ssize_t)sizeof q;
+    ZLOGE("★ BFH %s hdr=%p out=%#llx 头=%08x %08x %08x %08x | %#llx %#llx",
+          what, hdr, out,
+          ok ? *(unsigned int *)(q + 0) : 0, ok ? *(unsigned int *)(q + 4) : 0,
+          ok ? *(unsigned int *)(q + 8) : 0, ok ? *(unsigned int *)(q + 12) : 0,
+          ok ? *(unsigned long long *)(q + 0x18) : 0ull,
+          ok ? *(unsigned long long *)(q + 0x20) : 0ull);
+}
+static int za_bfh_isreloc(const void *hdr)
+{
+    if (!za_bin_hdr_isreloc)
+        za_bin_hdr_isreloc = (int (*)(const void *))
+            za_mod_lookup(&za_sdk_mod, "_ZNK2nn4util16BinaryFileHeader11IsRelocatedEv");
+    int r = za_bin_hdr_isreloc ? za_bin_hdr_isreloc(hdr) : 0;
+    static int n; if (n++ < 24) za_bfh_log("IsRelocated", hdr, (unsigned long long)r);
+    return r;
+}
+static void *za_bfh_first(const void *hdr)
+{
+    if (!za_bin_hdr_first)
+        za_bin_hdr_first = (void *(*)(const void *))
+            za_mod_lookup(&za_sdk_mod, "_ZN2nn4util16BinaryFileHeader13GetFirstBlockEv");
+    void *r = za_bin_hdr_first ? za_bin_hdr_first(hdr) : NULL;
+    static int n; if (n++ < 24) za_bfh_log("GetFirstBlock", hdr, (unsigned long long)(uintptr_t)r);
+    return r;
+}
+static void *za_bfh_reltab(const void *hdr)
+{
+    if (!za_bin_hdr_reltab)
+        za_bin_hdr_reltab = (void *(*)(const void *))
+            za_mod_lookup(&za_sdk_mod, "_ZN2nn4util16BinaryFileHeader18GetRelocationTableEv");
+    void *r = za_bin_hdr_reltab ? za_bin_hdr_reltab(hdr) : NULL;
+    static int n; if (n++ < 24) za_bfh_log("GetRelocationTable", hdr, (unsigned long long)(uintptr_t)r);
+    return r;
+}
+// 重定位表本身：`Relocate()` 会按表的基址把容器内部指针改成绝对地址。
+// 首帧那块 BNSH 的内部指针正好多出 0x100000000（main 基址），所以这里把
+// 表头和调用前后的关键字段都打出来，看它用的基址是哪个。
+static void (*za_reltab_reloc)(void *);
+static void (*za_reltab_unreloc)(void *);
+static void za_reltab_dump(const char *what, const void *t, const void *ret)
+{
+    unsigned char q[0x28];
+    struct iovec lo = { q, sizeof q }, ro = { (void *)(uintptr_t)t, sizeof q };
+    int ok = t && process_vm_readv(getpid(), &lo, 1, &ro, 1, 0) == (ssize_t)sizeof q;
+    // 顺带看第一个块的 [+0x20]/[+0x28]：BFH 的 GetRelocationTable 返回 hdr+0x24028、
+    // GetFirstBlock 返回 hdr+0x60，所以 blk = tbl - 0x23FC8。重定位前后各看一次，
+    // 就能分清「文件里本来就是 pack 内偏移」还是「基址加错了」。
+    unsigned long long b20 = 0, b28 = 0;
+    {
+        unsigned long long blk = (unsigned long long)(uintptr_t)t - 0x23FC8ull;
+        unsigned long long v[2] = { 0, 0 };
+        struct iovec l2 = { v, sizeof v }, r2 = { (void *)(uintptr_t)(blk + 0x20), sizeof v };
+        if (process_vm_readv(getpid(), &l2, 1, &r2, 1, 0) == (ssize_t)sizeof v) { b20 = v[0]; b28 = v[1]; }
+    }
+    ZLOGE("★ RelTab %s tbl=%p ret=%p 表=%#llx %#llx %#llx %#llx %#llx | blk+0x20=%#llx blk+0x28=%#llx",
+          what, t, ret,
+          ok ? *(unsigned long long *)(q + 0x00) : 0ull,
+          ok ? *(unsigned long long *)(q + 0x08) : 0ull,
+          ok ? *(unsigned long long *)(q + 0x10) : 0ull,
+          ok ? *(unsigned long long *)(q + 0x18) : 0ull,
+          ok ? *(unsigned long long *)(q + 0x20) : 0ull, b20, b28);
+}
+static void za_reltab_reloc_h(void *tbl)
+{
+    if (!za_reltab_reloc)
+        za_reltab_reloc = (void (*)(void *))
+            za_mod_lookup(&za_sdk_mod, "_ZN2nn4util15RelocationTable8RelocateEv");
+    za_reltab_dump("Relocate 前", tbl, NULL);
+    if (za_reltab_reloc) za_reltab_reloc(tbl);
+    za_reltab_dump("Relocate 后", tbl, NULL);
+}
+static void za_reltab_unreloc_h(void *tbl)
+{
+    if (!za_reltab_unreloc)
+        za_reltab_unreloc = (void (*)(void *))
+            za_mod_lookup(&za_sdk_mod, "_ZN2nn4util15RelocationTable10UnrelocateEv");
+    za_reltab_dump("Unrelocate 前", tbl, NULL);
+    if (za_reltab_unreloc) za_reltab_unreloc(tbl);
+    za_reltab_dump("Unrelocate 后", tbl, NULL);
+}
+
 static unsigned long long za_get_system_tick(void)
 {
     struct timespec ts;
@@ -3434,10 +3547,16 @@ static unsigned int za_fs_readfile_cnt(unsigned long *out_read, unsigned int h,
             if (n < 0) n = 0;
             if (out_read) *out_read = (unsigned long)n;
             {
+                // ★ 大块读一定要记下**目标缓冲地址**：资源容器就落在这些缓冲里，
+                //   首帧那块 grsc 容器（0x6de3…）到底是哪个读填进去的，靠这一列对照。
                 static int lg2;
-                if (lg2++ < 32)
-                    ZLOGE("★ fs::ReadFile(fd=%d \"%s\" off=%lld size=%lu) => %zd",
-                          fd, za_fs_path_of(h), off, size, n);
+                if (size >= 0x10000 || lg2 < 32)
+                {
+                    if (size >= 0x10000) { /* 大块每次都记，数量很少 */ }
+                    else lg2++;
+                    ZLOGE("★ fs::ReadFile(fd=%d \"%s\" off=%lld size=%lu buf=%p) => %zd",
+                          fd, za_fs_path_of(h), off, size, buf, n);
+                }
             }
             return 0;
         }
@@ -3455,15 +3574,47 @@ static unsigned int za_fs_readfile_cnt(unsigned long *out_read, unsigned int h,
     if (out_read) *out_read = n;
     {
         static int lg;
-        if (lg++ < 32)
-            ZLOGE("★ fs::ReadFile(内嵌 h=%#x \"%s\" off=%lld size=%lu) => %lu/%lu",
-                  h, za_fs_path_of(h), off, size, n, total);
+        if (size >= 0x10000 || lg < 32)
+        {
+            if (size < 0x10000) lg++;
+            ZLOGE("★ fs::ReadFile(内嵌 h=%#x \"%s\" off=%lld size=%lu buf=%p) => %lu/%lu",
+                  h, za_fs_path_of(h), off, size, buf, n, total);
+        }
     }
     return 0;
 }
 static unsigned int za_fs_readfile(unsigned int h, long long off, void *buf, unsigned long size)
 {
-    return za_fs_readfile_cnt(NULL, h, off, buf, size);
+    unsigned long lr0;
+#if defined(__aarch64__)
+    __asm__ __volatile__("mov %0, x30" : "=r"(lr0));
+#else
+    lr0 = 0;
+#endif
+    unsigned int r = za_fs_readfile_cnt(NULL, h, off, buf, size);
+    // ★ 大块读：把**目标缓冲的归属**和调用者一起打出来。缓冲区落在
+    //   scudo:secondary 还是客机自己的区，决定了它被谁释放、该在哪里挂钩子。
+    if (size >= 0x10000) {
+        static int once;
+        if (once++ < 6) {
+            char mm[320];
+            za_maps_near((unsigned long long)(uintptr_t)buf & 0x00FFFFFFFFFFFFFFull,
+                         mm, sizeof mm);
+            {
+                unsigned long gb = (unsigned long)za_guest_base;
+                char who[40];
+                if (gb && lr0 >= gb && lr0 < gb + ZA_IMAGE_SIZE)
+                    snprintf(who, sizeof who, "main+%#lx", lr0 - gb);
+                else if (za_sdk_base && lr0 >= za_sdk_base && lr0 < za_sdk_base + za_sdk_size)
+                    snprintf(who, sizeof who, "sdk+%#lx", lr0 - za_sdk_base);
+                else
+                    snprintf(who, sizeof who, "%#lx", lr0);
+                ZLOGE("★ 大块读 off=%lld size=%lu 调用者=%s 缓冲归属 %s",
+                      off, size, who, mm);
+            }
+        }
+    }
+    return r;
 }
 static unsigned int za_fs_closefile(unsigned int h)
 {
@@ -3766,16 +3917,13 @@ static int za_quar_mode(void)
                    F_OK) == 0;
     return m;
 }
-static unsigned long za_caller_lr(void)
-{
+// ⚠ 必须**内联**在调用点取 x30：写成普通函数读到的是它自己的返回地址。
+//   而且只能在函数**入口**取（任何一次调用都会覆盖 x30）。
 #if defined(__aarch64__)
-    unsigned long v;
-    __asm__ __volatile__("mov %0, x30" : "=r"(v));
-    return v;
+#define ZA_CALLER_LR() ({ unsigned long _l_; __asm__ __volatile__("mov %0, x30" : "=r"(_l_)); _l_; })
 #else
-    return 0;
+#define ZA_CALLER_LR() 0ul
 #endif
-}
 static void za_musl_free(void *p)
 {
     void (*f)(void *) = (void (*)(void *))za_mod_lookup(&za_main_mod, "free");
@@ -3808,6 +3956,7 @@ static int za_hdr_get(void *p, za_hdr_t *out)
 }
 static void za_guest_free_impl(void *p)
 {
+    unsigned long lr0 = ZA_CALLER_LR();
     if (!p) return;
     if (!za_alloc_mode()) { za_musl_free(p); return; }
     za_hdr_t h;
@@ -3819,18 +3968,40 @@ static void za_guest_free_impl(void *p)
         za_q_n++;
         if (za_q_n <= 16 || (za_q_n & 63) == 0)
             ZLOGE("★ [quarantine] 保留 %u 字节块 %p（第 %d 块，释放者 lr=%#lx）",
-                  h.size, p, za_q_n, za_caller_lr());
+                  h.size, p, za_q_n, lr0);
         return;                       // 不归还：让悬空指针继续可读
     }
     if (za_free_total <= 32 || h.size >= 32768)
         ZLOGE("★ [free] %u 字节块 %p（累计 %lu 次，释放者 lr=%#lx）",
-              h.size, p, za_free_total, za_caller_lr());
+              h.size, p, za_free_total, lr0);
     free(h.base);
+}
+// 分配器里**不能直接打日志**：__android_log_print 自己会 malloc，再进来就
+// 无限递归（真机实测：启动 0.2 秒就崩在宿主里，纹理 0）。用线程局部标志挡一层。
+static __thread int za_alloc_log_busy;
+static void za_alloc_log(const char *fmt, ...)
+{
+    char b[160];
+    va_list ap;
+    if (za_alloc_log_busy) return;
+    za_alloc_log_busy = 1;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    ZLOGE("%s", b);
+    za_alloc_log_busy = 0;
 }
 static void *za_guest_malloc_impl(size_t n)
 {
-    if (!za_alloc_mode()) return za_main_malloc(n);
-    return za_hdr_alloc(n ? n : 1, 16);
+    unsigned long lr0 = ZA_CALLER_LR();
+    void *p;
+    if (!za_alloc_mode()) p = za_main_malloc(n);
+    else p = za_hdr_alloc(n ? n : 1, 16);
+    if (p && n >= 0x10000) {
+        static int na;
+        if (na++ < 40) za_alloc_log("★ 大块分配 %zu 字节 -> %p（lr=%#lx）", n, p, lr0);
+    }
+    return p;
 }
 static void *za_guest_calloc_impl(size_t a, size_t b)
 {
@@ -3868,8 +4039,15 @@ static void *za_guest_realloc_impl(void *p, size_t n)
 }
 static void *za_guest_aligned_impl(size_t al, size_t n)
 {
-    if (!za_alloc_mode()) return za_main_aligned_alloc(al, n);
-    return za_hdr_alloc(n ? n : 1, al);
+    unsigned long lr0 = ZA_CALLER_LR();
+    void *p;
+    if (!za_alloc_mode()) p = za_main_aligned_alloc(al, n);
+    else p = za_hdr_alloc(n ? n : 1, al);
+    if (p && n >= 0x10000) {
+        static int na;
+        if (na++ < 40) za_alloc_log("★ 大块对齐分配 %zu 字节 (align %zu) -> %p（lr=%#lx）", n, al, p, lr0);
+    }
+    return p;
 }
 static void *za_guest_new_impl(size_t n) { return za_guest_malloc_impl(n ? n : 1); }
 static void *za_guest_new_aligned_impl(size_t n, size_t al) { return za_guest_aligned_impl(al, n); }
@@ -3878,6 +4056,13 @@ static void za_guest_delete_aligned_impl(void *p, size_t al) { (void)al; za_gues
 static const za_host_sym_t za_host_syms[] = {
     // loader 提供的「runtime object file」（真机由 nnrtld 提供）
     { "__nnDetailNintendoSdkRuntimeObjectFile", (void *)za_host_runtime_object_file },
+    // BinaryFileHeader 重定位诊断（透传 SDK 实现，只加日志）
+    { "_ZN2nn4util16BinaryFileHeader13GetFirstBlockEv", (void *)za_bfh_first },
+    { "_ZNK2nn4util16BinaryFileHeader13GetFirstBlockEv", (void *)za_bfh_first },
+    { "_ZN2nn4util16BinaryFileHeader18GetRelocationTableEv", (void *)za_bfh_reltab },
+    { "_ZNK2nn4util16BinaryFileHeader11IsRelocatedEv", (void *)za_bfh_isreloc },
+    { "_ZN2nn4util15RelocationTable8RelocateEv", (void *)za_reltab_reloc_h },
+    { "_ZN2nn4util15RelocationTable10UnrelocateEv", (void *)za_reltab_unreloc_h },
     // 分配器接管/隔离实验（files/za-alloc-takeover、files/za-quarantine 控制行为）
     { "malloc", (void *)za_guest_malloc_impl },
     { "free", (void *)za_guest_free_impl },
@@ -4105,7 +4290,23 @@ void *za_resolve_host(const char *name)
     if (p) return p;
     p = za_mod_lookup(&za_main_mod, name);
     if (p) return p;
-    return dlsym(RTLD_DEFAULT, name);
+    p = dlsym(RTLD_DEFAULT, name);
+    if (p) {
+        // ★ 2026-10-29 真机：落在这条兜底的符号会解析到 **bionic**（Scudo 堆）。
+        //   首帧那块资源容器就在 scudo:secondary 里，说明它的分配/释放走的是
+        //   bionic 而不是 main 的 musl —— 而我们的分配器钩子只看得到导入表。
+        //   把「谁走了兜底」逐个记下来，才知道该补哪几个名字。
+        static char seen[64][64];
+        static int nseen;
+        int known = 0;
+        for (int i = 0; i < nseen; i++) if (!strcmp(seen[i], name)) { known = 1; break; }
+        if (!known && nseen < 64) {
+            snprintf(seen[nseen], sizeof seen[0], "%s", name);
+            nseen++;
+            ZLOGE("★ 导入走 bionic 兜底：%s -> %p", name, p);
+        }
+    }
+    return p;
 }
 
 static void *za_resolve(const char *name, unsigned index)
@@ -4430,22 +4631,23 @@ unsigned long za_tls_mrs_hook(void)
 #define ZA_FS_SET_BITS 16
 #define ZA_FS_SET_SIZE (1u << ZA_FS_SET_BITS)
 static void *za_fs_set[ZA_FS_SET_SIZE];
+static size_t za_fs_set_sz[ZA_FS_SET_SIZE];
 static pthread_mutex_t za_fs_set_mtx = PTHREAD_MUTEX_INITIALIZER;
 static int za_fs_set_full_logged;
 static unsigned za_fs_foreign_free;
 
-static void za_fs_set_add(void *p)
+static void za_fs_set_add(void *p, size_t sz)
 {
     unsigned h = (unsigned)(((uintptr_t)p >> 4) & (ZA_FS_SET_SIZE - 1));
     pthread_mutex_lock(&za_fs_set_mtx);
     for (unsigned i = 0; i < ZA_FS_SET_SIZE; i++)
     {
         unsigned k = (h + i) & (ZA_FS_SET_SIZE - 1);
-        if (za_fs_set[k] == NULL) { za_fs_set[k] = p; break; }
+        if (za_fs_set[k] == NULL) { za_fs_set[k] = p; za_fs_set_sz[k] = sz; break; }
     }
     pthread_mutex_unlock(&za_fs_set_mtx);
 }
-static int za_fs_set_take(void *p)
+static int za_fs_set_take(void *p, size_t *sz_out)
 {
     unsigned h = (unsigned)(((uintptr_t)p >> 4) & (ZA_FS_SET_SIZE - 1));
     int found = 0;
@@ -4453,17 +4655,44 @@ static int za_fs_set_take(void *p)
     for (unsigned i = 0; i < ZA_FS_SET_SIZE; i++)
     {
         unsigned k = (h + i) & (ZA_FS_SET_SIZE - 1);
-        if (za_fs_set[k] == p) { za_fs_set[k] = NULL; found = 1; break; }
+        if (za_fs_set[k] == p) {
+            if (sz_out) *sz_out = za_fs_set_sz[k];
+            za_fs_set[k] = NULL; za_fs_set_sz[k] = 0; found = 1; break;
+        }
         if (za_fs_set[k] == NULL) break;
     }
     pthread_mutex_unlock(&za_fs_set_mtx);
     return found;
 }
+// fs/vtable 路径的隔离区：**不依赖全局接管**。
+// 大块资源缓冲（BNSH 容器）就是这条路上 posix_memalign 出来的（真机实测落在
+// scudo:secondary），所以只要这条路的释放被保留，就能验证「提前 free 是不是首帧墙」。
+#define ZA_FQN 256
+static void *za_fq_ptr[ZA_FQN];
+static size_t za_fq_sz[ZA_FQN];
+static int za_fq_n;
+static int za_fq_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-quarantine", F_OK) == 0;
+    return m;
+}
 static void za_fs_guard_free(void *p, const char *who)
 {
+    size_t sz = 0;
     if (!p) return;
-    if (za_fs_set_take(p)) {
-        if (za_mem_guest_owns(p)) za_mem_guest_free(p); else free(p);
+    if (za_fs_set_take(p, &sz)) {
+        if (za_fq_mode() && sz >= 32768 && za_fq_n < ZA_FQN) {
+            za_fq_ptr[za_fq_n] = p;
+            za_fq_sz[za_fq_n] = sz;
+            za_fq_n++;
+            if (za_fq_n <= 8 || (za_fq_n & 63) == 0)
+                ZLOGE("★ [fs-quarantine] 保留 %zu 字节块 %p（第 %d 块）", sz, p, za_fq_n);
+            return;                    // 不归还：验证悬空引用能否被救活
+        }
+        if (za_mem_guest_owns(p)) za_mem_guest_free(p);
+        else free(p);
         return;
     }
     if (za_fs_foreign_free++ < 6)
@@ -4474,7 +4703,7 @@ void *za_fs_alloc_host(unsigned long size)
 {
     // ★ fs 读缓冲交给客机写 ⇒ 走客机共享区（宿主堆会被客机越界写坏）
     void *p = za_mem_guest_alloc(size ? (size_t)size : 1, 16);
-    if (p) za_fs_set_add(p);
+    if (p) za_fs_set_add(p, (size_t)size);
     return p;
 }
 void za_fs_free_host(void *p)
@@ -4489,12 +4718,23 @@ void za_fs_free_host(void *p)
 // 不经过 fs 的那两个跳板，所以必须直接填 vtable。
 void *za_fs_vt_alloc(void *obj, unsigned long size, unsigned long align)
 {
+    unsigned long lr0 = ZA_CALLER_LR();
     (void)obj;
+    void *p = NULL;
     if (align < sizeof(void *)) align = sizeof(void *);
     if ((align & (align - 1)) != 0) align = 16;      // 非 2 的幂：退回 16
-    void *p = NULL;
-    if (posix_memalign(&p, (size_t)align, size ? (size_t)size : 1) != 0) return NULL;
-    za_fs_set_add(p);
+    // 接管模式下走同一套自带头部堆（接管模式本身有问题，默认不用）
+    if (za_alloc_mode()) p = za_guest_aligned_impl((size_t)align, size ? (size_t)size : 1);
+    else if (posix_memalign(&p, (size_t)align, size ? (size_t)size : 1) != 0) return NULL;
+    if (p) {
+        za_fs_set_add(p, size ? (size_t)size : 1);
+        // ★ 大块分配记一笔：首帧那块 grsc 资源容器到底是不是从这里出去的，
+        //   和大块读的 buf 地址一对照就知道。
+        if (size >= 0x10000) {
+            static int nv;
+            if (nv++ < 40) ZLOGE("★ fs vt 大块分配 %lu 字节 -> %p（lr=%#lx）", size, p, lr0);
+        }
+    }
     return p;
 }
 void za_fs_vt_free(void *obj, void *ptr, unsigned long size, unsigned long align)
@@ -5441,7 +5681,8 @@ int za_guest_relocate(unsigned char *base, za_guest_t *out)
             // 桩 0x2fc5a20 读 GOT 槽 0x3cea090，调用点 main+0x1a0495c 崩在里面
             // ⇒ 把槽号一起打出来，才能确定那到底是谁（名字表的两列都有偏移，不能靠猜）。
             if (name && (r->slot == 0x3cea090u || r->slot == 0x3cea098u ||
-                         r->slot == 0x3cea088u))
+                         r->slot == 0x3cea088u || r->slot == 0x3ce9b40u ||
+                         r->slot == 0x3ceab68u || r->slot == 0x3ceab60u))
                 ZLOGE("★ GOT 槽 %#x = %s -> %p", r->slot, name, p);
             if (p)
             {
