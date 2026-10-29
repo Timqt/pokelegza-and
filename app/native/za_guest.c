@@ -1222,6 +1222,55 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                             //   落到我们自己的页里。
                             if (rtn != 31) ucx->uc_mcontext.regs[rtn] =
                                 (unsigned long)(uintptr_t)za_zero_page;
+                            // ★ 2026-10-29：main+0x2554d8c 是「按 0x6c 步长遍历一张列表」
+                            //   的循环头（ldr w8,[x23,#0x30]），而列表基址与计数都可能是
+                            //   垃圾（x23 = x8 + [x9+0x30]，x20 = [x9+0x2c]）。逐次恢复只会
+                            //   把几万次迭代走完再放弃。把计数寄存器置 1，下一次
+                            //   subs/b.eq 就正常退出循环——等价于「这张表里没有更多项」。
+                            // ★ 首个坏读（main+0x250b0b8）处倒一次客机调用链：
+                            //   这条链是整棵「半初始化对象树」的起点，先确认是哪个子系统在问。
+                            if (in_main2 && (pcv2 - gb0) == 0x250b0b8ul) {
+                                static int nchain;
+                                if (nchain++ < 2) {
+                                    unsigned long long fp0 = (unsigned long long)ucx->uc_mcontext.regs[29];
+                                    static unsigned long long seen[8];
+                                    unsigned long long cur[8]; int nc = 0;
+                                    unsigned long long fp = fp0;
+                                    for (int i = 0; i < 8 && fp; i++) {
+                                        if (fp & 7) break;
+                                        unsigned long long nf = *(volatile unsigned long long *)(uintptr_t)fp;
+                                        unsigned long long lr = *(volatile unsigned long long *)(uintptr_t)(fp + 8);
+                                        if (!za_in_code((unsigned long)lr)) break;
+                                        cur[nc++] = lr;
+                                        if (nf <= fp || nf - fp > 0x100000ull) break;
+                                        fp = nf;
+                                    }
+                                    int dup = 1;
+                                    for (int i = 0; i < nc && dup; i++) if (cur[i] != seen[i]) dup = 0;
+                                    if (!dup) {
+                                        for (int i = 0; i < nc; i++) seen[i] = cur[i];
+                                        char cb[300]; char *cq = cb;
+                                        cq = za_put_str(cq, "ZaGuest: ★ 首个坏读调用链:");
+                                        for (int i = 0; i < nc && i < 8; i++) {
+                                            cq = za_put_str(cq, " ");
+                                            if (cur[i] >= gb0 && cur[i] < gb0 + ZA_IMAGE_SIZE)
+                                                cq = za_put_str(cq, "main+"), cq = za_put_hex(cq, cur[i] - gb0);
+                                            else
+                                                cq = za_put_hex(cq, cur[i]);
+                                        }
+                                        za_fatal_write(cb, (size_t)(cq - cb));
+                                    }
+                                }
+                            }
+                            if (in_main2 && (pcv2 - gb0) == 0x2554d8cul) {
+                                static int nloop;
+                                if (nloop++ < 8) {
+                                    char lb[160]; char *lq = lb;
+                                    lq = za_put_str(lq, "ZaGuest: ★ 垃圾列表遍历→提前结束 pc=+0x2554d8c");
+                                    za_fatal_write(lb, (size_t)(lq - lb));
+                                }
+                                ucx->uc_mcontext.regs[20] = 1;
+                            }
                             if (is_pair) {
                                 int rt2 = (int)((w >> 10) & 0x1fu);
                                 if (rt2 != 31) ucx->uc_mcontext.regs[rt2] = 0;
@@ -3905,6 +3954,22 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
             unsigned int *st = (unsigned int *)(base + 0x6048700u);
             st[0] = 0xd2800000u;   // mov x0, #0
             st[1] = 0xd65f03c0u;   // ret
+        }
+        // ★ 2026-10-29（A/B，默认关；files/za-nop-fill 打开）：
+        //   首个坏读的调用链是 main+0x251f814 ← 0xed91d4 ← 0xecafd0 ← 0xa6a6d8
+        //   ← 任务线程，中间 main+0x251f810 的 `bl 0x24fa77c` 会把一堆
+        //   **半初始化的 program wrapper** 填进表里（entry+0x68 是空/野），
+        //   之后整棵对象图带着垃圾往下走。把这个填充调用跳过，看引擎能否
+        //   继续到下一趟绘制——用来判断这一步是不是「可选的一趟」。
+        if (access("/data/user/0/org.pokelegza.android.port/files/za-nop-fill", F_OK) == 0) {
+            unsigned int *w = (unsigned int *)(base + 0x251f810u);
+            if (*w == 0x97ff6bdbu) {          // bl 0x24fa77c（原字节校验后才改）
+                *w = 0xd503201fu;             // nop
+                __builtin___clear_cache((char *)w, (char *)w + 4);
+                ZLOGE("★ A/B：已跳过 main+0x251f810 的 program wrapper 填充（bl→nop）");
+            } else {
+                ZLOGE("★ A/B：main+0x251f810 指令字不符（%#x），未打补丁", *w);
+            }
         }
         __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x800);
         mprotect(base + ZA_MPROBE_STUB, 0x1000, PROT_READ | PROT_EXEC);

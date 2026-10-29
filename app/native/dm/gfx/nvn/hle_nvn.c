@@ -83,6 +83,10 @@ typedef struct { const char *name; void *fn; } nvn_impl;
     DM_SECT(swnvn) static const nvn_impl e_##name = {#name, (void *)h_##name}; \
     static ret h_##name(__VA_ARGS__)
 
+// 帧管线计数（宿主侧诊断：首帧到底走到哪一步）
+// Frame-pipeline counters: how far the first frame actually gets.
+volatile unsigned long nvn_n_begin, nvn_n_end, nvn_n_submit, nvn_n_draw, nvn_n_present;
+volatile unsigned long nvn_n_fence, nvn_n_syncwait, nvn_n_acquire, nvn_n_presentcall;
 static int g_log;
 
 // 客机侧的返回地址：NVN 跳板（nvn_thunks.S）只改 x16/x17，不动 x30，
@@ -706,7 +710,7 @@ NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 // 围栏 = 「此前提交到队列的命令全部完成」：记下最近一次提交的栅栏值
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) {
-    if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueFenceSync 对象指针非法 %p", (void *)q); return; } (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = x_fence(); }
+    if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueFenceSync 对象指针非法 %p", (void *)q); return; } nvn_n_fence++; (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = x_fence(); }
 // 没围栏过的同步对象按真机行为等到超时；已围栏的只在 GPU 真正完成到该栅栏值后放行
 // 诊断：游戏每帧在 SyncWait / 读事件上等了多久、等的是落后最新提交几次的栅栏（每 300 帧一行）
 // A sync object that was never fenced waits until the timeout, as on the device; a fenced one is released only once the GPU has really completed up to that fence value
@@ -724,6 +728,7 @@ static void gw_report(void) {
 static int x_wait_sub(uint64_t sub, uint64_t timeout);
 NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
     const sync_t *o = (const sync_t *)s;
+    nvn_n_syncwait++;
     if (!o->fenced) return NVN_SYNC_WAIT_RESULT_TIMEOUT_EXPIRED;
 #ifdef __OHOS__   // 鸿蒙：先在翻译队列上等目标提交译完再问 GPU，并记等待统计（其他平台保持原逻辑）| HarmonyOS: wait on the translation queue for the target submit first, then ask the GPU, with wait statistics (other platforms keep the original logic)
     atomic_fetch_add(&g_gw_sync_n, 1); atomic_fetch_add(&g_gw_sync_lag, x_fence() - o->fence); if ((const void *)s == g_acq_sync) atomic_fetch_add(&g_gw_acq_n, 1); gw_report();
@@ -910,6 +915,7 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBeginRecording 对象指针非法 %p", (void *)c); return; }
     cmd_t *o = CB(c);
+    nvn_n_begin++;
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1;
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->begin = p;
@@ -917,6 +923,7 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferEndRecording 对象指针非法 %p", (void *)c); return 0; }
     cmd_t *o = CB(c);
+    nvn_n_end++;
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_END, 8);
     o->recording = 0;
     return (NVNcommandHandle)o->begin;
@@ -1080,10 +1087,14 @@ NVN(nvnCommandBufferSetPolygonOffsetClamp, void, NVNcommandBuffer *c, float fa, 
     *REC(c, OP_POLY_OFFSET, p_poly_offset) = (p_poly_offset){fa, un, cl};
 }
 NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n) {
-    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferDrawArrays 对象指针非法 %p", (void *)c); return; } *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n}; }
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferDrawArrays 对象指针非法 %p", (void *)c); return; }
+    nvn_n_draw++;
+    *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n};
+}
 NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
     int bv, int bi, int inst) {
     if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferDrawElementsInstanced 对象指针非法 %p", (void *)c); return; }
+    nvn_n_draw++;
     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, bi, inst, ib};
 }
 NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, int z) {
@@ -1385,6 +1396,7 @@ static uint64_t x_present_ticket(uint64_t job) {   // 出图任务执行完后�
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
     if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueSubmitCommands 对象指针非法 %p", (void *)q); return; }
     gfx_enter();
+    nvn_n_submit++;
     ((queue_t *)q)->submits++;
     xjob j = {XJ_SUBMIT, n, n > 0 ? malloc((size_t)n * sizeof *h) : NULL};   // 句柄数组是游戏的，入队时拷一份 | The handle array belongs to the game; copy it when enqueuing
     if (n > 0) memcpy(j.h, h, (size_t)n * sizeof *h);
@@ -1491,6 +1503,7 @@ extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同�
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     if (!nvn_obj_ok(w, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnWindowAcquireTexture 对象指针非法 %p", (void *)w); return 0; }
     win_t *o = (win_t *)w;
+    nvn_n_acquire++;
     *idx = o->ntex ? o->next++ % o->ntex : 0;
     // 垂直同步阻塞在这里（真机 NVN：交换链里的贴图都在等显示时，等下一张被释放），不在出图里——游戏常持锁调出图
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock

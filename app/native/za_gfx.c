@@ -195,6 +195,20 @@ static void *za_gfx_stat_thread(void *arg)
         za_xbg_stats s;
         memset(&s, 0, sizeof s);
         xbg_game_get_stats(&s);
+        {
+            extern volatile unsigned long nvn_n_begin, nvn_n_end, nvn_n_submit, nvn_n_draw, nvn_n_present;
+            extern volatile unsigned long nvn_n_fence, nvn_n_syncwait, nvn_n_acquire;
+            static unsigned long pb, pe, ps, pd, pp, pf, pw, pa;
+            if (nvn_n_begin != pb || nvn_n_end != pe || nvn_n_submit != ps ||
+                nvn_n_draw != pd || nvn_n_present != pp || nvn_n_fence != pf ||
+                nvn_n_syncwait != pw || nvn_n_acquire != pa) {
+                ZLOGI("★ 帧管线：Acquire=%lu Fence=%lu SyncWait=%lu Begin=%lu End=%lu Submit=%lu Draw=%lu Present=%lu",
+                      nvn_n_acquire, nvn_n_fence, nvn_n_syncwait, nvn_n_begin, nvn_n_end,
+                      nvn_n_submit, nvn_n_draw, nvn_n_present);
+                pb = nvn_n_begin; pe = nvn_n_end; ps = nvn_n_submit; pd = nvn_n_draw; pp = nvn_n_present;
+                pf = nvn_n_fence; pw = nvn_n_syncwait; pa = nvn_n_acquire;
+            }
+        }
         if (memcmp(&s, &last, sizeof s) != 0) {
             ZLOGI("★ 图形层统计：submit=%llu draw=%llu dispatch=%llu present=%llu shader=%llu",
                   (unsigned long long)s.submissions, (unsigned long long)s.draws,
