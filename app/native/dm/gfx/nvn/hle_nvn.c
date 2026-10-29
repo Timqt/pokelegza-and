@@ -18,6 +18,9 @@
 // sync object = submit fence value, and waits are released only after the GPU completes.
 // Every implementation gets a compile-time signature check against the prototypes in nvn_protos.h (NVNboolean parameters are received as uint32_t, only the low 8 bits are looked at).
 // Environment switches: DM_NVN_FRAMES=N prints the call table per frame for the first N frames (default 3); DM_NVN_TSV=path writes the per-frame call table and timing to a TSV (DM_NVN_TSV_CALLS=0 writes timing only); DM_SLOWFRAME=1 writes only the per-frame breakdown of dropped frames to the log; DM_NVN_LOG=1 logs object creation.
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // process_vm_readv（转储着色器代码时用来安全读客机内存）
+#endif
 #include "../../host/hle.h"
 #include "nvn_protos.h"
 #include "nvn_pool_flags_registry.h"
@@ -33,6 +36,8 @@
 #include <mach/mach.h>
 #include <TargetConditionals.h>
 #include <unistd.h>
+#include <sys/uio.h>
+#include <sys/stat.h>
 #if TARGET_OS_OSX
 #define DM_MEM_CAP_DEFAULT_GB 24
 #else
@@ -100,9 +105,27 @@ static int nvn_obj_ok(const void *p, size_t len)
 {
     unsigned long long a = (unsigned long long)(uintptr_t)p;
     a &= 0x00FFFFFFFFFFFFFFull;            // 去掉 TBI 标记
-    if (a < 0x10000ull) return 0;          // 近空指针（0x10 这类）
+    // ★ 2026-10-29 真机：客机映像在 4GB（0x100000000）、SDK 在 8GB（0x200000000），
+    //   而**最低的合法内存映射是 16GB（0x400000000，GetInfo 0x2/0x3/0xc 都这么报）**。
+    //   所以低于 16GB 的指针一律不是对象：既挡住 0x10 这类近空，也挡住
+    //   0x10a992 / 0x5f0084 这类「把代码/rodata 地址当对象」的实机形态。
+    if (a < 0x400000000ull) return 0;
     if (a >= 0x800000000000ull) return 0;  // 内核区 / 非法
     if (a + len < a) return 0;             // 长度溢出
+    // ★ 2026-10-29 真机：引擎还会把**客机代码段地址**当对象传（实测
+    //   nvnProgramInitialize(p=0x10a992)，我们 memset 进 .text ⇒ SIGBUS 打死宿主）。
+    //   NVN 对象只可能是游戏在堆上分配的，落在映像的代码/只读段就一定不是。
+    {
+        extern unsigned char *za_guest_base;
+        extern unsigned long long za_sdk_base, za_sdk_size;
+        unsigned long long gb = (unsigned long long)(uintptr_t)za_guest_base;
+        // 与 app/native/za_guest_info.h 的 ZA_IMAGE_SIZE / ZA_DATA_OFF 保持一致
+        // （dm 层不引我们的内核头，改这里要同步那边）。
+        if (gb && a >= gb && a < gb + 0x5f7a000ull) {
+            if (a < gb + 0x39e1000ull) return 0;             // text + rodata
+        }
+        if (za_sdk_base && a >= za_sdk_base && a < za_sdk_base + za_sdk_size) return 0;
+    }
     return 1;
 }
 
@@ -441,7 +464,8 @@ NVN(nvnTextureCompare, NVNboolean, const NVNtexture *a, const NVNtexture *b) {
 }
 // 头文件无原型；main 0x174899c 一类调用点把返回值与 1 比，不等则置某状态位 0x100。含义未核，先给 1
 // No prototype in the header; call sites such as main 0x174899c compare the return value with 1 and set some status bit 0x100 if not equal. Meaning unverified; return 1 for now
-NVN_NOPROTO(nvnTextureGetRawStorageClass, int, const NVNtexture *t) { (void)t; return 1; }
+NVN_NOPROTO(nvnTextureGetRawStorageClass, int, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetRawStorageClass 对象指针非法 %p", (void *)t); return 0; } (void)t; return 1; }
 #define VW(v) ((view_t *)(v))
 NVN(nvnTextureViewSetDefaults, void, NVNtextureView *v) {
     if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewSetDefaults 对象指针非法 %p", (void *)v); return; } memset(v, 0, sizeof(view_t)); }
@@ -549,11 +573,127 @@ NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
 }
 NVN(nvnProgramFinalize, void, NVNprogram *p) {
     if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramFinalize 对象指针非法 %p", (void *)p); return; } prog_t *o = (prog_t *)p; snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->magic = 0; }
+
+// 引擎固定传 n 个 NVNshaderData，未用的槽是 {data=0, control=垃圾}（真机实测：
+// 顶点-only 的 program 里 sd[1].data==0、sd[1].control 指向一段代码块）。
+// 只保留 data 非零的条目并收紧 n——否则那个假阶段会被当真实阶段建管线。
+// The engine always passes n entries; unused ones have data == 0 (control is junk).
+static int nvn_stage_filter(NVNshaderData *dst, const NVNshaderData *src, int n)
+{
+    int k = 0;
+    for (int i = 0; i < n; i++)
+        if (src[i].data) dst[k++] = src[i];
+    return k;
+}
+
+// ── 着色器控制段自检（诊断，不改变行为）──────────────────────────────
+// 引擎每次 nvnProgramSetShaders 都把 NVNshaderData{data, control} 交进来。
+// 这里用引擎自己的 xbg_shader_control_key 算出键，再看 files/shaders/<键>.xgs
+// 在不在。这样在「还没走到建管线」的时候就能回答两件事：
+//   ① 引擎手里的 control 是不是真的（首字应为 0x34127698）；
+//   ② 我们离线产出的 17,284 个包覆盖不覆盖引擎真正会要的键。
+// Diagnostics only: derive the engine's own key from the control blob and check
+// whether our bundle exists. Validates the shader chain without a draw.
+int xbg_shader_control_key(const void *data, char out[17]);
+static char g_shader_dir_cache[256];
+static void nvn_shader_selfcheck(const NVNshaderData *sd, int n)
+{
+    static int hits, miss, bad, logged;
+    if (!g_shader_dir_cache[0]) {
+        const char *d = getenv("ZA_SHADER_DIR");
+        snprintf(g_shader_dir_cache, sizeof g_shader_dir_cache, "%s",
+                 d ? d : "/data/user/0/org.pokelegza.android.port/files/shaders");
+    }
+    for (int i = 0; i < n; i++) {
+        const void *ctl = sd[i].control;
+        if (!ctl) continue;
+        if (!nvn_obj_ok(ctl, 4)) { bad++; continue; }
+        unsigned int magic = *(const unsigned int *)ctl;
+        // 控制段首 4 字节是 34 12 76 98（参考工程里按字节串 "34127698" 找），
+        // 按小端读成 u32 是 0x98761234 —— 别写成字节串的顺序。
+        if (magic != 0x98761234u) {
+            bad++;
+            {   static int nb;
+                if (nb < 3) {
+                    nb++;
+                    const unsigned char *p8 = (const unsigned char *)ctl;
+                    LOG("[nvn] 坏控制段 stage=%d magic=%#x head=%02x%02x%02x%02x %02x%02x%02x%02x",
+                        i, magic, p8[0], p8[1], p8[2], p8[3], p8[4], p8[5], p8[6], p8[7]);
+                }
+            }
+            continue;
+        }
+        char key[17];
+        if (xbg_shader_control_key(ctl, key) != 0) { bad++; continue; }
+        char path[340];
+        snprintf(path, sizeof path, "%s/%s.xgs", g_shader_dir_cache, key);
+        if (access(path, F_OK) == 0) {
+            hits++;
+            if (logged < 6) { logged++; LOG("[nvn] 着色器键命中 %s stage=%d", key, i); }
+        } else {
+            miss++;
+            if (logged < 12) { logged++; LOG("[nvn] 着色器键缺失 %s stage=%d（包不在 %s）", key, i, g_shader_dir_cache); }
+            // ★ 缺失的键多半是 main NSO 里的内建着色器（我们的容器扫描覆盖不到）。
+            //   把 control 与 code 原样转储，离线用 bnsh_xlate 翻译后补包。
+            // Missing keys are usually shaders embedded in the main NSO; dump control+code for offline translation.
+            {
+                static int dumped;
+                if (dumped < 200) {
+                    const void *code = (const void *)(uintptr_t)sd[i].data;   // data 是 NVNbufferAddress（整数）
+                    if (code && nvn_obj_ok(code, 0x40)) {
+                        char dir[300], fp[360];
+                        snprintf(dir, sizeof dir, "%s/../za_shaderdump", g_shader_dir_cache);
+                        mkdir(dir, 0777);
+                        snprintf(fp, sizeof fp, "%s/%s.ctl", dir, key);
+                        FILE *f = fopen(fp, "wb");
+                        if (f) { fwrite(ctl, 1, 0x880, f); fclose(f); }
+                        snprintf(fp, sizeof fp, "%s/%s.code", dir, key);
+                        f = fopen(fp, "wb");
+                        if (f) {
+                            // ⚠ 不能直接 fwrite(code,1,0x10000)：代码块可能贴着映射边界，
+                            //   越界读会在 libc 的 memcpy 里 SIGBUS 打死宿主（真机踩过）。
+                            //   用 process_vm_readv 分块读，读不到就停。
+                            static unsigned char chunk[4096];
+                            for (unsigned long off = 0; off < 0x40000; off += sizeof chunk) {
+                                struct iovec lo2 = { chunk, sizeof chunk };
+                                struct iovec ro2 = { (void *)(uintptr_t)((unsigned long long)code + off), sizeof chunk };
+                                ssize_t got = process_vm_readv(getpid(), &lo2, 1, &ro2, 1, 0);
+                                if (got <= 0) break;
+                                fwrite(chunk, 1, (size_t)got, f);
+                                if ((size_t)got < sizeof chunk) break;
+                            }
+                            fclose(f);
+                        }
+                        dumped++;
+                        LOG("[nvn] 已转储缺失着色器 %s（stage=%d）", key, i);
+                    }
+                }
+            }
+        }
+    }
+    if ((hits + miss) && ((hits + miss) % 2000) < n)
+        LOG("[nvn] 着色器自检累计：命中 %d 缺失 %d 坏控制段 %d", hits, miss, bad);
+    {   // 头几次无论如何说一句，否则「没输出」分不清是没调还是全被判坏
+        static int first;
+        if (first < 3) {
+            first++;
+            LOG("[nvn] 自检首调：n=%d data0=%#llx ctl0=%p magic0=%#x data1=%#llx ctl1=%p magic1=%#x 目录=%s",
+                n, (unsigned long long)(n > 0 ? sd[0].data : 0), (n > 0 ? sd[0].control : NULL),
+                (n > 0 && nvn_obj_ok(sd[0].control, 4)) ? *(const unsigned int *)sd[0].control : 0u,
+                (unsigned long long)(n > 1 ? sd[1].data : 0), (n > 1 ? sd[1].control : NULL),
+                (n > 1 && nvn_obj_ok(sd[1].control, 4)) ? *(const unsigned int *)sd[1].control : 0u,
+                g_shader_dir_cache);
+        }
+    }
+}
+
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     { unsigned long _glr = NVN_GUEST_LR();
+      if (n > 0 && !nvn_obj_ok(sd, (size_t)n * sizeof *sd)) { static int _s; if (_s++ < 4) LOG("【红】nvnProgramSetShaders sd 非法 %p", (const void *)sd); return 0; }
       if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramSetShaders 非法对象 %p（按成功处理）", (void *)p); return 1; } }
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShaders 阶段数 %d", n); return 0; }
+    nvn_shader_selfcheck(sd, n);
     snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
     OLOG("ProgramSetShaders %p n=%d data0=%#llx", (void *)p, n, n ? (unsigned long long)sd[0].data : 0ull);
     return 1;
@@ -1970,7 +2110,8 @@ NVN(nvnSamplerPoolGetSize, int, const NVNsamplerPool *p) {
 NVN(nvnDeviceRegisterFastClearColor, NVNboolean, NVNdevice *d, const float *c, NVNformat f) { (void)d; (void)c; (void)f; return 1; }
 NVN(nvnSamplerBuilderSetReductionFilter, void, NVNsamplerBuilder *b, NVNsamplerReduction r) {
     if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetReductionFilter 对象指针非法 %p", (void *)b); return; } (void)b; (void)r; }
-NVN_NOPROTO(nvnQueueBuilderSetQueuePriority, void, NVNqueueBuilder *b, int p) { (void)b; (void)p; }
+NVN_NOPROTO(nvnQueueBuilderSetQueuePriority, void, NVNqueueBuilder *b, int p) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueBuilderSetQueuePriority 对象指针非法 %p", (void *)b); return; } (void)b; (void)p; }
 
 // 状态对象：缺的这几个都是「记录进状态、回放时用」的，取值按 NVN/GL 语义
 NVN(nvnBlendStateGetBlendTarget, int, const NVNblendState *s) { return (int)((const blend_st *)s)->target; }
@@ -2064,10 +2205,19 @@ NVN(nvnCommandBufferSetConservativeRasterEnable, void, NVNcommandBuffer *c, uint
     if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetConservativeRasterEnable 对象指针非法 %p", (void *)c); return; } (void)c; (void)v; }
 // 带扩展阶段的着色器绑定：与 SetShaders 同一份存储（n 可到 6）
 NVN_NOPROTO(nvnProgramSetShadersExt, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
+    if (n > 0 && n <= 6 && !nvn_obj_ok(sd, (size_t)n * sizeof *sd)) {   // sd 本身也可能是野指针
+        static int _s; if (_s++ < 4) LOG("【红】ProgramSetShadersExt sd 非法 %p n=%d", (const void *)sd, n);
+        return 0;
+    }
+    if (n > 0 && n <= 6) nvn_shader_selfcheck(sd, n);   // 自检放在守卫之前：p 非法时也要验证着色器数据
+    if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramSetShadersExt 对象指针非法 %p", (void *)p); return 0; }
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShadersExt 阶段数 %d", n); return 0; }
-    snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o);
-    o->nstage = n; memcpy(o->sd, sd, (size_t)n * sizeof *sd); o->serial = nvn_new_serial();
-    OLOG("ProgramSetShadersExt %p n=%d", (void *)p, n);
-    return 1;
+    {   NVNshaderData tmp[6];
+        int k = nvn_stage_filter(tmp, sd, n);      // 丢掉 data==0 的空槽（见函数注释）
+        snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o);
+        o->nstage = k; memcpy(o->sd, tmp, (size_t)k * sizeof *tmp); o->serial = nvn_new_serial();
+        OLOG("ProgramSetShadersExt %p n=%d 实存=%d", (void *)p, n, k);
+        return 1;
+    }
 }

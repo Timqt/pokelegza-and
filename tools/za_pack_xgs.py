@@ -90,6 +90,15 @@ def trim_caps(spv):
         elif op == 25 and n >= 9 and w[i + 3] == 1:    # OpTypeImage Dim = 1D
             uses_img1d = True
         i += n
+    caps = set()
+    i0 = 5
+    while i0 < len(w):
+        n0 = w[i0] >> 16
+        if n0 == 0 or i0 + n0 > len(w):
+            break
+        if (w[i0] & 0xFFFF) == 17:
+            caps.add(w[i0 + 1])
+        i0 += n0
     drop = set()
     if not uses_group:
         drop |= {61, 62, 63, 64, 65, 66}
@@ -101,12 +110,20 @@ def trim_caps(spv):
         drop.add(25)
     out = w[:5]
     i = 5
+    kept_ext = False
+    VPIL = b"SPV_EXT_shader_viewport_index_layer"
     while i < len(w):
         n = w[i] >> 16
         if n == 0 or i + n > len(w):
             break
         op = w[i] & 0xFFFF
-        if op == 10:                              # OpExtension：引擎一律拒绝
+        if op == 10:                              # OpExtension
+            # 引擎对扩展一律 fatal，只有我们真的在设备上启用的那个放行
+            # （顶点着色器写 gl_Layer 需要它）。其余照旧删掉。
+            raw = struct.pack("<%dI" % (n - 1), *w[i + 1:i + n]).split(b"\0", 1)[0]
+            if raw == VPIL:
+                kept_ext = True
+                out.extend(w[i:i + n])
             i += n
             continue
         if op == 17 and n >= 2 and w[i + 1] in drop:   # OpCapability
@@ -114,6 +131,16 @@ def trim_caps(spv):
             continue
         out.extend(w[i:i + n])
         i += n
+    if 5254 in caps and not kept_ext:
+        # spirv-val 要求用 ShaderViewportIndexLayerEXT 的模块声明对应 SPIR-V 扩展；
+        # Ryujinx 没写，这里补上（引擎侧只有启用设备扩展时才放行）。
+        ext = [1 << 16 | 10] + list(struct.unpack("<%dI" % ((len(VPIL) + 4) // 4),
+                                                   VPIL.ljust((len(VPIL) + 4) // 4 * 4, b"\0")))
+        # 插在最后一条 OpCapability 之后（SPIR-V 头部顺序：Capability*, Extension*）
+        at = 5
+        while at < len(out) and (out[at] & 0xFFFF) == 17:
+            at += out[at] >> 16
+        out = out[:at] + ext + out[at:]
     return struct.pack("<%dI" % len(out), *out)
 
 def load_core():
@@ -194,6 +221,8 @@ def main():
     ap.add_argument("--containers", type=Path, default=ROOT / "work" / "shaders_all")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--keep-temp", action="store_true")
+    ap.add_argument("--flat", action="store_true",
+                    help="把 <键>_<SPH>_<stage>.spv 里的 <键> 直接当控制段键（内建着色器用）")
     args = ap.parse_args()
 
     opt = os.environ.get("SPIRV_OPT", DEFAULT_OPT)
@@ -237,12 +266,15 @@ def main():
         if STAGE.get(stage_c) is None:
             stats["未知阶段"] += 1
             continue
-        b0 = starts.get(bnsh)
+        b0 = starts.get(bnsh) if not args.flat else 0
         if b0 is None:
             stats["没有该容器"] += 1
             skipped.append(spv_path.stem)
             continue
-        ctl = keys.get((bnsh, b0 + sph, stage_c.lower()))
+        if args.flat:
+            ctl = bnsh
+        else:
+            ctl = keys.get((bnsh, b0 + sph, stage_c.lower()))
         if ctl is None:
             stats["没有控制段键"] += 1
             skipped.append(spv_path.stem)

@@ -166,6 +166,11 @@ def decode_tex(slots, h, image):
 def export(key, stage, c1, spv, res):
     """改写后的 SPIR-V + 翻译器的 res.json → vk.json（字段见 pack_game_shaders.py） | Rewritten SPIR-V + the translator's res.json → vk.json (fields: see pack_game_shaders.py)"""
     caps, exts, deco, types, ptr, var, names, consts = spirv_info(spv)
+    # 顶点着色器写 gl_Layer 需要 SPV_EXT_shader_viewport_index_layer；引擎在设备支持时
+    # 已放开这个扩展（xbg_game.cpp 的 OpExtension 白名单），所以这里放行它。
+    # Vertex shaders writing gl_Layer need this SPIR-V extension; the engine allows it
+    # when the device extension is enabled, so accept it here.
+    exts = [e for e in exts if e != 'SPV_EXT_shader_viewport_index_layer']
     if exts: raise ValueError('残留扩展 ' + ','.join(exts))
     by_bind = {}
     for vid, (pt, sc) in var.items():

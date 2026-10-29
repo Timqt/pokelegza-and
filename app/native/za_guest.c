@@ -651,6 +651,22 @@ static void za_log_obj_rtti(unsigned long long obj_raw)
     za_fatal_write(bb, (size_t)(qq - bb));
 }
 
+
+// 这个地址是不是「可执行代码」：客机映像 / SDK 映像 / 任何已加载模块。
+// ⚠ 不能只用 dladdr：客机与 SDK 的映像是我们自己 mmap 进来的，动态链接器
+//   不认识它们（实测客机地址 dladdr 返回 0）。
+static int za_in_code(unsigned long a)
+{
+    extern unsigned char *za_guest_base;
+    extern volatile unsigned long za_sdk_base, za_sdk_size;
+    if (!a) return 0;
+    if (za_guest_base && a >= (unsigned long)(uintptr_t)za_guest_base &&
+        a < (unsigned long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE) return 1;
+    if (za_sdk_base && a >= za_sdk_base && a < za_sdk_base + za_sdk_size) return 1;
+    { Dl_info di; memset(&di, 0, sizeof di); if (dladdr((void *)(uintptr_t)a, &di) && di.dli_fbase) return 1; }
+    return 0;
+}
+
 static void za_fatal_handler(int sig, siginfo_t *info, void *ctx);
 
 // 帧快照（定义在 za_horizon.c）：0x14457c 三条 svc 时刻的整帧内容
@@ -939,6 +955,39 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
     //   等于自己制造全局停摆。真机实测：两次这样的信号之后主线程就再也不动了，
     //   NVN 永远 submit=0。现在一律忽略，采样改走专用信号 63。
     if (info && info->si_code <= 0) return;
+    // ★★ 2026-10-29：**跳转到垃圾地址**（野 vptr / 被释放对象里的函数指针）。
+    //   这类故障以前没有恢复路径：pc 不在我们的映像里，所有「解码故障指令」的
+    //   降级都不匹配，只能交回致命流程 ⇒ 进程当场死。
+    //   真机实测形态：`blr x8` 且 x8 = 0x74736e75007463（一段字符串字节）。
+    //   语义上「这次间接调用没有目标」最接近的等价物是**让它立刻返回 0**：
+    //   把 pc 设回 x30（调用方的返回地址），x0 = 0。
+    //   用 dladdr 判断 pc 是否落在任何已加载模块里：落不进 ⇒ 一定不是可执行代码。
+    if ((sig == SIGSEGV || sig == SIGBUS) && ctx)
+    {
+        ucontext_t *ucj = (ucontext_t *)ctx;
+        unsigned long pcj = (unsigned long)ucj->uc_mcontext.pc;
+        if (!za_in_code(pcj))
+        {
+            unsigned long lrj = (unsigned long)ucj->uc_mcontext.regs[30];
+            // 返回地址必须是真代码，否则这次「返回」只会掉进下一个坑
+            if (za_in_code(lrj))
+            {
+                static int nj;
+                if (nj++ < 24) {
+                    char b[200];
+                    char *q = b;
+                    q = za_put_str(q, "ZaGuest: ★ 野调用→按返回0处理 pc=");
+                    q = za_put_hex(q, (unsigned long long)pcj);
+                    q = za_put_str(q, " x30=");
+                    q = za_put_hex(q, (unsigned long long)lrj);
+                    za_fatal_write(b, (size_t)(q - b));
+                }
+                ucj->uc_mcontext.regs[0] = 0;
+                ucj->uc_mcontext.pc = lrj;
+                return;
+            }
+        }
+    }
     // ★ 2026-10-28：「名字表缺失」修复（不受 ZA_NULLRECOVER 影响）。
     //   主映像里有一组「按序号取名字」的小访问器（main+0x1757a6c / 0x1757a98），
     //   形状都是
@@ -952,7 +1001,10 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
     //       容器 +0x58 == 0  ⇒ 访问器走 cbz，返回空串/0（=「没有名字」）
     //       容器 +0x28 = 极大值 ⇒ 析构时的引用计数递减永远不到 0，不会 free 它
     //   写回 [obj+0x1f8] 后**重执行**故障指令（pc 不变），后续每次访问都命中假表。
-    if (ctx && sig == SIGSEGV && info)
+    // ★ 2026-10-29：SIGBUS 与 SIGSEGV 是同一类「解引用了不可用地址」的故障
+    //   （真机同一个 `ldr w8,[x23,#0x30]` 站点前几次报 SIGSEGV、最后一次报 SIGBUS，
+    //   而这里只放行 SIGSEGV ⇒ 最后一次没人接，进程当场死）。
+    if (ctx && (sig == SIGSEGV || sig == SIGBUS) && info)
     {
         extern unsigned char *za_guest_base;
         ucontext_t *ucx = (ucontext_t *)ctx;
@@ -985,12 +1037,15 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 //   原样返回 false（读到 0），引擎就会**正常构建**进这块内存。
                 //   ⚠ 静态池不归客机分配器管：如果引擎最终 free() 它们，会在
                 //   销毁阶段炸；目前的优先级是先让首帧流程走通。
-                { 0x250b0e8u, 0x250b0f4u, 0 },
+                { 0x250b0e8u, 0x250b0f4u, 1 },
             };
             // ★ 先补存储：main+0x250b0e8 `ldrb w8,[x8]` 且 x8==0，x0=entry。
             //   给 entry->0x68 塞一块零内存 → 重执该 ldrb（读 0 → 查询返回 false
             //   → 调用方走「构建」分支，把对象初始化进我们这块内存）。
-            if (pcx == gb0 + 0x250b0e8ul &&
+            static int pool_on = -1;
+            if (pool_on < 0)
+                pool_on = access("/data/user/0/org.pokelegza.android.port/files/za-wrap-pool", F_OK) == 0;
+            if (pool_on && pcx == gb0 + 0x250b0e8ul &&
                 *(volatile unsigned int *)(uintptr_t)pcx == 0x39400108u &&
                 ucx->uc_mcontext.regs[8] == 0 && ucx->uc_mcontext.regs[0] != 0)
             {
@@ -1097,15 +1152,24 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     // 「看起来像真对象」的区间不动，避免把正常的越界写也一起盖掉。
                     if (is_st && rnn != 31 && rnn != 30 &&
                         (saddr < 0x4000000000ull || saddr >= 0x1000000000000ull)) {
-                        static unsigned long stpc[8];
-                        static unsigned stn[8];
+                        static unsigned long stpc[16];
+                        static unsigned stn[16];
                         int slot = 0;
-                        for (int i2 = 0; i2 < 8; i2++) {
-                            if (stpc[i2] == pcv2) { slot = i2; break; }
-                            if (stpc[i2] == 0) { stpc[i2] = pcv2; slot = i2; break; }
-                            if (i2 == 7) slot = (int)((pcv2 >> 2) & 7u);
+                        {
+                            int found = 0, empty = -1;
+                            for (int i2 = 0; i2 < 16; i2++) {
+                                if (stpc[i2] == pcv2) { slot = i2; found = 1; break; }
+                                if (empty < 0 && stpc[i2] == 0) empty = i2;
+                            }
+                            if (!found) {
+                                // ★ 换成另一个 PC 时必须清零计数：以前 8 个槽被挤满后，
+                                //   新 PC 直接继承别人的计数（≥64）⇒ 一次都不救就放弃
+                                //   （真机：main+0x2554d8c 的 `ldr w8,[x23,#0x30]` 没被救）。
+                                slot = empty >= 0 ? empty : (int)((pcv2 >> 2) & 15u);
+                                stpc[slot] = pcv2; stn[slot] = 0;
+                            }
                         }
-                        if (stn[slot] < 64) {
+                        if (stn[slot] < 4096) {
                             stn[slot]++;
                             if (is_pair) {
                                 ucx->uc_mcontext.pc = pcv2 + 4;   // 配对写：整条跳过
@@ -1129,15 +1193,21 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     // 小的近空读交给后面的「近空读恢复」（它会置 0 并跳过，语义更准）
                     if (is_ld && saddr < 0x1000ull) { /* fallthrough */ }
                     else if (is_ld && rtn != 31 && rnn != 30) {
-                        static unsigned long badpc[8];
-                        static unsigned cnt[8];
+                        static unsigned long badpc[16];
+                        static unsigned cnt[16];
                         int slot = 0, i;
-                        for (i = 0; i < 8; i++) {
-                            if (badpc[i] == pcv2) { slot = i; break; }
-                            if (badpc[i] == 0) { badpc[i] = pcv2; slot = i; break; }
-                            if (i == 7) slot = (int)((pcv2 >> 2) & 7u);
+                        {
+                            int found = 0, empty = -1;
+                            for (i = 0; i < 16; i++) {
+                                if (badpc[i] == pcv2) { slot = i; found = 1; break; }
+                                if (empty < 0 && badpc[i] == 0) empty = i;
+                            }
+                            if (!found) {
+                                slot = empty >= 0 ? empty : (int)((pcv2 >> 2) & 15u);
+                                badpc[slot] = pcv2; cnt[slot] = 0;   // 同 store：换 PC 清零
+                            }
                         }
-                        if (cnt[slot] < 64) {
+                        if (cnt[slot] < 4096) {   // 上限放大：引擎同一个站点可能反复解引用空/野对象
                             cnt[slot]++;
                             {
                                 static int once;

@@ -323,7 +323,23 @@ class Program
                     catch (Exception he) { extra = " hdrFail:" + he.GetType().Name; }
                     Console.WriteLine($"    [HDR] SPH@0x{sph:X} stage={stage}{extra} size={ctx.Size} cb1Size={ctx.Cb1DataSize}");
                 }
-                var prog = ctx.Translate(isCompute);
+                ShaderProgram prog;
+                try
+                {
+                    prog = ctx.Translate(isCompute);
+                }
+                catch (Exception e1)
+                {
+                    // ★ 优化器/AST 重建偶尔会抛（实测 AstTextureOperation 的 InvalidCast）。
+                    //   参考工程（d2r build_shaders.py）的做法：用 DebugMode 再翻一次
+                    //   ——DebugMode 跳过 AST 优化器，语义不变，只是产物临时变量多。
+                    //   Optimizer/AST rebuilds occasionally throw; d2r retries with DebugMode.
+                    var flags2 = TranslationFlags.DebugMode | (isCompute ? TranslationFlags.Compute : 0);
+                    var ctx2 = Translator.CreateContext((ulong)codeStart, acc,
+                        new TranslationOptions(TargetLanguage.Spirv, TargetApi.Vulkan, flags2));
+                    prog = ctx2.Translate(isCompute);
+                    Console.Error.WriteLine($"    [DebugMode 重试] {Path.GetFileName(path)} SPH@0x{sph:X} ← {e1.GetType().Name}");
+                }
                 if (prog.BinaryCode == null || prog.BinaryCode.Length == 0) { skipped++; continue; }
                 string spvName = Path.GetFileNameWithoutExtension(path) + "_" + $"{sph:X8}_{stage}.spv";
                 File.WriteAllBytes(Path.Combine(sub, spvName), prog.BinaryCode);

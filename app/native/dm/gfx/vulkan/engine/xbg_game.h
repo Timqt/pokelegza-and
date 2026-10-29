@@ -17,6 +17,8 @@ typedef struct xbg_game_config {
     uint32_t queue_family;
     VkPhysicalDeviceFeatures enabled_core;
     VkBool32 enabled_shader_draw_parameters;
+    /* VK_EXT_shader_viewport_index_layer enabled at device creation (vertex shaders writing gl_Layer). */
+    VkBool32 enabled_viewport_index_layer;
     uint64_t fence_timeout_ns;
     const char *shader_directory; /* <control-sha256-first16>.xgs bundles */
     void *userdata;
