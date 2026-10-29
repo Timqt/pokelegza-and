@@ -847,6 +847,8 @@ static unsigned long long za_fake_registry[0x40];   // 0x200 字节，+0x80 处�
 static unsigned long long za_fake_lookup[0x10];
 static unsigned long long za_fake_table[0x20];
 static char za_fake_name[8] __attribute__((aligned(8)));
+// 悬空/不可读内存的「安全替身」：64KB 全零，可读写。
+static unsigned char za_zero_page[65536] __attribute__((aligned(4096)));
 static volatile int za_fake_ready;
 
 // 「合法名字结构」：引擎解出来的名字是自相对偏移格式（反汇编 main+0x17389a0）：
@@ -957,6 +959,64 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
             //     ldr x8,[x0,#0x28] ; cbz ; ldr x8,[x8,#0x20] ; cbz ; ldrb w8,[x8,#0x110]
             //   字段指向未映射内存时，语义上等价于「没有这个对象」⇒ 返回 false 最温和。
             //   它只影响一个布尔查询，不改任何资源状态。
+            // ★ 通用降级：**在客机/SDK 映像内的普通 load，目标地址不可读** ⇒ 读到 0 并跳过。
+            //   这一族崩溃都是「某个对象字段指向已释放/未重定位的内存，代码直接解引用」，
+            //   真机实测形如 `[obj+0x28] -> 0xb400006ee3xxxxxx`（宿主 malloc 区的悬空指针），
+            //   崩在多个站点（main+0x250b0b8、main+0x2553b90 …）。
+            //   保守条件：① pc 在 main/sdk 映像内；② 指令是 ldr/ldrb/ldrh/ldrsw；
+            //             ③ 目标地址 >= 0x1000（近空指针另有专门恢复）；
+            //             ④ 同一 pc 最多恢复 64 次（防止原地空转）。
+            if (gb0 || za_sdk_base) {
+                unsigned long pcv2 = pcx;
+                int in_main2 = gb0 && pcv2 >= gb0 && pcv2 < gb0 + ZA_IMAGE_SIZE;
+                extern volatile unsigned long za_sdk_base, za_sdk_size;
+                int in_sdk2 = za_sdk_base && pcv2 >= za_sdk_base &&
+                              pcv2 < za_sdk_base + za_sdk_size;
+                unsigned long long saddr = (unsigned long long)(uintptr_t)info->si_addr;
+                if ((in_main2 || in_sdk2) && saddr >= 0x1000ull) {
+                    unsigned int w = *(volatile unsigned int *)(uintptr_t)pcv2;
+                    unsigned int rtn = w & 0x1fu, rnn = (w >> 5) & 0x1fu;
+                    int is_ld = 0;
+                    switch (w & 0xffc00000u) {
+                    case 0xf9400000u: case 0xb9400000u: case 0x39400000u:
+                    case 0x79400000u: case 0xb9800000u: is_ld = 1; break;
+                    default: break;
+                    }
+                    if (is_ld && rnn != 31 && rnn != 30) {
+                        static unsigned long badpc[8];
+                        static unsigned cnt[8];
+                        int slot = 0, i;
+                        for (i = 0; i < 8; i++) {
+                            if (badpc[i] == pcv2) { slot = i; break; }
+                            if (badpc[i] == 0) { badpc[i] = pcv2; slot = i; break; }
+                            if (i == 7) slot = (int)((pcv2 >> 2) & 7u);
+                        }
+                        if (cnt[slot] < 64) {
+                            cnt[slot]++;
+                            // ★ 置 0 会被调用方原样往下传（真机：x21=0 → 崩在
+                            //   main+0x254f4f8 的 `str x8,[x0]`）。改成指向一页全零的
+                            //   安全内存：非空（过 cbz）、任何读取都得 0、写入也只是
+                            //   落到我们自己的页里。
+                            if (rtn != 31) ucx->uc_mcontext.regs[rtn] =
+                                (unsigned long)(uintptr_t)za_zero_page;
+                            ucx->uc_mcontext.pc = pcv2 + 4;
+                            if (cnt[slot] <= 3) {
+                                char b[176];
+                                char *q = b;
+                                q = za_put_str(q, "ZaGuest: ★ 悬空读取→置0 pc=+");
+                                q = za_put_hex(q, (unsigned long long)(pcv2 - (in_main2 ? gb0 : za_sdk_base)));
+                                q = za_put_str(q, " addr=");
+                                q = za_put_hex(q, saddr);
+                                q = za_put_str(q, "（第 ");
+                                q = za_put_dec(q, cnt[slot]);
+                                q = za_put_str(q, " 次）\n");
+                                za_fatal_write(b, (size_t)(q - b));
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
             if (pcx == gb0 + 0x250b0b8ul &&
                 *(volatile unsigned int *)(uintptr_t)pcx == 0xf9401108u)   // ldr x8,[x8,#0x20]
             {

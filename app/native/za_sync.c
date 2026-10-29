@@ -894,21 +894,17 @@ int za_sync_grow_full_lq(void)
         if (!za_sync_read(&cap, q + 8, 4)) continue;
         if (!za_sync_read(&used, q + 0xc, 4)) continue;
         if (!za_sync_read(&head, q + 0x10, 4)) continue;
-        // 触发条件：容量有效，且「有发送方在等」或 used==cap（队满的两种观测面）
-        // ⚠ 校验要严：候选里混进了非队列结构（cap=2）时，曾经把别人的内存改坏。
-        if (cap < 8 || cap > 0x10000 || used > cap) continue;
-        if (arr < 0x10000ull || (arr & 0x00FF000000000000ull) != 0) continue;   // 数组指针必须像客机堆
+        // 触发条件：**必须真的满**（used == cap）且容量/数组指针都合法。
+        // ⚠ 校验要严：候选里混进了非队列结构（cap=2）时，曾经把别人的内存改坏；
+        //   启动阶段的短暂「有发送方在等」也不该扩（扩容是有代价的动作）。
+        if (cap < 8 || cap > 0x10000 || used != cap) continue;
+        // 数组指针可能带 TBI 标记（0xb4…）或落在宿主堆，先掩掉高位再判断。
         {
-            unsigned int w20 = 0;
-            if (!za_sync_read(&w20, q + 0x20, 4)) continue;
-            int sw = 0;
-            for (int s2 = 0; s2 < ZS_MAX; s2++) {
-                zs_slot_t *w2 = &zs_slots[s2];
-                if (!__atomic_load_n(&w2->tid, __ATOMIC_RELAXED)) continue;
-                if (w2->kind == 3 && w2->addr == q + 0x20) sw++;
-            }
-            if (!sw && used != cap) continue;      // 既没发送方在等、也没满 ⇒ 不扩
+            unsigned long long am = arr & 0x00FFFFFFFFFFFFFFull;
+            if (am < 0x10000ull || am >= 0x800000000000ull || (am & 7)) continue;
+            arr = am;
         }
+
         if (cap >= 0x10000) continue;
         unsigned int ncap = cap * 4;
         unsigned long long *na = calloc(ncap, 8);
@@ -921,11 +917,22 @@ int za_sync_grow_full_lq(void)
             na[k] = v;
         }
         if (!ok) { free(na); continue; }
+        {
+            // 拿队列的用户态自旋锁（q+0x18）：Push/TryReceive 都在它保护下改环。
+            // 拿不到就放弃本轮（下一轮再看），绝不无锁换数组——那会丢消息。
+            unsigned int lk = 0;
+            if (!__atomic_compare_exchange_n((unsigned int *)(uintptr_t)(q + 0x18), &lk, 1u,
+                                             0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                free(na);
+                continue;
+            }
+        }
         __atomic_store_n((unsigned long long *)(uintptr_t)q, (unsigned long long)(uintptr_t)na,
                          __ATOMIC_RELEASE);
         __atomic_store_n((unsigned int *)(uintptr_t)(q + 8), ncap, __ATOMIC_RELEASE);
         __atomic_store_n((unsigned int *)(uintptr_t)(q + 0xc), used, __ATOMIC_RELEASE);
         __atomic_store_n((unsigned int *)(uintptr_t)(q + 0x10), 0u, __ATOMIC_RELEASE);
+        __atomic_store_n((unsigned int *)(uintptr_t)(q + 0x18), 0u, __ATOMIC_RELEASE);   // 解锁
         ZLOGE("★ 满队列扩容 %#llx：%u/100 → %u，%u 条消息已搬移", q, used, ncap, used);
         grown++;
     }

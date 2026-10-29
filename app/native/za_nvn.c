@@ -379,6 +379,25 @@ static void *za_nvn_tick_main(void *p)
             if (k && sig_n++ < 8)
                 ZLOGI("★ 已置位 %d 个事件句柄（外部事件实验）", k);
         }
+        // ★ 工作队列看门狗（闸门 A 的修复）：引擎的工作分发是 index 广播队列，
+        //   一旦消费方卡住、队列塞满 100/100，所有生产者（含主线程）会永久堵在
+        //   SendLightMessageQueue 里。真机验证：把满队列扩容后流水线立刻恢复
+        //   （纹理 10 → 18/21）。这里每 ~200ms 检查一次并扩容，而不是等
+        //   10 秒一次的停摆快照。存在 files/za-no-lqgrow 可关闭。
+        if ((za_nvn_ticks % 12) == 0) {
+            extern int za_sync_grow_full_lq(void);
+            static int off = -1;
+            if (off < 0)
+                off = access("/data/user/0/org.pokelegza.android.port/files/za-no-lqgrow",
+                             F_OK) == 0;
+            if (!off) {
+                int lg = za_sync_grow_full_lq();
+                if (lg) {
+                    static int nlog;
+                    if (nlog++ < 32) ZLOGI("★ 队列看门狗：扩容 %d 个满队列", lg);
+                }
+            }
+        }
         // ★ 停摆侦测：NVN 进展（贴图/命令缓冲/提交/呈现）20 秒没变 ⇒ 主动给客机
         //   主线程发 SIGSEGV 让致命处理器把客机调用栈倒进 files/za_fatal.log。
         //   客机整体睡死时 svc 计数还在缓慢增长（条件变量分片返回），按 svc 判卡死
