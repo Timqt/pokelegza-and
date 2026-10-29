@@ -89,6 +89,41 @@ volatile unsigned long nvn_n_begin, nvn_n_end, nvn_n_submit, nvn_n_draw, nvn_n_p
 volatile unsigned long nvn_n_fence, nvn_n_syncwait, nvn_n_acquire, nvn_n_presentcall;
 static int g_log;
 
+// 安全探读客机内存：读不到就返回 0，**不会**因为悬空指针把宿主打死。
+// 实测教训（dm77）：着色器自检直接 `*(const unsigned int *)ctl` 读控制段，
+// 而 ctl 指向的资源块已经被提前释放 ⇒ 宿主 SIGSEGV（崩点 selfcheck+308）。
+// Fault-free probe read of guest memory: a dangling pointer returns 0 instead of
+// killing the host (dm77 crashed exactly there, selfcheck+308).
+static int nvn_peek(void *dst, const void *src, size_t n)
+{
+    if (!src || !n) return 0;
+#if defined(__ANDROID__)
+    struct iovec lo = { dst, n }, ro = { (void *)(uintptr_t)src, n };
+    return process_vm_readv(getpid(), &lo, 1, &ro, 1, 0) == (ssize_t)n;
+#else
+    memcpy(dst, src, n); return 1;
+#endif
+}
+
+// 帧管线的「第一枪」是谁开的：把 Acquire / Begin / End / Submit / Present 的
+// 首次调用者记下来。真机实测一直是 Acquire=1 Begin=1 End=1 Submit=0，光看数字
+// 分不清「游戏主循环在跑第一帧」还是「引擎自己在初始化」，看调用者就一目了然。
+// lr 必须在处理函数**入口**用 NVN_GUEST_LR() 取好再传进来：一旦调用任何函数，
+// x30 就变成那个函数的返回地址了。
+// Who fires the frame pipeline: record the first caller of each stage, so
+// "Acquire=1 Begin=1 End=1 Submit=0" can be read for what it is. The lr must be
+// captured at the handler's entry; any call clobbers x30.
+static void nvn_log_first(const char *who, unsigned long lr)
+{
+    extern unsigned char *za_guest_base;
+    unsigned long long gb = (unsigned long long)(uintptr_t)za_guest_base;
+    unsigned long long a = (unsigned long long)lr & 0x00FFFFFFFFFFFFFFull;
+    if (gb && a >= gb && a < gb + 0x5f7a000ull)
+        LOG("[nvn] ★ 首次 %s：调用者 main+%#llx", who, a - gb);
+    else
+        LOG("[nvn] ★ 首次 %s：调用者 %#llx（不在客机映像内 → 引擎/宿主驱动）", who, a);
+}
+
 // 客机侧的返回地址：NVN 跳板（nvn_thunks.S）只改 x16/x17，不动 x30，
 // 所以实现函数入口处的 x30 仍然是客机那条 blr 的返回地址。
 // 用途：引擎拿「空对象+偏移」来调 NVN 时，直接看是**哪段客机代码**给的。
@@ -611,8 +646,12 @@ static void nvn_shader_selfcheck(const NVNshaderData *sd, int n)
     for (int i = 0; i < n; i++) {
         const void *ctl = sd[i].control;
         if (!ctl) continue;
-        if (!nvn_obj_ok(ctl, 4)) { bad++; continue; }
-        unsigned int magic = *(const unsigned int *)ctl;
+        // 先把整段控制段探读到本地再做任何判断：ctl 可能指向已被释放的资源块，
+        // 裸读会把宿主打死（dm77 selfcheck+308）。
+        unsigned char sctl[0x880];
+        if (!nvn_peek(sctl, ctl, sizeof sctl)) { bad++; continue; }
+        unsigned int magic;
+        memcpy(&magic, sctl, 4);
         // 控制段首 4 字节是 34 12 76 98（参考工程里按字节串 "34127698" 找），
         // 按小端读成 u32 是 0x98761234 —— 别写成字节串的顺序。
         if (magic != 0x98761234u) {
@@ -620,15 +659,14 @@ static void nvn_shader_selfcheck(const NVNshaderData *sd, int n)
             {   static int nb;
                 if (nb < 3) {
                     nb++;
-                    const unsigned char *p8 = (const unsigned char *)ctl;
                     LOG("[nvn] 坏控制段 stage=%d magic=%#x head=%02x%02x%02x%02x %02x%02x%02x%02x",
-                        i, magic, p8[0], p8[1], p8[2], p8[3], p8[4], p8[5], p8[6], p8[7]);
+                        i, magic, sctl[0], sctl[1], sctl[2], sctl[3], sctl[4], sctl[5], sctl[6], sctl[7]);
                 }
             }
             continue;
         }
         char key[17];
-        if (xbg_shader_control_key(ctl, key) != 0) { bad++; continue; }
+        if (xbg_shader_control_key(sctl, key) != 0) { bad++; continue; }
         char path[340];
         snprintf(path, sizeof path, "%s/%s.xgs", g_shader_dir_cache, key);
         if (access(path, F_OK) == 0) {
@@ -913,17 +951,26 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
     uint8_t *p = o->cur; o->cur += size; put_hdr(p, 0, size); return p;
 }
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
+    unsigned long lr0 = NVN_GUEST_LR();
     if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBeginRecording 对象指针非法 %p", (void *)c); return; }
     cmd_t *o = CB(c);
     nvn_n_begin++;
+    if (nvn_n_begin == 1) nvn_log_first("nvnCommandBufferBeginRecording", lr0);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1;
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->begin = p;
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
+    unsigned long lr0 = NVN_GUEST_LR();
     if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferEndRecording 对象指针非法 %p", (void *)c); return 0; }
     cmd_t *o = CB(c);
     nvn_n_end++;
+    if (nvn_n_end == 1) {
+        // 录制里到底有没有内容：字节数为 0 = 游戏只开了个空缓冲，Submit=0 就不奇怪了
+        LOG("[nvn] ★ 首个命令缓冲：Begin→End 录了 %u 字节（cb=%p）",
+            (unsigned)(o->cur && o->begin ? (size_t)(o->cur - o->begin) : 0), (void *)c);
+        nvn_log_first("nvnCommandBufferEndRecording", lr0);
+    }
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_END, 8);
     o->recording = 0;
     return (NVNcommandHandle)o->begin;
@@ -1394,9 +1441,11 @@ static uint64_t x_present_ticket(uint64_t job) {   // 出图任务执行完后�
     return tk;
 }
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
+    unsigned long lr0 = NVN_GUEST_LR();
     if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueSubmitCommands 对象指针非法 %p", (void *)q); return; }
     gfx_enter();
     nvn_n_submit++;
+    if (nvn_n_submit == 1) nvn_log_first("nvnQueueSubmitCommands", lr0);
     ((queue_t *)q)->submits++;
     xjob j = {XJ_SUBMIT, n, n > 0 ? malloc((size_t)n * sizeof *h) : NULL};   // 句柄数组是游戏的，入队时拷一份 | The handle array belongs to the game; copy it when enqueuing
     if (n > 0) memcpy(j.h, h, (size_t)n * sizeof *h);
@@ -1501,9 +1550,11 @@ static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
+    unsigned long lr0 = NVN_GUEST_LR();
     if (!nvn_obj_ok(w, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnWindowAcquireTexture 对象指针非法 %p", (void *)w); return 0; }
     win_t *o = (win_t *)w;
     nvn_n_acquire++;
+    if (nvn_n_acquire == 1) nvn_log_first("nvnWindowAcquireTexture", lr0);
     *idx = o->ntex ? o->next++ % o->ntex : 0;
     // 垂直同步阻塞在这里（真机 NVN：交换链里的贴图都在等显示时，等下一张被释放），不在出图里——游戏常持锁调出图
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
@@ -1830,8 +1881,10 @@ static uint64_t present_period(const win_t *o) {
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
+    unsigned long lr0 = NVN_GUEST_LR();
     if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueuePresentTexture 对象指针非法 %p", (void *)q); return; }
     (void)q; win_t *o = (win_t *)w; o->presents++;
+    if (o->presents == 1) nvn_log_first("nvnQueuePresentTexture", lr0);
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     // 第一次进局的读取画面：后台管线预热没跑完就在这里等它（读取画面多停一会儿），进局后不在提交线程现编管线。预热早已完成时一次判断即过
     // Loading screen on first entering a run: if the background pipeline warm-up has not finished, wait for it here (the loading screen stays a bit longer), so that after entering the run no pipelines are compiled on the fly on the submit thread. When warm-up finished long ago this passes with a single check
