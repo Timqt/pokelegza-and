@@ -1220,8 +1220,16 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                             //   main+0x254f4f8 的 `str x8,[x0]`）。改成指向一页全零的
                             //   安全内存：非空（过 cbz）、任何读取都得 0、写入也只是
                             //   落到我们自己的页里。
-                            if (rtn != 31) ucx->uc_mcontext.regs[rtn] =
-                                (unsigned long)(uintptr_t)za_zero_page;
+                            if (rtn != 31) {
+                                // A/B（files/za-null-dangle）：把悬空读恢复成**真 0**。
+                                // 给非空假指针会骗过引擎自己的 cbz 判空，可能正是下游
+                                // 一连串垃圾的源头；0 至少会让它走「没有这个对象」的分支。
+                                static int null_dangle = -1;
+                                if (null_dangle < 0)
+                                    null_dangle = access("/data/user/0/org.pokelegza.android.port/files/za-null-dangle", F_OK) == 0;
+                                ucx->uc_mcontext.regs[rtn] = null_dangle
+                                    ? 0ul : (unsigned long)(uintptr_t)za_zero_page;
+                            }
                             // ★ 2026-10-29：main+0x2554d8c 是「按 0x6c 步长遍历一张列表」
                             //   的循环头（ldr w8,[x23,#0x30]），而列表基址与计数都可能是
                             //   垃圾（x23 = x8 + [x9+0x30]，x20 = [x9+0x2c]）。逐次恢复只会
@@ -1231,6 +1239,24 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                             //   这条链是整棵「半初始化对象树」的起点，先确认是哪个子系统在问。
                             if (in_main2 && (pcv2 - gb0) == 0x250b0b8ul) {
                                 static int nchain;
+                                if (nchain < 2) {
+                                    // 这块就是 GetFirstBlock() 返回的资源块：把头部与那个
+                                    // 悬空字段都倒出来，判断「被释放」还是「从没重定位」。
+                                    unsigned long long blk = (unsigned long long)ucx->uc_mcontext.regs[0];
+                                    unsigned long long b = blk & 0x00FFFFFFFFFFFFFFull;
+                                    if (b >= 0x10000ull && b < 0x800000000000ull) {
+                                        unsigned long long q[8] = {0};
+                                        struct iovec lo3 = { q, sizeof q }, ro3 = { (void *)(uintptr_t)b, sizeof q };
+                                        int okr = process_vm_readv(getpid(), &lo3, 1, &ro3, 1, 0) == (ssize_t)sizeof q;
+                                        unsigned long long fld = 0; int fmapped = 0;
+                                        if (okr) {
+                                            struct iovec lo4 = { &fld, 8 }, ro4 = { (void *)(uintptr_t)(q[5]), 8 };
+                                            fmapped = process_vm_readv(getpid(), &lo4, 1, &ro4, 1, 0) == 8;
+                                        }
+                                        ZLOGE("[nvn-diag] 首个坏读的块 blk=%#llx 可读=%d 头=%#llx %#llx %#llx %#llx | %#llx %#llx %#llx %#llx | [blk+0x28]=%#llx 可读=%d",
+                                            b, okr, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[5], fmapped);
+                                    }
+                                }
                                 if (nchain++ < 2) {
                                     unsigned long long fp0 = (unsigned long long)ucx->uc_mcontext.regs[29];
                                     static unsigned long long seen[8];
@@ -1570,6 +1596,25 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     return;
                     }
                 }
+            }
+        }
+    }
+    // ★ 2026-10-29（A/B，默认关；files/za-kill-thread 打开）：
+    //   走到这里说明所有定点/通用降级都没接住。若出错的不是客机主线程，
+    //   只终结这一条线程、让进程继续跑——用来判断「主线程还能不能提交一帧」。
+    //   Kill only the faulting thread (not the process) when it is not the guest main.
+    if (ctx) {
+        static int kill_on = -1;
+        if (kill_on < 0)
+            kill_on = access("/data/user/0/org.pokelegza.android.port/files/za-kill-thread", F_OK) == 0;
+        if (kill_on) {
+            long me = (long)syscall(SYS_gettid);
+            if (za_guest_tid > 0 && me != za_guest_tid) {   // ⚠ za_guest_tid 未设置时别乱杀（会杀掉 UI 线程）
+                static int nk;
+                if (nk++ < 8)
+                    ZLOGE("★ A/B：只终止出错线程 tid=%ld（pc=%#lx），进程继续", me,
+                          (unsigned long)((ucontext_t *)ctx)->uc_mcontext.pc);
+                syscall(SYS_exit, 0);
             }
         }
     }
@@ -3497,9 +3542,102 @@ static unsigned za_ngc_check(void *self, unsigned *masks, unsigned pat,
 //   自带的 musl 分配器（za_mod_lookup(&za_main_mod,...) 先命中），不是宿主 Scudo；
 //   在 free 包装里调 malloc_usable_size 会对这些指针直接 abort（进程信号 6，
 //   连致命处理器都来不及跑）。这条弯路已经试过，别再走。
+
+// ── 分配器一致性垫片（2026-10-29，真机实测根因）────────────────────────
+// 客机的 malloc/free/calloc/realloc/operator new/delete 由 **main 自带的 musl** 提供，
+// 但下面这些 main 没导出、SDK 却导出了，于是被解析到 **SDK 自己的堆**：
+//     memalign / posix_memalign / strdup / operator new[] / operator delete[]
+// 于是同一块内存在 SDK 堆上分配、却由 musl 的 free 释放（或反过来）——
+// 两套堆混用必然损坏。真机表现就是「一块二进制资源被释放后仍在被引用」。
+// 这里把它们全部**改道到 main 的堆**，保证一套分配器。
+// Allocator consistency: route these to main's own musl heap instead of the SDK's.
+static za_mod_t za_main_mod;   // 前置声明（真正定义在下面，带初始化）
+static void *za_main_malloc(size_t n)
+{
+    void *(*f)(size_t) = (void *(*)(size_t))za_mod_lookup(&za_main_mod, "malloc");
+    return f ? f(n) : NULL;
+}
+static void *za_main_aligned_alloc(size_t align, size_t size)
+{
+    void *(*aa)(size_t, size_t) = (void *(*)(size_t, size_t))za_mod_lookup(&za_main_mod, "aligned_alloc");
+    if (!aa) return NULL;
+    if (align < sizeof(void *)) align = sizeof(void *);
+    if (align & (align - 1)) return NULL;                  // 必须是 2 的幂
+    size_t rounded = (size + align - 1) & ~(align - 1);    // aligned_alloc 要求 size 是 align 的倍数
+    if (rounded < size) return NULL;
+    return aa(align, rounded);
+}
+static void *za_shim_memalign(size_t align, size_t size) { return za_main_aligned_alloc(align, size); }
+static int za_shim_posix_memalign(void **out, size_t align, size_t size)
+{
+    if (!out) return 22;                                   // EINVAL
+    if (align < sizeof(void *) || (align & (align - 1))) return 22;
+    void *p = za_main_aligned_alloc(align, size);
+    if (!p) return 12;                                     // ENOMEM
+    *out = p;
+    return 0;
+}
+static char *za_shim_strdup(const char *str)
+{
+    if (!str) return NULL;
+    size_t n = strlen(str) + 1;
+    char *p = (char *)za_main_malloc(n);
+    if (p) memcpy(p, str, n);
+    return p;
+}
+static void *za_shim_new_array(size_t n)
+{
+    void *(*f)(size_t) = (void *(*)(size_t))za_mod_lookup(&za_main_mod, "_Znwm");
+    return f ? f(n) : za_main_malloc(n);
+}
+static void za_shim_delete_array(void *p)
+{
+    void (*f)(void *) = (void (*)(void *))za_mod_lookup(&za_main_mod, "_ZdlPv");
+    if (f) { f(p); return; }
+    void (*fr)(void *) = (void (*)(void *))za_mod_lookup(&za_main_mod, "free");
+    if (fr && p) fr(p);
+}
+// malloc_usable_size：main 与 SDK 都没导出，落 dlsym 会用 bionic 的元数据去读
+// musl 的指针。客机很少调；返回 0 比读坏元数据安全。
+static size_t za_shim_usable_size(void *p) { (void)p; return 0; }
+
+
+// C++17 对齐 / 不抛异常 / 数组变体：main 只导出了 _Znwm / _ZdlPv /
+// _ZnwmSt11align_val_t，其余全由 SDK 的 operator new/delete 提供（SDK 自己的堆）。
+// 全部改道到 main 的 musl，保证一套分配器。
+static void za_shim_note(const char *n)
+{
+    static int c;
+    if (c < 24) { c++; ZLOGE("★ 分配器垫片首次使用：%s", n); }
+}
+static void *za_shim_new_array_aligned(size_t n, size_t al)
+{
+    za_shim_note("_ZnamSt11align_val_t");
+    void *(*f)(size_t, size_t) = (void *(*)(size_t, size_t))za_mod_lookup(&za_main_mod, "_ZnwmSt11align_val_t");
+    if (f) return f(n, al);
+    return za_main_aligned_alloc(al, n);
+}
+static void za_shim_delete_aligned(void *p, size_t al) { (void)al; za_shim_note("_Zdl/_ZdaPvSt11align_val_t"); za_shim_delete_array(p); }
+static void *za_shim_new_nothrow(size_t n) { za_shim_note("_Znwm/_ZnamRKSt9nothrow_t"); return za_shim_new_array(n); }
+static void za_shim_delete_nothrow(void *p) { za_shim_note("_ZdlPv/_ZdaPvRKSt9nothrow_t"); za_shim_delete_array(p); }
+
 static const za_host_sym_t za_host_syms[] = {
     // loader 提供的「runtime object file」（真机由 nnrtld 提供）
     { "__nnDetailNintendoSdkRuntimeObjectFile", (void *)za_host_runtime_object_file },
+    // 分配器一致性（见上面 za_shim_* 的注释）：一律走 main 的 musl 堆
+    { "memalign", (void *)za_shim_memalign },
+    { "posix_memalign", (void *)za_shim_posix_memalign },
+    { "strdup", (void *)za_shim_strdup },
+    { "_Znam", (void *)za_shim_new_array },
+    { "_ZdaPv", (void *)za_shim_delete_array },
+    { "malloc_usable_size", (void *)za_shim_usable_size },
+    { "_ZnamSt11align_val_t", (void *)za_shim_new_array_aligned },
+    { "_ZdlPvSt11align_val_t", (void *)za_shim_delete_aligned },
+    { "_ZdaPvSt11align_val_t", (void *)za_shim_delete_aligned },
+    { "_ZnwmRKSt9nothrow_t", (void *)za_shim_new_nothrow },
+    { "_ZnamRKSt9nothrow_t", (void *)za_shim_new_nothrow },
+    { "_ZdlPvRKSt9nothrow_t", (void *)za_shim_delete_nothrow },
+    { "_ZdaPvRKSt9nothrow_t", (void *)za_shim_delete_nothrow },
 
     // ── hid 初始化：先接管成「成功」──────────────────────────────
     // nn::hid::InitializeNpad 会通过 CMIF 连 hid 服务、建共享内存；
@@ -3643,6 +3781,29 @@ static const za_host_sym_t za_host_syms[] = {
 // ── 已装载的两个模块（导出符号表）：main 与 SDK ──────────────────────
 static za_mod_t za_main_mod;
 static za_mod_t za_sdk_mod;
+
+// ★ 一次性探针：哪些「分配器」符号真的由 main / SDK 导出。
+// 两套堆是隐患：客机 malloc/free 在 main 自带的 musl 里，若某个分配入口 main
+// 没导出就会落到 dlsym → bionic 堆，之后被 musl 的 free 处理 ⇒ 堆损坏
+// （真机表现为「资源块释放后仍被引用」）。这里把归属打出来。
+void za_log_alloc_syms(void)
+{
+    static const char *names[] = {
+        "malloc", "free", "calloc", "realloc", "memalign", "aligned_alloc",
+        "posix_memalign", "strdup", "malloc_usable_size",
+        "_Znwm", "_Znam", "_ZdlPv", "_ZdaPv",
+        // C++17 对齐/不抛异常变体：这些如果落到 dlsym，就是 bionic 堆
+        "_ZnwmSt11align_val_t", "_ZnamSt11align_val_t",
+        "_ZdlPvSt11align_val_t", "_ZdaPvSt11align_val_t",
+        "_ZnwmRKSt9nothrow_t", "_ZnamRKSt9nothrow_t",
+        "_ZdlPvRKSt9nothrow_t", "_ZdaPvRKSt9nothrow_t", NULL
+    };
+    for (int k = 0; names[k]; k++) {
+        void *m = za_mod_lookup(&za_main_mod, names[k]);
+        void *d = za_mod_lookup(&za_sdk_mod, names[k]);
+        ZLOGI("分配器符号 %-16s main=%p sdk=%p", names[k], m, d);
+    }
+}
 static unsigned char *za_guest_main_base;
 
 // 解析客机导入的符号。顺序与上游 d2r-mobile 的 guest_sym 一致：

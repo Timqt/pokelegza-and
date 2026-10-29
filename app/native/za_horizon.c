@@ -1157,6 +1157,19 @@ static long za_horizon_dispatch(long a0, long a1, long a2, long a3,
     }
     case 5: // UnmapMemory(dst=x0, src=x1, size=x2)
     {
+        // ★ 诊断（2026-10-29）：首帧卡在一段**已释放的二进制资源块**上
+        //   （nn::util::BinaryFileHeader::GetFirstBlock() 指进去的那块被 munmap 了）。
+        //   这里把解映射的地址/大小/客机返回地址打出来，直接看到是谁放掉的。
+        //   Who unmapped the resource blob: log address, size and the guest LR.
+        {
+            static int nu;
+            if (nu < 40) {
+                nu++;
+                unsigned long lr = (unsigned long)za_horizon_regs[ZA_REG_PC];
+                ZLOGE("★ [unmap] dst=%#lx size=%#lx lr=%#lx",
+                      (unsigned long)a0, (unsigned long)a1, lr);
+            }
+        }
         return (long)za_mem_unmap_memory((unsigned long long)a0,
                                          (unsigned long long)a1,
                                          (unsigned long long)a2);

@@ -561,6 +561,7 @@ static void *guest_thread(void *arg)
     size_t me_len = 0;
     unsigned char *mexp = (unsigned char *)za_read_asset(assets, "guest/main_exports.bin", &me_len);
     if (mexp) za_guest_mod_init(mbase, mexp, me_len);
+    { extern void za_log_alloc_syms(void); }
 
     // ---- 第 2 步：装载 SDK NSO（提供 main 需要的 23,000 个 nn::* 符号）----
     size_t sts = 0, srs = 0, sds = 0, se_len = 0, sr_len = 0, sg_len = 0;
@@ -578,6 +579,7 @@ static void *guest_thread(void *arg)
         if (za_guest_load_sdk(stext, sts, srodata, srs, sdata, sds, 0xCEB20u,
                               sexp, se_len, srel, sr_len, sgate, sg_len) == 0)
         {
+            { extern void za_log_alloc_syms(void); za_log_alloc_syms(); }
             // ---- 第 3 步：重定位 main（它的导入会查到 SDK 的导出表）----
             za_guest_t g;
             if (za_guest_relocate(mbase, &g) == 0)
