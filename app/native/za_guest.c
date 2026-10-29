@@ -4397,6 +4397,8 @@ static void za_hook_m_dequeue(unsigned long long *r);static void za_hook_m_enq2(
 static void za_hook_m_enq3(unsigned long long *r);
 static void za_hook_m_jobenqueue(unsigned long long *r);
 static void za_hook_m_openfile(unsigned long long *r);
+static void za_hook_m_allocreq(unsigned long long *r);
+static void za_hook_m_alloctail(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
                                   void (*hook)(unsigned long long *));
@@ -4571,6 +4573,14 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd848fc, ZA_MPROBE_STUB + 0x480, ZA_MPROBE_SLOT + 0x48, za_hook_m_jobenqueue);
         za_install_main_probe(base, 0xd82644, ZA_MPROBE_STUB + 0x500, ZA_MPROBE_SLOT + 0x50, za_hook_m_enq2);
         za_install_main_probe(base, 0x16ffeb0, ZA_MPROBE_STUB + 0x580, ZA_MPROBE_SLOT + 0x58, za_hook_m_enq3);
+        // 引擎分配器失败现场（首帧墙的新解释：游戏自己 abort 了）：
+        //   abort 帧链 = main+0x102d3dc ← 0xf8aa3c ← 0x98efc0 ← 0x98eb78
+        //   main+0x102cf70 是个带「每线程在飞数组(16 格)」的分配封装：
+        //     计数 [TP+0x40]+0x98 == 0x10 ⇒ terminate；
+        //     blr [分配器 vtable+0x10](size=w1, align=w2) 返回 0 ⇒ 也 abort。
+        //   0x102d180 记录请求参数，0x102d3c8 是两条路都会经过的 abort 尾巴。
+        za_install_main_probe(base, 0x102d180, ZA_MPROBE_STUB + 0x600, ZA_MPROBE_SLOT + 0x60, za_hook_m_allocreq);
+        za_install_main_probe(base, 0x102d3c8, ZA_MPROBE_STUB + 0x680, ZA_MPROBE_SLOT + 0x68, za_hook_m_alloctail);
         // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
         //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
         //   main 的 BSS（pc=main+0x76b732c）。call 类指令不适合这套探针，已移除。
@@ -5504,6 +5514,36 @@ static void za_hook_m_enq3(unsigned long long *r)
     }
     ZLOGI("★ 真正入队 0x16ffeb0: x0=%#llx x1=%#llx x2=%#llx vt=%#llx 数量=%llu idx=%#llx lr=%#llx",
           r[0], r[1], r[2], vt, cnt, idx, r[19]);
+}
+
+// ★ 2026-10-30：引擎分配器（main+0x102cf70）的请求/失败现场。
+//   它每次分配都把对象指针压进「每线程在飞数组」（[TP+0x40]+0x98 是下标，
+//   满 0x10 直接 terminate），分配本身是一次虚调用 `blr [vt+0x10](size,align)`，
+//   返回 0 同样 abort。两个探针分别抓请求参数和 abort 尾巴上的现场。
+static unsigned long long za_alloc_req_sz, za_alloc_req_al, za_alloc_req_n;
+
+static void za_hook_m_allocreq(unsigned long long *r)
+{
+    unsigned long long k = __atomic_add_fetch(&za_alloc_req_n, 1, __ATOMIC_RELAXED);
+    za_alloc_req_sz = r[1];                 // w1 = size
+    za_alloc_req_al = r[2];                 // w2 = align
+    if (k <= 6) ZLOGI("★ 引擎分配请求 #%llu: size=%llu align=%llu", k, r[1], r[2]);
+}
+
+static void za_hook_m_alloctail(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 3) return;
+    // 探针桩保存了 x0..x17 + x29(fp) + x30(lr) ⇒ r[18] 就是 main+0x102cf70 的帧指针。
+    // 它的 prologue：x29=fp0、x24/x23=fp+0x10/0x18、x22/x21=fp+0x20/0x28、x20/x19=fp+0x30/0x38。
+    unsigned long fp = (unsigned long)r[18], x22 = 0, x19 = 0, alloc = 0, cnt = 0;
+    za_read_word(fp + 0x20, &x22);
+    za_read_word(fp + 0x38, &x19);
+    if (x22) za_read_word(x22 + 0x98, &cnt);
+    if (x19) za_read_word(x19 + 8, &alloc);
+    ZLOGI("★ 分配器 abort 尾巴：fp=%#lx x22=%#lx 在飞计数=%lu x19=%#lx 分配器=%#lx"
+          "｜最近请求 size=%llu align=%llu（累计 %llu 次）",
+          fp, x22, cnt, x19, alloc, za_alloc_req_sz, za_alloc_req_al, za_alloc_req_n);
 }
 
 // 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。

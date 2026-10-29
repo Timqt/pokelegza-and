@@ -13,6 +13,9 @@
 //
 // SDK 自己的内部指针（.data 里 24,977 个模块内偏移）由基址重定位修正 ✓。
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   // process_vm_readv（abort 栈回溯要安全读客机帧）
+#endif
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -21,6 +24,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <sys/syscall.h>
+#if defined(__ANDROID__)
+#include <sys/uio.h>
+#endif
 
 #include "za_common.h"
 #include "za_mod.h"
@@ -128,9 +134,25 @@ static void za_hook_assert_entry(unsigned long long *r) { za_probe_log("assert-e
 static void za_hook_assert_wrap(unsigned long long *r)  { za_probe_log("assert-wrap", r); }
 static void za_hook_assert_var(unsigned long long *r)   { za_probe_log("assert-va", r); }
 static void za_hook_assert_onfail(unsigned long long *r) { za_probe_log("assert-onfail", r); }
+// 安全读：帧链上的地址可能落在已被 munmap 的段里，直接解引用会把宿主打死。
+static int za_safe_rd(unsigned long long a, void *dst, size_t n)
+{
+#if defined(__ANDROID__)
+    struct iovec lo = { dst, n }, ro = { (void *)(uintptr_t)a, n };
+    return process_vm_readv(getpid(), &lo, 1, &ro, 1, 0) == (ssize_t)n;
+#else
+    memcpy(dst, (const void *)(uintptr_t)a, n);
+    return 1;
+#endif
+}
+
 // Abort 入口：除了参数，还要把 **调用者帧链** 走出来 —— abort 本身没有消息，
 // 唯一能定位的就是「谁调了它」。fp 是 0x9aba0 的帧指针（x29），
 // [fp]=上一帧 fp，[fp+8]=返回地址。
+// ★ 2026-10-30：连每帧的**保存寄存器区**一起打（fp+0x10..fp+0x38）。
+//   真机实测 abort 帧链落在 main+0x102d3dc，再往前一帧是 main+0x102cf70，
+//   它的 prologue 把 x24/x23/x22/x21/x20/x19 依次存到 fp+0x10..0x38 ——
+//   有了这几个值才能读出「每线程在飞计数」和「分配器对象」。
 static void za_hook_abort_entry(unsigned long long *r)
 {
     static int n;
@@ -144,16 +166,28 @@ static void za_hook_abort_entry(unsigned long long *r)
                         (fp >= 0x100000000ull && fp < 0x300000000ull);
         if (!plausible || (fp & 7)) break;
         unsigned long long nfp = 0, ra = 0;
-        memcpy(&nfp, (const void *)(uintptr_t)fp, 8);
-        memcpy(&ra, (const void *)(uintptr_t)(fp + 8), 8);
+        if (!za_safe_rd(fp, &nfp, 8) || !za_safe_rd(fp + 8, &ra, 8)) break;
+        unsigned long long regs[6] = {0};
+        int got = 0;
+        for (int k = 0; k < 6; k++)
+            if (za_safe_rd(fp + 0x10 + 8 * (unsigned long long)k, &regs[k], 8)) got = k + 1;
         if (ra >= za_sdk_base && ra < za_sdk_base + za_sdk_size)
-            ZLOGI("   abort fp[%d] ret=sdk+%#llx", i, ra - za_sdk_base);
+            ZLOGI("   abort fp[%d] ret=sdk+%#llx | fp+0x10..0x38 = %#llx %#llx %#llx %#llx %#llx %#llx",
+                  i, ra - za_sdk_base, got > 0 ? regs[0] : 0, got > 1 ? regs[1] : 0,
+                  got > 2 ? regs[2] : 0, got > 3 ? regs[3] : 0,
+                  got > 4 ? regs[4] : 0, got > 5 ? regs[5] : 0);
         else if (za_guest_base && ra >= (unsigned long long)(uintptr_t)za_guest_base &&
                  ra < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE)
-            ZLOGI("   abort fp[%d] ret=main+%#llx", i,
-                  ra - (unsigned long long)(uintptr_t)za_guest_base);
+            ZLOGI("   abort fp[%d] ret=main+%#llx | fp+0x10..0x38 = %#llx %#llx %#llx %#llx %#llx %#llx",
+                  i, ra - (unsigned long long)(uintptr_t)za_guest_base,
+                  got > 0 ? regs[0] : 0, got > 1 ? regs[1] : 0,
+                  got > 2 ? regs[2] : 0, got > 3 ? regs[3] : 0,
+                  got > 4 ? regs[4] : 0, got > 5 ? regs[5] : 0);
         else
-            ZLOGI("   abort fp[%d] ret=%#llx", i, ra);
+            ZLOGI("   abort fp[%d] ret=%#llx | fp+0x10..0x38 = %#llx %#llx %#llx %#llx %#llx %#llx",
+                  i, ra, got > 0 ? regs[0] : 0, got > 1 ? regs[1] : 0,
+                  got > 2 ? regs[2] : 0, got > 3 ? regs[3] : 0,
+                  got > 4 ? regs[4] : 0, got > 5 ? regs[5] : 0);
         if (nfp <= fp) break;
         fp = nfp;
     }
