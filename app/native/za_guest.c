@@ -953,6 +953,26 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
                 return;
             }
+            // ★ 悬空指针的**只读布尔查询**（main+0x250b0b0）：
+            //     ldr x8,[x0,#0x28] ; cbz ; ldr x8,[x8,#0x20] ; cbz ; ldrb w8,[x8,#0x110]
+            //   字段指向未映射内存时，语义上等价于「没有这个对象」⇒ 返回 false 最温和。
+            //   它只影响一个布尔查询，不改任何资源状态。
+            if (pcx == gb0 + 0x250b0b8ul &&
+                *(volatile unsigned int *)(uintptr_t)pcx == 0xf9401108u)   // ldr x8,[x8,#0x20]
+            {
+                static int nq;
+                ucx->uc_mcontext.regs[0] = 0;                    // w0 = false
+                ucx->uc_mcontext.pc = gb0 + 0x250b0d0ul;         // mov w0,wzr; ret
+                if (nq++ < 6) {
+                    char b[160];
+                    char *q = b;
+                    q = za_put_str(q, "ZaGuest: ★ 悬空字段→布尔查询返回 false（第 ");
+                    q = za_put_dec(q, (unsigned long long)nq);
+                    q = za_put_str(q, " 次）\n");
+                    za_fatal_write(b, (size_t)(q - b));
+                }
+                return;
+            }
         }
         unsigned long prev = pcx >= 4 ? *(volatile unsigned int *)(uintptr_t)(pcx - 4) : 0;
         unsigned long fi = *(volatile unsigned int *)(uintptr_t)pcx;
@@ -3877,7 +3897,12 @@ void za_dump_progress_stall(void)
         if (lg) {
             extern int za_sync_grow_full_lq(void);
             static int n;
-            if (n < 8) { int g = za_sync_grow_full_lq(); if (g) n++; }
+            // 每轮停摆都试：只要还有发送方被「队满」堵着，就继续扩。
+            // 真机实测：扩到 400 后纹理立刻从 10 涨到 21，说明这一环确实是死锁点。
+            if (n < 64) {
+                int g = za_sync_grow_full_lq();
+                if (g) { n++; ZLOGE("   ↳ 队列扩容累计 %d 次", n); }
+            }
         }
     }
     {

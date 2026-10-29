@@ -894,7 +894,21 @@ int za_sync_grow_full_lq(void)
         if (!za_sync_read(&cap, q + 8, 4)) continue;
         if (!za_sync_read(&used, q + 0xc, 4)) continue;
         if (!za_sync_read(&head, q + 0x10, 4)) continue;
-        if (!cap || cap > 0x10000 || used != cap) continue;     // 只扩「满」的
+        // 触发条件：容量有效，且「有发送方在等」或 used==cap（队满的两种观测面）
+        // ⚠ 校验要严：候选里混进了非队列结构（cap=2）时，曾经把别人的内存改坏。
+        if (cap < 8 || cap > 0x10000 || used > cap) continue;
+        if (arr < 0x10000ull || (arr & 0x00FF000000000000ull) != 0) continue;   // 数组指针必须像客机堆
+        {
+            unsigned int w20 = 0;
+            if (!za_sync_read(&w20, q + 0x20, 4)) continue;
+            int sw = 0;
+            for (int s2 = 0; s2 < ZS_MAX; s2++) {
+                zs_slot_t *w2 = &zs_slots[s2];
+                if (!__atomic_load_n(&w2->tid, __ATOMIC_RELAXED)) continue;
+                if (w2->kind == 3 && w2->addr == q + 0x20) sw++;
+            }
+            if (!sw && used != cap) continue;      // 既没发送方在等、也没满 ⇒ 不扩
+        }
         if (cap >= 0x10000) continue;
         unsigned int ncap = cap * 4;
         unsigned long long *na = calloc(ncap, 8);
