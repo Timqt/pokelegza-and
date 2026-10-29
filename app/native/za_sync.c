@@ -906,6 +906,9 @@ int za_sync_grow_full_lq(void)
         }
 
         if (cap >= 0x10000) continue;
+        // A/B 结论：+16 渐进扩容进程能活更久但推进更少（tex 恒 10）；
+        //   ×4 一次性扩容推进明显更多（tex 10→25、buf 12→37）。下游崩溃与
+        //   burst 无关（两种都崩/都卡），故选推进更多的 ×4。
         unsigned int ncap = cap * 4;
         unsigned long long *na = calloc(ncap, 8);
         if (!na) continue;
