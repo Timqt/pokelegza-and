@@ -3567,12 +3567,20 @@ static void *za_main_aligned_alloc(size_t align, size_t size)
     if (rounded < size) return NULL;
     return aa(align, rounded);
 }
-static void *za_shim_memalign(size_t align, size_t size) { return za_main_aligned_alloc(align, size); }
+// 见下面「分配器接管」一节：这几个按模式（files/za-alloc-takeover）分派
+static int za_alloc_mode(void);
+static void *za_guest_aligned_impl(size_t al, size_t n);
+static void *za_guest_malloc_impl(size_t n);
+static void *za_guest_new_impl(size_t n);
+static void *za_guest_new_aligned_impl(size_t n, size_t al);   // operator new(size, align_val_t)
+static void za_guest_free_impl(void *p);
+static void za_guest_delete_aligned_impl(void *p, size_t al);
+static void *za_shim_memalign(size_t align, size_t size) { return za_guest_aligned_impl(align, size); }
 static int za_shim_posix_memalign(void **out, size_t align, size_t size)
 {
     if (!out) return 22;                                   // EINVAL
     if (align < sizeof(void *) || (align & (align - 1))) return 22;
-    void *p = za_main_aligned_alloc(align, size);
+    void *p = za_guest_aligned_impl(align, size);
     if (!p) return 12;                                     // ENOMEM
     *out = p;
     return 0;
@@ -3581,22 +3589,12 @@ static char *za_shim_strdup(const char *str)
 {
     if (!str) return NULL;
     size_t n = strlen(str) + 1;
-    char *p = (char *)za_main_malloc(n);
+    char *p = (char *)za_guest_malloc_impl(n);
     if (p) memcpy(p, str, n);
     return p;
 }
-static void *za_shim_new_array(size_t n)
-{
-    void *(*f)(size_t) = (void *(*)(size_t))za_mod_lookup(&za_main_mod, "_Znwm");
-    return f ? f(n) : za_main_malloc(n);
-}
-static void za_shim_delete_array(void *p)
-{
-    void (*f)(void *) = (void (*)(void *))za_mod_lookup(&za_main_mod, "_ZdlPv");
-    if (f) { f(p); return; }
-    void (*fr)(void *) = (void (*)(void *))za_mod_lookup(&za_main_mod, "free");
-    if (fr && p) fr(p);
-}
+static void *za_shim_new_array(size_t n) { return za_guest_new_impl(n); }
+static void za_shim_delete_array(void *p) { za_guest_free_impl(p); }
 // malloc_usable_size：main 与 SDK 都没导出，落 dlsym 会用 bionic 的元数据去读
 // musl 的指针。客机很少调；返回 0 比读坏元数据安全。
 static size_t za_shim_usable_size(void *p) { (void)p; return 0; }
@@ -3610,34 +3608,196 @@ static void za_shim_note(const char *n)
     static int c;
     if (c < 24) { c++; ZLOGE("★ 分配器垫片首次使用：%s", n); }
 }
+// ⚠ 对齐变体必须和对应的 delete 走**同一个堆**。接管模式下 delete 会落到
+//   宿主 free（见 za_guest_delete_aligned_impl），这里如果继续用 main 的
+//   `_ZnwmSt11align_val_t`（musl 堆），就是「musl 分配、宿主释放」的经典崩法。
 static void *za_shim_new_array_aligned(size_t n, size_t al)
 {
     za_shim_note("_ZnamSt11align_val_t");
-    void *(*f)(size_t, size_t) = (void *(*)(size_t, size_t))za_mod_lookup(&za_main_mod, "_ZnwmSt11align_val_t");
-    if (f) return f(n, al);
-    return za_main_aligned_alloc(al, n);
+    return za_guest_new_aligned_impl(n, al);
 }
-static void za_shim_delete_aligned(void *p, size_t al) { (void)al; za_shim_note("_Zdl/_ZdaPvSt11align_val_t"); za_shim_delete_array(p); }
+static void za_shim_delete_aligned(void *p, size_t al) { za_shim_note("_Zdl/_ZdaPvSt11align_val_t"); za_guest_delete_aligned_impl(p, al); }
 static void *za_shim_new_nothrow(size_t n) { za_shim_note("_Znwm/_ZnamRKSt9nothrow_t"); return za_shim_new_array(n); }
 static void za_shim_delete_nothrow(void *p) { za_shim_note("_ZdlPv/_ZdaPvRKSt9nothrow_t"); za_shim_delete_array(p); }
+
+
+// ─────────── 分配器接管 + 释放隔离区（离线预置实验，2026-10-29）───────────
+// 目标：首帧卡在一块**被提前释放的资源块**上（[blk+0x28] 指向的兄弟块已 munmap）。
+// 只要能把「谁放掉的、什么时候放的」看清楚，或者干脆让大块永不真正归还，
+// 就有机会让引擎走完一帧。开关（启动前建文件）：
+//     files/za-alloc-takeover —— 客机的 C/C++ 分配器一律换成宿主堆，并记录大块释放
+//     files/za-quarantine     —— 其中的**大块**（≥32KB）释放时只记账不归还
+// 两者独立：只开 takeover 是「统一堆 + 记下释放者」，再加 quarantine 就是
+// 「永不归还」的对照实验。
+//
+// ⚠ 为什么不用 bionic 的 malloc_usable_size 问大小：它对**不是本堆**的指针会
+//   直接 abort（进程信号 6，见文件上方 2026-10-29 的实测记录）。所以接管模式
+//   自带 16 字节头部（magic/size/base）：
+//     · 头部 magic 对上 ⇒ 我们发的块，用 size 判断是否进隔离区，free(base) 归还；
+//     · 对不上        ⇒ main 内部（不经导入表）用 musl 分配的指针，退回 musl free。
+//   两条路都不碰 malloc_usable_size。
+#define ZA_QN 512
+#define ZA_HMAGIC 0x5a414c4cu
+typedef struct za_hdr { unsigned int magic, size; void *base; } za_hdr_t;   // 16 字节
+
+static void *za_q_ptr[ZA_QN];
+static size_t za_q_sz[ZA_QN];
+static int za_q_n;
+static unsigned long za_free_total;
+
+static int za_alloc_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-alloc-takeover",
+                   F_OK) == 0;
+    return m;
+}
+static int za_quar_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-quarantine",
+                   F_OK) == 0;
+    return m;
+}
+static unsigned long za_caller_lr(void)
+{
+#if defined(__aarch64__)
+    unsigned long v;
+    __asm__ __volatile__("mov %0, x30" : "=r"(v));
+    return v;
+#else
+    return 0;
+#endif
+}
+static void za_musl_free(void *p)
+{
+    void (*f)(void *) = (void (*)(void *))za_mod_lookup(&za_main_mod, "free");
+    if (f) f(p);
+}
+static void *za_hdr_alloc(size_t n, size_t al)
+{
+    if (al < 16) al = 16;
+    if (al & (al - 1)) return NULL;
+    if (n > (size_t)-1 - al - sizeof(za_hdr_t)) return NULL;
+    unsigned char *raw = (unsigned char *)malloc(n + al + sizeof(za_hdr_t));
+    if (!raw) return NULL;
+    uintptr_t u = ((uintptr_t)raw + sizeof(za_hdr_t) + al - 1) & ~(uintptr_t)(al - 1);
+    za_hdr_t *h = (za_hdr_t *)(u - sizeof(za_hdr_t));
+    h->magic = ZA_HMAGIC;
+    h->size = (unsigned int)n;
+    h->base = raw;
+    return (void *)u;
+}
+static int za_hdr_get(void *p, za_hdr_t *out)
+{
+    if (!p) return 0;
+    // 只读，不会因为「不是我们的块」而崩：musl 的 chunk 头同样在这个位置。
+    za_hdr_t *h = (za_hdr_t *)((unsigned char *)p - sizeof(za_hdr_t));
+    if (h->magic != ZA_HMAGIC || !h->base) return 0;
+    out->magic = h->magic;
+    out->size = h->size;
+    out->base = h->base;
+    return 1;
+}
+static void za_guest_free_impl(void *p)
+{
+    if (!p) return;
+    if (!za_alloc_mode()) { za_musl_free(p); return; }
+    za_hdr_t h;
+    if (!za_hdr_get(p, &h)) { za_musl_free(p); return; }
+    za_free_total++;
+    if (za_quar_mode() && h.size >= 32768 && za_q_n < ZA_QN) {
+        za_q_ptr[za_q_n] = p;
+        za_q_sz[za_q_n] = h.size;
+        za_q_n++;
+        if (za_q_n <= 16 || (za_q_n & 63) == 0)
+            ZLOGE("★ [quarantine] 保留 %u 字节块 %p（第 %d 块，释放者 lr=%#lx）",
+                  h.size, p, za_q_n, za_caller_lr());
+        return;                       // 不归还：让悬空指针继续可读
+    }
+    if (za_free_total <= 32 || h.size >= 32768)
+        ZLOGE("★ [free] %u 字节块 %p（累计 %lu 次，释放者 lr=%#lx）",
+              h.size, p, za_free_total, za_caller_lr());
+    free(h.base);
+}
+static void *za_guest_malloc_impl(size_t n)
+{
+    if (!za_alloc_mode()) return za_main_malloc(n);
+    return za_hdr_alloc(n ? n : 1, 16);
+}
+static void *za_guest_calloc_impl(size_t a, size_t b)
+{
+    if (!za_alloc_mode()) {
+        void *(*f)(size_t, size_t) =
+            (void *(*)(size_t, size_t))za_mod_lookup(&za_main_mod, "calloc");
+        return f ? f(a, b) : NULL;
+    }
+    if (b && a > (size_t)-1 / b) return NULL;
+    size_t n = a * b;
+    void *p = za_hdr_alloc(n ? n : 1, 16);
+    if (p) memset(p, 0, n);
+    return p;
+}
+static void *za_guest_realloc_impl(void *p, size_t n)
+{
+    if (!za_alloc_mode()) {
+        void *(*f)(void *, size_t) =
+            (void *(*)(void *, size_t))za_mod_lookup(&za_main_mod, "realloc");
+        return f ? f(p, n) : NULL;
+    }
+    if (!p) return za_hdr_alloc(n ? n : 1, 16);
+    za_hdr_t h;
+    if (!za_hdr_get(p, &h)) {          // 不是我们的块：交给 musl 原样处理
+        void *(*f)(void *, size_t) =
+            (void *(*)(void *, size_t))za_mod_lookup(&za_main_mod, "realloc");
+        return f ? f(p, n) : NULL;
+    }
+    void *q = za_hdr_alloc(n ? n : 1, 16);
+    if (!q) return NULL;
+    size_t cpy = h.size < n ? h.size : n;
+    if (cpy) memcpy(q, p, cpy);
+    free(h.base);                      // 旧块直接归还：调用方已经放弃它
+    return q;
+}
+static void *za_guest_aligned_impl(size_t al, size_t n)
+{
+    if (!za_alloc_mode()) return za_main_aligned_alloc(al, n);
+    return za_hdr_alloc(n ? n : 1, al);
+}
+static void *za_guest_new_impl(size_t n) { return za_guest_malloc_impl(n ? n : 1); }
+static void *za_guest_new_aligned_impl(size_t n, size_t al) { return za_guest_aligned_impl(al, n); }
+static void za_guest_delete_aligned_impl(void *p, size_t al) { (void)al; za_guest_free_impl(p); }
 
 static const za_host_sym_t za_host_syms[] = {
     // loader 提供的「runtime object file」（真机由 nnrtld 提供）
     { "__nnDetailNintendoSdkRuntimeObjectFile", (void *)za_host_runtime_object_file },
-    // 分配器一致性（见上面 za_shim_* 的注释）：一律走 main 的 musl 堆
-    { "memalign", (void *)za_shim_memalign },
-    { "posix_memalign", (void *)za_shim_posix_memalign },
-    { "strdup", (void *)za_shim_strdup },
-    { "_Znam", (void *)za_shim_new_array },
-    { "_ZdaPv", (void *)za_shim_delete_array },
-    { "malloc_usable_size", (void *)za_shim_usable_size },
-    { "_ZnamSt11align_val_t", (void *)za_shim_new_array_aligned },
-    { "_ZdlPvSt11align_val_t", (void *)za_shim_delete_aligned },
-    { "_ZdaPvSt11align_val_t", (void *)za_shim_delete_aligned },
+    // 分配器接管/隔离实验（files/za-alloc-takeover、files/za-quarantine 控制行为）
+    { "malloc", (void *)za_guest_malloc_impl },
+    { "free", (void *)za_guest_free_impl },
+    { "calloc", (void *)za_guest_calloc_impl },
+    { "realloc", (void *)za_guest_realloc_impl },
+    { "aligned_alloc", (void *)za_guest_aligned_impl },
+    { "_Znwm", (void *)za_guest_new_impl },
+    { "_Znam", (void *)za_guest_new_impl },
+    { "_ZdlPv", (void *)za_guest_free_impl },
+    { "_ZdaPv", (void *)za_guest_free_impl },
+    // 对齐变体必须**成对**改道：只改 delete 不改 new，就是「musl 分配、宿主释放」。
+    { "_ZnwmSt11align_val_t", (void *)za_guest_new_aligned_impl },
+    { "_ZnamSt11align_val_t", (void *)za_guest_new_aligned_impl },
+    { "_ZdlPvSt11align_val_t", (void *)za_guest_delete_aligned_impl },
+    { "_ZdaPvSt11align_val_t", (void *)za_guest_delete_aligned_impl },
+    // nothrow 变体没有对齐参数，直接走同一套 impl
     { "_ZnwmRKSt9nothrow_t", (void *)za_shim_new_nothrow },
     { "_ZnamRKSt9nothrow_t", (void *)za_shim_new_nothrow },
     { "_ZdlPvRKSt9nothrow_t", (void *)za_shim_delete_nothrow },
     { "_ZdaPvRKSt9nothrow_t", (void *)za_shim_delete_nothrow },
+    // 分配器一致性（见上面 za_shim_* 的注释）：一律走同一套堆
+    { "memalign", (void *)za_shim_memalign },
+    { "posix_memalign", (void *)za_shim_posix_memalign },
+    { "strdup", (void *)za_shim_strdup },
+    { "malloc_usable_size", (void *)za_shim_usable_size },
 
     // ── hid 初始化：先接管成「成功」──────────────────────────────
     // nn::hid::InitializeNpad 会通过 CMIF 连 hid 服务、建共享内存；
