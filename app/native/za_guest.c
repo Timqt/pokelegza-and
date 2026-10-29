@@ -4083,6 +4083,18 @@ void za_dump_progress_stall(void)
             }
             ZLOGE("★ SIMD 空转 tid=%ld main+%#lx: x10=%llu x12=%llu x25=%#llx 界[+8]=%#llx 界[+30]=%#llx",
                   sl->tid, off, x10, x12, x25, b0, b1);
+            // 这是一个哈希表探针循环：`cmp x10(=[x25+8]), x12(=[x25+0x30]); b.hs 退出`。
+            // 上界是垃圾值时会空转到天荒地老。把上界改成游标 ⇒ 下一轮立刻按
+            // 「未命中」退出（等价于这次查找没找到，是可接受的降级）。
+            // 只在上界明显大于游标、且两者都像正常计数（< 1<<24）时动手。
+            if (b1 > b0 && b1 < (1ull << 24) && b0 < (1ull << 24)) {
+                unsigned long long nb = b0;
+                memcpy((void *)(uintptr_t)(x25 + 0x30), &nb, 8);
+                ZLOGE("   ↳ 已把哈希表上界 [%#llx+0x30] 从 %#llx 改成 %#llx（令探针循环退出）",
+                      x25, b1, nb);
+            } else if (b1 >= (1ull << 24)) {
+                ZLOGE("   ↳ 上界 %#llx 像垃圾值（不动它，等寄存器采样确认）", b1);
+            }
         }
     }
     ZLOGE("★ 10 秒无 NVN 进展快照（svc 在涨 ⇒ 客机在自旋）：");
