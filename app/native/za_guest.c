@@ -976,13 +976,42 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 if ((in_main2 || in_sdk2) && saddr >= 0x1000ull) {
                     unsigned int w = *(volatile unsigned int *)(uintptr_t)pcv2;
                     unsigned int rtn = w & 0x1fu, rnn = (w >> 5) & 0x1fu;
-                    int is_ld = 0;
+                    int is_ld = 0, is_st = 0;
                     switch (w & 0xffc00000u) {
                     case 0xf9400000u: case 0xb9400000u: case 0x39400000u:
                     case 0x79400000u: case 0xb9800000u: is_ld = 1; break;
+                    case 0xf9000000u: case 0xb9000000u: case 0x39000000u:
+                    case 0x79000000u: case 0xb8000000u: is_st = 1; break;
                     default: break;
                     }
-                    if (is_ld && rnn != 31 && rnn != 30) {
+                    // store：把**基址**重定向到安全页，写落在我们自己的页里（无副作用）
+                    if (is_st && rnn != 31 && rnn != 30) {
+                        static unsigned long stpc[8];
+                        static unsigned stn[8];
+                        int slot = 0;
+                        for (int i2 = 0; i2 < 8; i2++) {
+                            if (stpc[i2] == pcv2) { slot = i2; break; }
+                            if (stpc[i2] == 0) { stpc[i2] = pcv2; slot = i2; break; }
+                            if (i2 == 7) slot = (int)((pcv2 >> 2) & 7u);
+                        }
+                        if (stn[slot] < 64) {
+                            stn[slot]++;
+                            ucx->uc_mcontext.regs[rnn] =
+                                (unsigned long)(uintptr_t)za_zero_page;
+                            if (stn[slot] <= 3) {
+                                char b[176];
+                                char *q = b;
+                                q = za_put_str(q, "ZaGuest: ★ 悬空写入→安全页 pc=+");
+                                q = za_put_hex(q, (unsigned long long)(pcv2 - (in_main2 ? gb0 : za_sdk_base)));
+                                q = za_put_str(q, " addr=");
+                                q = za_put_hex(q, saddr);
+                                q = za_put_str(q, " (store)\n");
+                                za_fatal_write(b, (size_t)(q - b));
+                            }
+                            return;      // pc 不变，重执这条 store
+                        }
+                    }
+                    if (is_ld && rtn != 31 && rnn != 30) {
                         static unsigned long badpc[8];
                         static unsigned cnt[8];
                         int slot = 0, i;
@@ -1032,6 +1061,67 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     za_fatal_write(b, (size_t)(q - b));
                 }
                 return;
+            }
+        }
+        // ★★ 终极通用降级：客机/SDK 代码解引用了一个**未映射**的地址
+        //   （悬空/use-after-free 指针，真机常见 0x6ee3_xxxx_xxxx 宿主堆残留）。
+        //   与其逐条解码指令形态（ldr/ldp/寄存器偏移…），不如直接把那一页
+        //   mmap 成全零页再重执：任何读都得 0、任何写都落在我们自己的页上。
+        //   限制：只认客机/SDK 映像里的 PC；最多补 512 页；地址必须像个指针。
+        {
+            unsigned long long saddr2 = (unsigned long long)(uintptr_t)info->si_addr;
+            int ours2 = 0;
+            if (gb0 && pcx >= gb0 && pcx < gb0 + ZA_IMAGE_SIZE) ours2 = 1;
+            extern volatile unsigned long za_sdk_base, za_sdk_size;
+            if (!ours2 && za_sdk_base && pcx >= za_sdk_base && pcx < za_sdk_base + za_sdk_size)
+                ours2 = 1;
+            static int mapped_pages;
+            {
+                static int dbg;
+                if (dbg < 8 && (gb0 || za_sdk_base)) {
+                    dbg++;
+                    char b[200]; char *q = b;
+                    q = za_put_str(q, "ZaGuest: [dbg-mmap] ours=");
+                    q = za_put_dec(q, (unsigned long long)ours2);
+                    q = za_put_str(q, " pc=+");
+                    q = za_put_hex(q, (unsigned long long)(pcx - (gb0 ? gb0 : za_sdk_base)));
+                    q = za_put_str(q, " addr=");
+                    q = za_put_hex(q, saddr2);
+                    za_fatal_write(b, (size_t)(q - b));
+                }
+            }
+            if (ours2 && saddr2 >= 0x10000ull && saddr2 >= 0x4000000000ull &&
+                saddr2 < 0x800000000000ull && mapped_pages < 512)
+            {
+                unsigned long pg = (unsigned long)(saddr2 & ~0xFFFull);
+                void *r = mmap((void *)pg, 0x1000, PROT_READ | PROT_WRITE,
+                               MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+                if (r == MAP_FAILED) {
+                    static int dbg2;
+                    if (dbg2++ < 8) {
+                        char b2[160]; char *q2 = b2;
+                        q2 = za_put_str(q2, "ZaGuest: [dbg-mmap] mmap 失败 errno=");
+                        q2 = za_put_dec(q2, (unsigned long long)errno);
+                        za_fatal_write(b2, (size_t)(q2 - b2));
+                    }
+                }
+                if (r != MAP_FAILED) {
+                    memset(r, 0, 0x1000);
+                    mapped_pages++;
+                    if (mapped_pages <= 6) {
+                        char b[176];
+                        char *q = b;
+                        q = za_put_str(q, "ZaGuest: ★ 悬空地址补零页 addr=");
+                        q = za_put_hex(q, saddr2);
+                        q = za_put_str(q, " pc=+");
+                        q = za_put_hex(q, (unsigned long long)(pcx - (gb0 ? gb0 : za_sdk_base)));
+                        q = za_put_str(q, "（已补 ");
+                        q = za_put_dec(q, (unsigned long long)mapped_pages);
+                        q = za_put_str(q, " 页）\n");
+                        za_fatal_write(b, (size_t)(q - b));
+                    }
+                    return;          // 重执这条指令，这次会读到全零
+                }
             }
         }
         unsigned long prev = pcx >= 4 ? *(volatile unsigned int *)(uintptr_t)(pcx - 4) : 0;
@@ -3975,6 +4065,26 @@ void za_dump_progress_stall(void)
     }
     za_sample_all_threads();
     { struct timespec t = { 0, 40 * 1000 * 1000 }; nanosleep(&t, NULL); }
+    // ★ SIMD 空转诊断：main+0x1a08440..0x1a084c0 是一个字节扫描内层循环，
+    //   界在 [x25+8] 与 [x25+0x30]。把采样到的寄存器与这两个界打出来，
+    //   立刻能分辨「界是垃圾值（死循环）」还是「真的在跑一段长数据」。
+    {
+        unsigned long gb = (unsigned long)(uintptr_t)za_guest_base;
+        for (int i = 0; i < 32; i++) {
+            za_samp_slot_t *sl = &za_samp_tab[i];
+            if (sl->tid <= 0 || sl->pc < gb) continue;
+            unsigned long off = sl->pc - gb;
+            if (off < 0x1a08400 || off > 0x1a08500) continue;
+            unsigned long long x25 = sl->regs[25], x10 = sl->regs[10], x12 = sl->regs[12];
+            unsigned long long b0 = 0, b1 = 0;
+            if (ZA_PTR_OK(x25)) {
+                memcpy(&b0, (const void *)(uintptr_t)(x25 + 8), 8);
+                memcpy(&b1, (const void *)(uintptr_t)(x25 + 0x30), 8);
+            }
+            ZLOGE("★ SIMD 空转 tid=%ld main+%#lx: x10=%llu x12=%llu x25=%#llx 界[+8]=%#llx 界[+30]=%#llx",
+                  sl->tid, off, x10, x12, x25, b0, b1);
+        }
+    }
     ZLOGE("★ 10 秒无 NVN 进展快照（svc 在涨 ⇒ 客机在自旋）：");
     {
         extern volatile unsigned long long za_enq_queue, za_enq_count;
