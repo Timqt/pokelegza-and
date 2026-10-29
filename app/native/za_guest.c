@@ -1009,7 +1009,15 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     // store：把**基址**重定向到安全页，写落在我们自己的页里（无副作用）。
                     // ⚠ 空指针写入的 si_addr 很小（如 8），不能用「>= 0x1000」过滤，
                     //   否则整族漏掉（真机 main+0x2553ed8 `str x0,[x19,#8]`，x19=0）。
-                    if (is_st && rnn != 31 && rnn != 30 && saddr < 0x4000000000ull) {
+                    // ★ 2026-10-29 真机：store 的目标也可能是**远超用户空间**的野指针
+                    //   （main+0x2553cb0 `str x8,[x0]`，x0=0x3c000000068d07），
+                    //   那种地址 mmap 也补不了（超出 48 位 VA）。既然已经 fault，
+                    //   这一页就一定不可写 —— 直接按「悬空写入」重定向到安全页。
+                    // 地址范围：近空（< 256GB，含空指针 + 客机堆区）或**荒谬高位**
+                    // （≥ 1PB，48 位 VA 之外的真野指针，mmap 也补不了）。中间那些
+                    // 「看起来像真对象」的区间不动，避免把正常的越界写也一起盖掉。
+                    if (is_st && rnn != 31 && rnn != 30 &&
+                        (saddr < 0x4000000000ull || saddr >= 0x1000000000000ull)) {
                         static unsigned long stpc[8];
                         static unsigned stn[8];
                         int slot = 0;
@@ -1288,7 +1296,11 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                         if (i == 7) slot = (int)(pcv & 7u);
                     }
                     if (seen_pc[slot] != pcv) { seen_pc[slot] = pcv; seen_n[slot] = 0; }
-                    if (++seen_n[slot] > 3) {
+                    // 上限从 3 提到 4096：真机上引擎会**成对地反复**解引用同一个空对象
+                    // （0x2554b58 / 0x2554c18 交替出现，3 次就放弃 ⇒ 进程被打死）。
+                    // 这两个站点都是「遍历 program 表、逐个读字段」，空对象在本作里是
+                    // 常态（引擎的池槽位空着），所以允许它一直按「读到 0」走下去。
+                    if (++seen_n[slot] > 4096) {
                         // 放弃恢复，走正常致命流程（下面会 dump 现场）
                     } else {
                     if (rt != 31) uc0->uc_mcontext.regs[rt] = 0;
@@ -4091,6 +4103,92 @@ static void za_unstick_main_job_spin(void)
     }
 }
 
+// ★ 线程级「两次采样」对照表。
+//   停摆表只列「在 svc 里睡着」的线程；**纯用户态自旋**的线程根本不进那张表
+//   （它不发 svc），而它往往就是真正卡住整条流水线的那一条（真机实测主线程
+//   6.3 秒墙钟烧掉 6.2 秒 CPU，同时排队/等待表全是静止的）。
+//   两次采样 PC 相同 ⇒ 卡在该 PC；PC 变化 ⇒ 它在正常跑。
+//   一起打印 x19/x20：任务对象 / 锁对象，能把「在等谁/持着什么」直接读出来。
+static void za_pc_str(char *out, size_t cap, unsigned long pc)
+{
+    unsigned long long mb = (unsigned long long)(uintptr_t)za_guest_base;
+    unsigned long long sb = (unsigned long long)za_sdk_base;
+    unsigned long long ss = (unsigned long long)za_sdk_size;
+    if (mb && pc >= mb && pc < mb + ZA_IMAGE_SIZE)
+        snprintf(out, cap, "main+%#llx", (unsigned long long)(pc - mb));
+    else if (sb && ss && pc >= sb && pc < sb + ss)
+        snprintf(out, cap, "sdk+%#llx", (unsigned long long)(pc - sb));
+    else
+        snprintf(out, cap, "%#lx", pc);
+}
+
+void za_dump_thread_pcs2(void)
+{
+    long tid[32];
+    unsigned long pc1[32], x19[32], x20[32], fp1[32];
+    int n = 0;
+    for (int i = 0; i < 32; i++) {
+        if (!za_samp_tab[i].tid) continue;
+        tid[n] = za_samp_tab[i].tid;
+        pc1[n] = za_samp_tab[i].pc;
+        x19[n] = za_samp_tab[i].regs[19];
+        x20[n] = za_samp_tab[i].regs[20];
+        fp1[n] = za_samp_tab[i].regs[29];
+        n++;
+    }
+    za_sample_all_threads();
+    { struct timespec t = { 0, 30 * 1000 * 1000 }; nanosleep(&t, NULL); }
+    ZLOGE("★ 线程 PC 对照（两次采样；同 PC = 卡在该处，CPU 在涨即用户态自旋）：");
+    for (int k = 0; k < n; k++) {
+        unsigned long p2 = 0;
+        int found = 0;
+        for (int i = 0; i < 32; i++)
+            if (za_samp_tab[i].tid == tid[k]) { p2 = za_samp_tab[i].pc; found = 1; break; }
+        char a[40], b[40];
+        za_pc_str(a, sizeof a, pc1[k]);
+        if (found) za_pc_str(b, sizeof b, p2);
+        else snprintf(b, sizeof b, "(未采到)");
+        int same = found && p2 == pc1[k];
+        ZLOGE("    tid=%ld %s (%#lx) → %s  x19=%#lx x20=%#lx%s",
+              tid[k], a, pc1[k], b, x19[k], x20[k], same ? "  ← 同 PC" : "");
+        // 同 PC 且落在客机映像里 ⇒ 用户态自旋，倒 5 帧调用链（fp 链）
+        if (same && za_guest_base && pc1[k] >= (unsigned long)(uintptr_t)za_guest_base &&
+            pc1[k] < (unsigned long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE) {
+            unsigned long long fp = fp1[k];
+            for (int f = 0; f < 5 && fp; f++) {
+                if (fp & 7) break;
+                unsigned long long nf = *(volatile unsigned long long *)(uintptr_t)fp;
+                unsigned long long lr = *(volatile unsigned long long *)(uintptr_t)(fp + 8);
+                char s[40];
+                za_pc_str(s, sizeof s, (unsigned long)lr);
+                ZLOGE("        [%d] lr=%s", f, s);
+                if (nf <= fp || nf - fp > 0x100000ull) break;
+                fp = nf;
+            }
+            // 这个对象的头 4 个 qword：vector 的 begin/end/cap 一看就知道计数是不是
+            // 「被一个垃圾字段撑大」的（真机实测 resize 计数到了 4.2e9）。
+            {
+                za_samp_slot_t *sl = NULL;
+                for (int i = 0; i < 32; i++)
+                    if (za_samp_tab[i].tid == tid[k]) { sl = &za_samp_tab[i]; break; }
+                if (sl && x19[k] >= 0x10000ul &&
+                    (x19[k] & 0x00FFFFFFFFFFFFFFull) < 0x800000000000ull) {
+                    unsigned long long a = x19[k] & 0x00FFFFFFFFFFFFFFull;
+                    unsigned long long q[4] = {0, 0, 0, 0};
+                    struct iovec lo = { q, sizeof q }, ro = { (void *)(uintptr_t)a, sizeof q };
+                    if (process_vm_readv(getpid(), &lo, 1, &ro, 1, 0) == (ssize_t)sizeof q)
+                        ZLOGE("        x19 头 4 项: %#llx %#llx %#llx %#llx  (end-begin)/8=%lld",
+                              q[0], q[1], q[2], q[3], (long long)((q[1] - q[0]) / 8));
+                }
+                if (sl)
+                    ZLOGE("        regs x0=%#lx x1=%#lx x2=%#lx x3=%#lx x21=%#lx x22=%#lx x23=%#lx",
+                          sl->regs[0], sl->regs[1], sl->regs[2], sl->regs[3],
+                          sl->regs[21], sl->regs[22], sl->regs[23]);
+            }
+        }
+    }
+}
+
 // 自旋型停摆的快照。客机自旋时 svc 计数一直在涨，旧的 no_progress 判定
 // 永远不会触发；但 NVN 一个提交都没有，说明它其实没前进。
 // 由 NVN 帧驱动每 10 秒调一次，倒出「每条线程此刻停在哪」。
@@ -5144,8 +5242,11 @@ static void *za_sampler_watchdog(void *arg)
                             // 采样器环形轨迹（现在是纯存储、async-signal-safe）
                             {
                                 extern void za_sample_all_threads(void);
+                                extern void za_dump_thread_pcs2(void);
                                 extern void za_write_maps_now(void);
                                 za_write_maps_now();
+                                // ★ 先做两次采样对照：谁在用户态自旋（不发 svc）只能这样看见。
+                                za_dump_thread_pcs2();
                                 za_sample_all_threads();
                                 struct timespec samp = { 0, 40 * 1000 * 1000 };
                                 nanosleep(&samp, NULL);

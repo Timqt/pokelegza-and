@@ -79,6 +79,24 @@ typedef struct { const char *name; void *fn; } nvn_impl;
     static ret h_##name(__VA_ARGS__)
 
 static int g_log;
+
+// ───────── 对象指针合法性检查 ─────────
+// 真机实测：客机会把「空对象 + 偏移」当对象传进来（nvnProgramInitialize(p=0x10)，
+// 之后我们 memset(p) 直接踩到 0x84 打死宿主）。影子层只写几个小字段所以从没炸过。
+// 所有「往游戏对象里写」的入口都先过这一关：非法就按失败返回，让引擎自己走
+// 错误分支，而不是把宿主打死。
+// Real-device: the guest sometimes passes "null + offset" as an object pointer
+// (nvnProgramInitialize(p=0x10)); memset(p) then faults at 0x84 and kills the host.
+static int nvn_obj_ok(const void *p, size_t len)
+{
+    unsigned long long a = (unsigned long long)(uintptr_t)p;
+    a &= 0x00FFFFFFFFFFFFFFull;            // 去掉 TBI 标记
+    if (a < 0x10000ull) return 0;          // 近空指针（0x10 这类）
+    if (a >= 0x800000000000ull) return 0;  // 内核区 / 非法
+    if (a + len < a) return 0;             // 长度溢出
+    return 1;
+}
+
 uint64_t nvn_new_serial(void) { static _Atomic uint64_t n; return ++n; }
 static unsigned g_nsem;                          // 语义实现个数（nvn_init_slots 填） | Number of semantic implementations (filled by nvn_init_slots)
 #define OLOG(...) do { if (g_log) LOG("[nvn] " __VA_ARGS__); } while (0)
@@ -86,6 +104,7 @@ static unsigned g_nsem;                          // 语义实现个数（nvn_ini
 static void nvn_init_slots(void) {
     static int done; if (done) return; done = 1;
     g_log = getenv("DM_NVN_LOG") != NULL;
+    { static int forced = -1; if (forced < 0) { forced = 1; g_log = 1; } }   // ★ 临时：安卓上没法给 NativeActivity 设环境变量，先无条件打开对象创建日志
     unsigned long sz; const nvn_impl *im;
     DM_SECT_GET(swnvn, const nvn_impl, im, sz);
     unsigned nim = im ? (unsigned)(sz / sizeof *im) : 0, hit = 0;
@@ -131,6 +150,8 @@ HLE_FORCE("nvnBootstrapLoader", "NVN 图形接口整块换成宿主空设备（�
 NVN(nvnDeviceBuilderSetDefaults, void, NVNdeviceBuilder *b) { memset(b, 0, sizeof(dev_builder_t)); }
 NVN(nvnDeviceBuilderSetFlags, void, NVNdeviceBuilder *b, int f) { ((dev_builder_t *)b)->flags = f; }
 NVN(nvnDeviceInitialize, NVNboolean, NVNdevice *d, const NVNdeviceBuilder *b) {
+    if (!nvn_obj_ok(d, sizeof(dev_t_))) { static int _n; if (_n++ < 6) LOG("【红】nvnDeviceInitialize 对象指针非法 %p", (void *)d); return 0; }
+    if (!nvn_obj_ok(b, 8)) { static int _b; if (_b++ < 6) LOG("【红】nvnDeviceInitialize builder 指针非法 %p", (void *)b); return 0; }
     dev_t_ *o = (dev_t_ *)d; memset(o, 0, sizeof *o);
     o->magic = MAGIC('D', 'E', 'V', 0); o->flags = ((const dev_builder_t *)b)->flags;
     OLOG("DeviceInitialize %p flags=%#x", (void *)d, o->flags);
@@ -181,10 +202,14 @@ NVN(nvnDeviceFinalizeCommandHandle, void, NVNdevice *d, NVNcommandHandle h) { (v
 
 // ---------- 内存池 ----------
 // ---------- Memory pools ----------
-NVN(nvnMemoryPoolBuilderSetDefaults, void, NVNmemoryPoolBuilder *b) { memset(b, 0, sizeof(pool_builder_t)); }
-NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) { ((pool_builder_t *)b)->dev = d; }
-NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) { ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
-NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) { ((pool_builder_t *)b)->flags = f; }
+NVN(nvnMemoryPoolBuilderSetDefaults, void, NVNmemoryPoolBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnMemoryPoolBuilderSetDefaults 对象指针非法 %p", (void *)b); return; } memset(b, 0, sizeof(pool_builder_t)); }
+NVN(nvnMemoryPoolBuilderSetDevice, void, NVNmemoryPoolBuilder *b, NVNdevice *d) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnMemoryPoolBuilderSetDevice 对象指针非法 %p", (void *)b); return; } ((pool_builder_t *)b)->dev = d; }
+NVN(nvnMemoryPoolBuilderSetStorage, void, NVNmemoryPoolBuilder *b, void *m, size_t n) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnMemoryPoolBuilderSetStorage 对象指针非法 %p", (void *)b); return; } ((pool_builder_t *)b)->mem = m; ((pool_builder_t *)b)->size = n; }
+NVN(nvnMemoryPoolBuilderSetFlags, void, NVNmemoryPoolBuilder *b, int f) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnMemoryPoolBuilderSetFlags 对象指针非法 %p", (void *)b); return; } ((pool_builder_t *)b)->flags = f; }
 // 池标志表：图形后端可查询一段客体内存所在池的标志（Vulkan 引擎据 CPU_NO_ACCESS 省掉被更新的 GPU 结果覆盖的存储写回）。
 // 建池、销池在客体线程，查询在渲染线程；用互斥量（不在信号处理里用）。按池对象删除，重叠alias不证明CPU_NO_ACCESS。
 // 表满或非法范围后全表持续返回未知，避免未登记的可读alias被忽略。
@@ -213,6 +238,8 @@ int nvn_pool_flags(const void *addr, size_t len) {
     return f;
 }
 NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBuilder *b) {
+    if (!nvn_obj_ok(p, sizeof(pool_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnMemoryPoolInitialize 对象指针非法 %p", (void *)p); return 0; }
+    if (!nvn_obj_ok(b, 8)) { static int _b; if (_b++ < 6) LOG("【红】nvnMemoryPoolInitialize builder 指针非法 %p", (void *)b); return 0; }
     const pool_builder_t *s = (const pool_builder_t *)b; pool_t *o = (pool_t *)p;
     o->magic = MAGIC('P', 'O', 'O', 'L'); o->flags = s->flags; o->mem = s->mem; o->size = s->size;
     if (o->mem) { mtl_pool_add(o->mem, o->size); nvn_dirty_add_range(o->mem, o->size); pool_flags_add(p,o->mem, o->size, o->flags); }
@@ -220,47 +247,70 @@ NVN(nvnMemoryPoolInitialize, NVNboolean, NVNmemoryPool *p, const NVNmemoryPoolBu
     OLOG("MemoryPool %p mem=%p size=%#llx flags=%#x", (void *)p, (void *)o->mem, o->size, o->flags);
     return 1;
 }
-NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) { pool_flags_del(p); if (((pool_t *)p)->mem) { nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
-NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) { (void)p; (void)off; (void)n; }
-NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) { return (NVNbufferAddress)((const pool_t *)p)->mem; }
+NVN(nvnMemoryPoolFinalize, void, NVNmemoryPool *p) {
+    if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnMemoryPoolFinalize 对象指针非法 %p", (void *)p); return; } pool_flags_del(p); if (((pool_t *)p)->mem) { nvn_dirty_remove_range(((pool_t *)p)->mem); mtl_pool_del(((pool_t *)p)->mem); } ((pool_t *)p)->magic = 0; }
+NVN(nvnMemoryPoolFlushMappedRange, void, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
+    if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnMemoryPoolFlushMappedRange 对象指针非法 %p", (void *)p); return; } (void)p; (void)off; (void)n; }
+NVN(nvnMemoryPoolGetBufferAddress, NVNbufferAddress, const NVNmemoryPool *p) {
+    if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnMemoryPoolGetBufferAddress 对象指针非法 %p", (void *)p); return 0; } return (NVNbufferAddress)((const pool_t *)p)->mem; }
 
 // ---------- 描述符池 ----------
 // ---------- Descriptor pools ----------
 NVN(nvnTexturePoolInitialize, NVNboolean, NVNtexturePool *tp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
+    if (!nvn_obj_ok(tp, sizeof(dpool_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnTexturePoolInitialize 对象指针非法 %p", (void *)tp); return 0; }
     *(dpool_t *)tp = (dpool_t){(const pool_t *)p, off, n}; OLOG("TexturePool n=%d", n); mtl_set_tex_pool_n(n); return 1;
 }
-NVN(nvnTexturePoolFinalize, void, NVNtexturePool *tp) { (void)tp; }
+NVN(nvnTexturePoolFinalize, void, NVNtexturePool *tp) {
+    if (!nvn_obj_ok(tp, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTexturePoolFinalize 对象指针非法 %p", (void *)tp); return; } (void)tp; }
 NVN(nvnTexturePoolRegisterTexture, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) { (void)tp; mtl_reg_tex(id, (const tex_t *)t, (const view_t *)v); }
 NVN(nvnSamplerPoolInitialize, NVNboolean, NVNsamplerPool *sp, const NVNmemoryPool *p, ptrdiff_t off, int n) {
+    if (!nvn_obj_ok(sp, sizeof(dpool_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnSamplerPoolInitialize 对象指针非法 %p", (void *)sp); return 0; }
     *(dpool_t *)sp = (dpool_t){(const pool_t *)p, off, n}; OLOG("SamplerPool n=%d", n); return 1;
 }
-NVN(nvnSamplerPoolFinalize, void, NVNsamplerPool *sp) { (void)sp; }
-NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) { (void)sp; mtl_reg_samp(id, &((const samp_t *)s)->p); }
+NVN(nvnSamplerPoolFinalize, void, NVNsamplerPool *sp) {
+    if (!nvn_obj_ok(sp, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerPoolFinalize 对象指针非法 %p", (void *)sp); return; } (void)sp; }
+NVN(nvnSamplerPoolRegisterSampler, void, const NVNsamplerPool *sp, int id, const NVNsampler *s) {
+    if (!nvn_obj_ok(sp, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerPoolRegisterSampler 对象指针非法 %p", (void *)sp); return; } (void)sp; mtl_reg_samp(id, &((const samp_t *)s)->p); }
 
 // ---------- 贴图 ----------
 // ---------- Textures ----------
 #define TB(b) ((tex_builder_t *)(b))
 NVN(nvnTextureBuilderSetDefaults, void, NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetDefaults 对象指针非法 %p", (void *)b); return; }
     NVNdevice *dev = TB(b)->dev; memset(b, 0, sizeof(tex_builder_t)); TB(b)->dev = dev;
     TB(b)->d.target = NVN_TEXTURE_TARGET_2D; TB(b)->d.width = TB(b)->d.height = TB(b)->d.depth = TB(b)->d.levels = 1;
 }
-NVN(nvnTextureBuilderSetDevice, void, NVNtextureBuilder *b, NVNdevice *d) { TB(b)->dev = d; }
-NVN(nvnTextureBuilderSetFlags, void, NVNtextureBuilder *b, int f) { TB(b)->d.flags = f; }
-NVN(nvnTextureBuilderSetTarget, void, NVNtextureBuilder *b, NVNtextureTarget t) { TB(b)->d.target = t; }
-NVN(nvnTextureBuilderSetWidth, void, NVNtextureBuilder *b, int v) { TB(b)->d.width = v; }
-NVN(nvnTextureBuilderSetHeight, void, NVNtextureBuilder *b, int v) { TB(b)->d.height = v; }
-NVN(nvnTextureBuilderSetDepth, void, NVNtextureBuilder *b, int v) { TB(b)->d.depth = v; }
-NVN(nvnTextureBuilderSetSize1D, void, NVNtextureBuilder *b, int w) { TB(b)->d.width = w; TB(b)->d.height = TB(b)->d.depth = 1; }
-NVN(nvnTextureBuilderSetLevels, void, NVNtextureBuilder *b, int v) { TB(b)->d.levels = v; }
-NVN(nvnTextureBuilderSetFormat, void, NVNtextureBuilder *b, NVNformat f) { TB(b)->d.format = f; }
-NVN(nvnTextureBuilderSetSamples, void, NVNtextureBuilder *b, int s) { TB(b)->d.samples = s; }
-NVN(nvnTextureBuilderSetStride, void, NVNtextureBuilder *b, ptrdiff_t s) { TB(b)->d.stride = (uint32_t)s; }
-NVN(nvnTextureBuilderSetStorage, void, NVNtextureBuilder *b, NVNmemoryPool *p, ptrdiff_t off) { TB(b)->pool = (pool_t *)p; TB(b)->off = off; }
+NVN(nvnTextureBuilderSetDevice, void, NVNtextureBuilder *b, NVNdevice *d) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetDevice 对象指针非法 %p", (void *)b); return; } TB(b)->dev = d; }
+NVN(nvnTextureBuilderSetFlags, void, NVNtextureBuilder *b, int f) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetFlags 对象指针非法 %p", (void *)b); return; } TB(b)->d.flags = f; }
+NVN(nvnTextureBuilderSetTarget, void, NVNtextureBuilder *b, NVNtextureTarget t) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetTarget 对象指针非法 %p", (void *)b); return; } TB(b)->d.target = t; }
+NVN(nvnTextureBuilderSetWidth, void, NVNtextureBuilder *b, int v) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetWidth 对象指针非法 %p", (void *)b); return; } TB(b)->d.width = v; }
+NVN(nvnTextureBuilderSetHeight, void, NVNtextureBuilder *b, int v) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetHeight 对象指针非法 %p", (void *)b); return; } TB(b)->d.height = v; }
+NVN(nvnTextureBuilderSetDepth, void, NVNtextureBuilder *b, int v) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetDepth 对象指针非法 %p", (void *)b); return; } TB(b)->d.depth = v; }
+NVN(nvnTextureBuilderSetSize1D, void, NVNtextureBuilder *b, int w) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetSize1D 对象指针非法 %p", (void *)b); return; } TB(b)->d.width = w; TB(b)->d.height = TB(b)->d.depth = 1; }
+NVN(nvnTextureBuilderSetLevels, void, NVNtextureBuilder *b, int v) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetLevels 对象指针非法 %p", (void *)b); return; } TB(b)->d.levels = v; }
+NVN(nvnTextureBuilderSetFormat, void, NVNtextureBuilder *b, NVNformat f) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetFormat 对象指针非法 %p", (void *)b); return; } TB(b)->d.format = f; }
+NVN(nvnTextureBuilderSetSamples, void, NVNtextureBuilder *b, int s) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetSamples 对象指针非法 %p", (void *)b); return; } TB(b)->d.samples = s; }
+NVN(nvnTextureBuilderSetStride, void, NVNtextureBuilder *b, ptrdiff_t s) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetStride 对象指针非法 %p", (void *)b); return; } TB(b)->d.stride = (uint32_t)s; }
+NVN(nvnTextureBuilderSetStorage, void, NVNtextureBuilder *b, NVNmemoryPool *p, ptrdiff_t off) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetStorage 对象指针非法 %p", (void *)b); return; } TB(b)->pool = (pool_t *)p; TB(b)->off = off; }
 NVN(nvnTextureBuilderSetPackagedTextureLayout, void, NVNtextureBuilder *b, const NVNpackagedTextureLayout *l) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetPackagedTextureLayout 对象指针非法 %p", (void *)b); return; }
     TB(b)->has_layout = l != NULL; if (l) memcpy(TB(b)->layout, l->layout, 8);
     TB(b)->d.pkg_block_h = l ? l->layout[0] + 1 : 0;
 }
-NVN(nvnTextureBuilderGetFlags, NVNtextureFlags, const NVNtextureBuilder *b) { return (NVNtextureFlags)((const tex_builder_t *)b)->d.flags; }
+NVN(nvnTextureBuilderGetFlags, NVNtextureFlags, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetFlags 对象指针非法 %p", (void *)b); return 0; } return (NVNtextureFlags)((const tex_builder_t *)b)->d.flags; }
 static uint64_t g_layout_logged;
 static void log_layout(const tex_builder_t *b, const nvn_texlayout *L) {
     if (b->has_layout && g_layout_logged++ < 16)
@@ -269,12 +319,14 @@ static void log_layout(const tex_builder_t *b, const nvn_texlayout *L) {
             b->layout[3], b->layout[4], b->layout[5], b->layout[6], b->layout[7], L->tileH, L->size);
 }
 NVN(nvnTextureBuilderGetStorageSize, size_t, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetStorageSize 对象指针非法 %p", (void *)b); return 0; }
     nvn_texlayout L; nvn_tex_layout(&((const tex_builder_t *)b)->d, &L);
     if (!L.bpb) LOG("【红】TextureBuilderGetStorageSize 未知格式 %#x", ((const tex_builder_t *)b)->d.format);
     log_layout((const tex_builder_t *)b, &L);
     return L.size;
 }
 NVN(nvnTextureBuilderGetStorageAlignment, size_t, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetStorageAlignment 对象指针非法 %p", (void *)b); return 0; }
     nvn_texlayout L; nvn_tex_layout(&((const tex_builder_t *)b)->d, &L); return L.align;
 }
 #define TX(t) ((tex_t *)(t))
@@ -350,6 +402,8 @@ static void snap_drop(const void **pp, uint64_t ser, uint64_t snap_ser_off) {
     pthread_mutex_unlock(&g_snap_mu);
 }
 NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(t, sizeof(tex_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnTextureInitialize 对象指针非法 %p", (void *)t); return 0; }
+    if (!nvn_obj_ok(b, 8)) { static int _b; if (_b++ < 6) LOG("【红】nvnTextureInitialize builder 指针非法 %p", (void *)b); return 0; }
     const tex_builder_t *s = (const tex_builder_t *)b; tex_t *o = TX(t);
     memset(o, 0, sizeof *o);
     o->magic = MAGIC('T', 'E', 'X', 0); o->d = s->d; o->pool = s->pool; o->off = s->off;
@@ -361,13 +415,18 @@ NVN(nvnTextureInitialize, NVNboolean, NVNtexture *t, const NVNtextureBuilder *b)
          o->d.levels, o->d.format, o->d.target, o->d.flags, o->L.size);
     return 1;
 }
-NVN(nvnTextureFinalize, void, NVNtexture *t) { snap_drop(&TX(t)->snap, TX(t)->serial, offsetof(tex_t, serial)); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
-NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) { return (NVNtextureFlags)CTX(t)->d.flags; }
-NVN(nvnTextureGetWidth, int, const NVNtexture *t) { return (int)CTX(t)->d.width; }
-NVN(nvnTextureGetHeight, int, const NVNtexture *t) { return (int)CTX(t)->d.height; }
-NVN(nvnTextureGetDepth, int, const NVNtexture *t) { return (int)CTX(t)->d.depth; }
-NVN(nvnTextureGetStorageSize, int, const NVNtexture *t) { return (int)CTX(t)->L.size; }
+NVN(nvnTextureFinalize, void, NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureFinalize 对象指针非法 %p", (void *)t); return; } snap_drop(&TX(t)->snap, TX(t)->serial, offsetof(tex_t, serial)); mtl_tex_release(TX(t)); TX(t)->magic = 0; }
+NVN(nvnTextureGetWidth, int, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetWidth 对象指针非法 %p", (void *)t); return 0; } return (int)CTX(t)->d.width; }
+NVN(nvnTextureGetHeight, int, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetHeight 对象指针非法 %p", (void *)t); return 0; } return (int)CTX(t)->d.height; }
+NVN(nvnTextureGetDepth, int, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetDepth 对象指针非法 %p", (void *)t); return 0; } return (int)CTX(t)->d.depth; }
+NVN(nvnTextureGetStorageSize, int, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetStorageSize 对象指针非法 %p", (void *)t); return 0; } return (int)CTX(t)->L.size; }
 NVN(nvnTextureCompare, NVNboolean, const NVNtexture *a, const NVNtexture *b) {
+    if (!nvn_obj_ok(a, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureCompare 对象指针非法 %p", (void *)a); return 0; }
     const tex_t *x = CTX(a), *y = CTX(b);
     return !memcmp(&x->d, &y->d, sizeof x->d) && x->mem == y->mem;
 }
@@ -375,15 +434,18 @@ NVN(nvnTextureCompare, NVNboolean, const NVNtexture *a, const NVNtexture *b) {
 // No prototype in the header; call sites such as main 0x174899c compare the return value with 1 and set some status bit 0x100 if not equal. Meaning unverified; return 1 for now
 NVN_NOPROTO(nvnTextureGetRawStorageClass, int, const NVNtexture *t) { (void)t; return 1; }
 #define VW(v) ((view_t *)(v))
-NVN(nvnTextureViewSetDefaults, void, NVNtextureView *v) { memset(v, 0, sizeof(view_t)); }
-NVN(nvnTextureViewSetLevels, void, NVNtextureView *v, int base, int n) { VW(v)->set_levels = 1; VW(v)->base_level = base; VW(v)->nlevels = n; }
-NVN(nvnTextureViewSetLayers, void, NVNtextureView *v, int min, int n) { VW(v)->set_layers = 1; VW(v)->min_layer = min; VW(v)->nlayers = n; }
-NVN(nvnTextureViewSetFormat, void, NVNtextureView *v, NVNformat f) { VW(v)->set_format = 1; VW(v)->format = f; }
-NVN(nvnTextureViewSetTarget, void, NVNtextureView *v, NVNtextureTarget t) { VW(v)->set_target = 1; VW(v)->target = t; }
-NVN(nvnTextureViewGetLayers, NVNboolean, const NVNtextureView *v, int *min, int *n) {
-    const view_t *o = (const view_t *)v; *min = o->min_layer; *n = o->nlayers; return o->set_layers;
-}
+NVN(nvnTextureViewSetDefaults, void, NVNtextureView *v) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewSetDefaults 对象指针非法 %p", (void *)v); return; } memset(v, 0, sizeof(view_t)); }
+NVN(nvnTextureViewSetLevels, void, NVNtextureView *v, int base, int n) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewSetLevels 对象指针非法 %p", (void *)v); return; } VW(v)->set_levels = 1; VW(v)->base_level = base; VW(v)->nlevels = n; }
+NVN(nvnTextureViewSetLayers, void, NVNtextureView *v, int min, int n) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewSetLayers 对象指针非法 %p", (void *)v); return; } VW(v)->set_layers = 1; VW(v)->min_layer = min; VW(v)->nlayers = n; }
+NVN(nvnTextureViewSetFormat, void, NVNtextureView *v, NVNformat f) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewSetFormat 对象指针非法 %p", (void *)v); return; } VW(v)->set_format = 1; VW(v)->format = f; }
+NVN(nvnTextureViewSetTarget, void, NVNtextureView *v, NVNtextureTarget t) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewSetTarget 对象指针非法 %p", (void *)v); return; } VW(v)->set_target = 1; VW(v)->target = t; }
 NVN(nvnTextureGetViewOffset, ptrdiff_t, const NVNtexture *t, const NVNtextureView *v) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetViewOffset 对象指针非法 %p", (void *)t); return 0; }
     const tex_t *o = CTX(t); const view_t *w = (const view_t *)v;
     if (!w) return 0;
     uint64_t off = w->set_levels ? nvn_tex_level_offset(&o->d, (unsigned)w->base_level) : 0;
@@ -402,50 +464,71 @@ static void read_texels(const tex_t *o, const view_t *v, const NVNcopyRegion *r,
     mtl_read_texels(o, level, layer0, r, dst, (size_t)row, (size_t)img);
 }
 NVN(nvnTextureReadTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureReadTexels 对象指针非法 %p", (void *)t); return; }
     read_texels(CTX(t), (const view_t *)v, r, dst, 0, 0);
 }
 NVN(nvnTextureReadTexelsStrided, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, void *dst, ptrdiff_t row, ptrdiff_t img) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureReadTexelsStrided 对象指针非法 %p", (void *)t); return; }
     read_texels(CTX(t), (const view_t *)v, r, dst, row, img);
 }
-NVN(nvnTextureInvalidateTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) { (void)t; (void)v; (void)r; }
+NVN(nvnTextureInvalidateTexels, void, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureInvalidateTexels 对象指针非法 %p", (void *)t); return; } (void)t; (void)v; (void)r; }
 
 // ---------- 采样器 ----------
 // ---------- Samplers ----------
 #define SB(b) (&((samp_builder_t *)(b))->p)
 NVN(nvnSamplerBuilderSetDefaults, void, NVNsamplerBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetDefaults 对象指针非法 %p", (void *)b); return; }
     NVNdevice *dev = ((samp_builder_t *)b)->dev; memset(b, 0, sizeof(samp_builder_t)); ((samp_builder_t *)b)->dev = dev;
     samp_par *o = SB(b);
     o->minf = NVN_MIN_FILTER_NEAREST_MIPMAP_LINEAR; o->magf = NVN_MAG_FILTER_LINEAR;   // GL 默认 | GL defaults
     o->ws = o->wt = o->wr = NVN_WRAP_MODE_REPEAT; o->cmp_func = NVN_COMPARE_FUNC_LESS;
     o->lod_min = -1000.f; o->lod_max = 1000.f; o->aniso = 1.f;
 }
-NVN(nvnSamplerBuilderSetDevice, void, NVNsamplerBuilder *b, NVNdevice *d) { ((samp_builder_t *)b)->dev = d; }
-NVN(nvnSamplerBuilderSetMinMagFilter, void, NVNsamplerBuilder *b, NVNminFilter mi, NVNmagFilter ma) { SB(b)->minf = mi; SB(b)->magf = ma; }
-NVN(nvnSamplerBuilderSetWrapMode, void, NVNsamplerBuilder *b, NVNwrapMode s, NVNwrapMode t, NVNwrapMode r) { SB(b)->ws = s; SB(b)->wt = t; SB(b)->wr = r; }
-NVN(nvnSamplerBuilderSetLodClamp, void, NVNsamplerBuilder *b, float lo, float hi) { SB(b)->lod_min = lo; SB(b)->lod_max = hi; }
-NVN(nvnSamplerBuilderSetLodBias, void, NVNsamplerBuilder *b, float v) { SB(b)->lod_bias = v; }
-NVN(nvnSamplerBuilderSetCompare, void, NVNsamplerBuilder *b, NVNcompareMode m, NVNcompareFunc f) { SB(b)->cmp_mode = m; SB(b)->cmp_func = f; }
-NVN(nvnSamplerBuilderSetBorderColor, void, NVNsamplerBuilder *b, const float *c) { memcpy(SB(b)->border, c, 16); }
-NVN(nvnSamplerBuilderSetMaxAnisotropy, void, NVNsamplerBuilder *b, float v) { SB(b)->aniso = v; }
-NVN(nvnSamplerBuilderSetLodSnap, void, NVNsamplerBuilder *b, float v) { (void)b; (void)v; }   // Metal 无对应，忽略 | No Metal equivalent, ignored
+NVN(nvnSamplerBuilderSetDevice, void, NVNsamplerBuilder *b, NVNdevice *d) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetDevice 对象指针非法 %p", (void *)b); return; } ((samp_builder_t *)b)->dev = d; }
+NVN(nvnSamplerBuilderSetMinMagFilter, void, NVNsamplerBuilder *b, NVNminFilter mi, NVNmagFilter ma) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetMinMagFilter 对象指针非法 %p", (void *)b); return; } SB(b)->minf = mi; SB(b)->magf = ma; }
+NVN(nvnSamplerBuilderSetWrapMode, void, NVNsamplerBuilder *b, NVNwrapMode s, NVNwrapMode t, NVNwrapMode r) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetWrapMode 对象指针非法 %p", (void *)b); return; } SB(b)->ws = s; SB(b)->wt = t; SB(b)->wr = r; }
+NVN(nvnSamplerBuilderSetLodClamp, void, NVNsamplerBuilder *b, float lo, float hi) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetLodClamp 对象指针非法 %p", (void *)b); return; } SB(b)->lod_min = lo; SB(b)->lod_max = hi; }
+NVN(nvnSamplerBuilderSetLodBias, void, NVNsamplerBuilder *b, float v) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetLodBias 对象指针非法 %p", (void *)b); return; } SB(b)->lod_bias = v; }
+NVN(nvnSamplerBuilderSetCompare, void, NVNsamplerBuilder *b, NVNcompareMode m, NVNcompareFunc f) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetCompare 对象指针非法 %p", (void *)b); return; } SB(b)->cmp_mode = m; SB(b)->cmp_func = f; }
+NVN(nvnSamplerBuilderSetBorderColor, void, NVNsamplerBuilder *b, const float *c) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetBorderColor 对象指针非法 %p", (void *)b); return; } memcpy(SB(b)->border, c, 16); }
+NVN(nvnSamplerBuilderSetMaxAnisotropy, void, NVNsamplerBuilder *b, float v) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetMaxAnisotropy 对象指针非法 %p", (void *)b); return; } SB(b)->aniso = v; }
+NVN(nvnSamplerBuilderSetLodSnap, void, NVNsamplerBuilder *b, float v) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetLodSnap 对象指针非法 %p", (void *)b); return; } (void)b; (void)v; }   // Metal 无对应，忽略 | No Metal equivalent, ignored
 NVN(nvnSamplerBuilderGetMinMagFilter, void, const NVNsamplerBuilder *b, NVNminFilter *mi, NVNmagFilter *ma) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderGetMinMagFilter 对象指针非法 %p", (void *)b); return; }
     const samp_par *o = &((const samp_builder_t *)b)->p; *mi = (NVNminFilter)o->minf; *ma = (NVNmagFilter)o->magf;
 }
 NVN(nvnSamplerBuilderGetWrapMode, void, const NVNsamplerBuilder *b, NVNwrapMode *s, NVNwrapMode *t, NVNwrapMode *r) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderGetWrapMode 对象指针非法 %p", (void *)b); return; }
     const samp_par *o = &((const samp_builder_t *)b)->p; *s = (NVNwrapMode)o->ws; *t = (NVNwrapMode)o->wt; *r = (NVNwrapMode)o->wr;
 }
 NVN(nvnSamplerInitialize, NVNboolean, NVNsampler *s, const NVNsamplerBuilder *b) {
+    if (!nvn_obj_ok(s, sizeof(samp_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnSamplerInitialize 对象指针非法 %p", (void *)s); return 0; }
+    if (!nvn_obj_ok(b, 8)) { static int _b; if (_b++ < 6) LOG("【红】nvnSamplerInitialize builder 指针非法 %p", (void *)b); return 0; }
     samp_t *o = (samp_t *)s; o->magic = MAGIC('S', 'M', 'P', 0); o->p = ((const samp_builder_t *)b)->p; return 1;
 }
-NVN(nvnSamplerFinalize, void, NVNsampler *s) { ((samp_t *)s)->magic = 0; }
+NVN(nvnSamplerFinalize, void, NVNsampler *s) {
+    if (!nvn_obj_ok(s, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerFinalize 对象指针非法 %p", (void *)s); return; } ((samp_t *)s)->magic = 0; }
 
 // ---------- 程序 ----------
 // ---------- Programs ----------
 NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
+    if (!nvn_obj_ok(p, sizeof(prog_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnProgramInitialize 对象指针非法 %p", (void *)p); return 0; }
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
-NVN(nvnProgramFinalize, void, NVNprogram *p) { prog_t *o = (prog_t *)p; snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->magic = 0; }
+NVN(nvnProgramFinalize, void, NVNprogram *p) {
+    if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramFinalize 对象指针非法 %p", (void *)p); return; } prog_t *o = (prog_t *)p; snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->magic = 0; }
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
+    if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramSetShaders 对象指针非法 %p", (void *)p); return 0; }
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShaders 阶段数 %d", n); return 0; }
     snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
@@ -459,7 +542,8 @@ NVN(nvnSyncInitialize, NVNboolean, NVNsync *s, NVNdevice *d) { (void)d; *(sync_t
 NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 // 围栏 = 「此前提交到队列的命令全部完成」：记下最近一次提交的栅栏值
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
-NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) { (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = x_fence(); }
+NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) {
+    if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueFenceSync 对象指针非法 %p", (void *)q); return; } (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = x_fence(); }
 // 没围栏过的同步对象按真机行为等到超时；已围栏的只在 GPU 真正完成到该栅栏值后放行
 // 诊断：游戏每帧在 SyncWait / 读事件上等了多久、等的是落后最新提交几次的栅栏（每 300 帧一行）
 // A sync object that was never fenced waits until the timeout, as on the device; a fenced one is released only once the GPU has really completed up to that fence value
@@ -498,57 +582,78 @@ NVN(nvnSyncWait, NVNsyncWaitResult, const NVNsync *s, uint64_t timeout) {
 // gives the strong definition). This is an empty weak definition, not a weak declaration: Apple's linker requires even a weak reference
 // to resolve at link time, or the Mac host and the iOS app fail to link (_mtl_event_read undefined)
 __attribute__((weak)) void mtl_event_read(const volatile uint32_t *val) { (void)val; }
-NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) { memset(b, 0, sizeof(ev_builder_t)); }
+NVN(nvnEventBuilderSetDefaults, void, NVNeventBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnEventBuilderSetDefaults 对象指针非法 %p", (void *)b); return; } memset(b, 0, sizeof(ev_builder_t)); }
 NVN(nvnEventBuilderSetStorage, void, NVNeventBuilder *b, const NVNmemoryPool *p, int64_t off) { *(ev_builder_t *)b = (ev_builder_t){(const pool_t *)p, off}; }
 NVN(nvnEventInitialize, NVNboolean, NVNevent *e, const NVNeventBuilder *b) {
+    if (!nvn_obj_ok(e, sizeof(ev_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnEventInitialize 对象指针非法 %p", (void *)e); return 0; }
+    if (!nvn_obj_ok(b, 8)) { static int _b; if (_b++ < 6) LOG("【红】nvnEventInitialize builder 指针非法 %p", (void *)b); return 0; }
     const ev_builder_t *s = (const ev_builder_t *)b;
     if (!s->pool || !s->pool->mem) { LOG("【红】EventInitialize 没有存储"); return 0; }
     if (mtl_event_read) mtl_event_read((volatile uint32_t *)(s->pool->mem + s->off));
     *(ev_t *)e = (ev_t){MAGIC('E', 'V', 'N', 'T'), (volatile uint32_t *)(s->pool->mem + s->off)}; return 1;
 }
-NVN(nvnEventFinalize, void, NVNevent *e) { if (mtl_event_read) mtl_event_read(((ev_t *)e)->val); ((ev_t *)e)->magic = 0; }
+NVN(nvnEventFinalize, void, NVNevent *e) {
+    if (!nvn_obj_ok(e, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnEventFinalize 对象指针非法 %p", (void *)e); return; } if (mtl_event_read) mtl_event_read(((ev_t *)e)->val); ((ev_t *)e)->magic = 0; }
 // 后端若延后发布命令缓冲里的 SignalEvent（安卓 Vulkan，gfx-defer-events），读值前先让它落地；Metal 后端没有这个钩子
 // 读事件计时只在鸿蒙做（只有鸿蒙汇报这些计数），其余平台照旧
 // If the backend defers publishing command-buffer SignalEvents (Android Vulkan, gfx-defer-events), let it land before the read; the Metal backend has no such hook
 // The event-read timing runs on HarmonyOS only (only HarmonyOS reports these counters); other platforms as before
 #ifdef __OHOS__
-NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { if (mtl_event_read) { uint64_t t0 = now_ns(); mtl_event_read(((const ev_t *)e)->val); atomic_fetch_add(&g_gw_ev_ns, now_ns() - t0); atomic_fetch_add(&g_gw_ev_n, 1); } return *((const ev_t *)e)->val; }
+NVN(nvnEventGetValue, uint32_t, const NVNevent *e) {
+    if (!nvn_obj_ok(e, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnEventGetValue 对象指针非法 %p", (void *)e); return 0; } if (mtl_event_read) { uint64_t t0 = now_ns(); mtl_event_read(((const ev_t *)e)->val); atomic_fetch_add(&g_gw_ev_ns, now_ns() - t0); atomic_fetch_add(&g_gw_ev_n, 1); } return *((const ev_t *)e)->val; }
 #else
-NVN(nvnEventGetValue, uint32_t, const NVNevent *e) { if (mtl_event_read) mtl_event_read(((const ev_t *)e)->val); return *((const ev_t *)e)->val; }
+NVN(nvnEventGetValue, uint32_t, const NVNevent *e) {
+    if (!nvn_obj_ok(e, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnEventGetValue 对象指针非法 %p", (void *)e); return 0; } if (mtl_event_read) mtl_event_read(((const ev_t *)e)->val); return *((const ev_t *)e)->val; }
 #endif
 static void ev_signal(const ev_t *e, int mode, uint32_t v) { if (mtl_event_read) mtl_event_read(e->val); if (mode == NVN_EVENT_SIGNAL_MODE_ADD) *e->val += v; else *e->val = v; }
-NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) { ev_signal((const ev_t *)e, m, v); }
+NVN(nvnEventSignal, void, NVNevent *e, NVNeventSignalMode m, uint32_t v) {
+    if (!nvn_obj_ok(e, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnEventSignal 对象指针非法 %p", (void *)e); return; } ev_signal((const ev_t *)e, m, v); }
 
 // ---------- 队列 ----------
 // ---------- Queue ----------
 #define QB(b) ((queue_builder_t *)(b))
 NVN(nvnQueueBuilderSetDefaults, void, NVNqueueBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueBuilderSetDefaults 对象指针非法 %p", (void *)b); return; }
     NVNdevice *dev = QB(b)->dev; memset(b, 0, sizeof(queue_builder_t)); QB(b)->dev = dev;
     QB(b)->cmd_sz = 65536; QB(b)->comp_sz = 262144; QB(b)->ctl_sz = 16384; QB(b)->flush = 4096;   // 设备默认值 | Device defaults
 }
-NVN(nvnQueueBuilderSetDevice, void, NVNqueueBuilder *b, NVNdevice *d) { QB(b)->dev = d; }
-NVN(nvnQueueBuilderSetFlags, void, NVNqueueBuilder *b, int f) { QB(b)->flags = f; }
-NVN(nvnQueueBuilderSetCommandMemorySize, void, NVNqueueBuilder *b, size_t n) { QB(b)->cmd_sz = n; }
-NVN(nvnQueueBuilderSetComputeMemorySize, void, NVNqueueBuilder *b, size_t n) { QB(b)->comp_sz = n; }
-NVN(nvnQueueBuilderSetControlMemorySize, void, NVNqueueBuilder *b, size_t n) { QB(b)->ctl_sz = n; }
-NVN(nvnQueueBuilderSetCommandFlushThreshold, void, NVNqueueBuilder *b, size_t n) { QB(b)->flush = n; }
+NVN(nvnQueueBuilderSetDevice, void, NVNqueueBuilder *b, NVNdevice *d) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueBuilderSetDevice 对象指针非法 %p", (void *)b); return; } QB(b)->dev = d; }
+NVN(nvnQueueBuilderSetFlags, void, NVNqueueBuilder *b, int f) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueBuilderSetFlags 对象指针非法 %p", (void *)b); return; } QB(b)->flags = f; }
+NVN(nvnQueueBuilderSetCommandMemorySize, void, NVNqueueBuilder *b, size_t n) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueBuilderSetCommandMemorySize 对象指针非法 %p", (void *)b); return; } QB(b)->cmd_sz = n; }
+NVN(nvnQueueBuilderSetComputeMemorySize, void, NVNqueueBuilder *b, size_t n) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueBuilderSetComputeMemorySize 对象指针非法 %p", (void *)b); return; } QB(b)->comp_sz = n; }
+NVN(nvnQueueBuilderSetControlMemorySize, void, NVNqueueBuilder *b, size_t n) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueBuilderSetControlMemorySize 对象指针非法 %p", (void *)b); return; } QB(b)->ctl_sz = n; }
+NVN(nvnQueueBuilderSetCommandFlushThreshold, void, NVNqueueBuilder *b, size_t n) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueBuilderSetCommandFlushThreshold 对象指针非法 %p", (void *)b); return; } QB(b)->flush = n; }
 // 队列内存：命令 + 计算 + 控制三块之和按 4 KiB 取整（宿主不使用，只需游戏按此大小分配）
 // Queue memory: the sum of the command + compute + control blocks rounded to 4 KiB (the host does not use it; the game only needs to allocate this size)
 NVN(nvnQueueBuilderGetQueueMemorySize, size_t, const NVNqueueBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueBuilderGetQueueMemorySize 对象指针非法 %p", (void *)b); return 0; }
     const queue_builder_t *o = (const queue_builder_t *)b;
     return (o->cmd_sz + o->comp_sz + o->ctl_sz + 4095) & ~(size_t)4095;
 }
 NVN(nvnQueueBuilderSetQueueMemory, void, NVNqueueBuilder *b, void *m, size_t n) { QB(b)->mem = m; QB(b)->mem_sz = n; }
 NVN(nvnQueueInitialize, NVNboolean, NVNqueue *q, const NVNqueueBuilder *b) {
+    if (!nvn_obj_ok(q, sizeof(queue_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnQueueInitialize 对象指针非法 %p", (void *)q); return 0; }
+    if (!nvn_obj_ok(b, 8)) { static int _b; if (_b++ < 6) LOG("【红】nvnQueueInitialize builder 指针非法 %p", (void *)b); return 0; }
     *(queue_t *)q = (queue_t){MAGIC('Q', 'U', 'E', 'U'), ((const queue_builder_t *)b)->dev, 0};
     OLOG("QueueInitialize %p", (void *)q); return 1;
 }
-NVN(nvnQueueFinalize, void, NVNqueue *q) { ((queue_t *)q)->magic = 0; }
+NVN(nvnQueueFinalize, void, NVNqueue *q) {
+    if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueFinalize 对象指针非法 %p", (void *)q); return; } ((queue_t *)q)->magic = 0; }
 NVN(nvnQueueGetError, NVNqueueGetErrorResult, NVNqueue *q, NVNqueueErrorInfo *info) {
+    if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueGetError 对象指针非法 %p", (void *)q); return 0; }
     (void)q; if (info) memset(info, 0, sizeof *info); return NVN_QUEUE_GET_ERROR_RESULT_GPU_NO_ERROR;
 }
-NVN(nvnQueueFlush, void, NVNqueue *q) { (void)q; }
-NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; x_drain(); mtl_finish(); }
+NVN(nvnQueueFlush, void, NVNqueue *q) {
+    if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueFlush 对象指针非法 %p", (void *)q); return; } (void)q; }
+NVN(nvnQueueFinish, void, NVNqueue *q) {
+    if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueFinish 对象指针非法 %p", (void *)q); return; } (void)q; x_drain(); mtl_finish(); }
 
 // ---------- 命令缓冲：录进游戏的命令内存，提交时执行 CPU 可见副作用 ----------
 // ---------- Command buffer: record into the game's command memory, perform CPU-visible side effects at submit ----------
@@ -556,11 +661,16 @@ NVN(nvnQueueFinish, void, NVNqueue *q) { (void)q; x_drain(); mtl_finish(); }
 #define OP_RESERVE 24                             // 段尾永远留够一条 JUMP / END | Always keep enough room at the segment end for one JUMP / END
 
 NVN(nvnCommandBufferInitialize, NVNboolean, NVNcommandBuffer *c, NVNdevice *d) {
+    if (!nvn_obj_ok(c, sizeof(cmd_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnCommandBufferInitialize 对象指针非法 %p", (void *)c); return 0; }
+    if (!nvn_obj_ok(d, 8)) { static int _b; if (_b++ < 6) LOG("【红】nvnCommandBufferInitialize builder 指针非法 %p", (void *)d); return 0; }
     memset(c, 0, sizeof(cmd_t)); CB(c)->magic = MAGIC('C', 'M', 'D', 'B'); CB(c)->dev = d; return 1;
 }
-NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) { CB(c)->magic = 0; }
-NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) { CB(c)->cb = cb; }
-NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) { CB(c)->cb_data = d; }
+NVN(nvnCommandBufferFinalize, void, NVNcommandBuffer *c) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferFinalize 对象指针非法 %p", (void *)c); return; } CB(c)->magic = 0; }
+NVN(nvnCommandBufferSetMemoryCallback, void, NVNcommandBuffer *c, PFNNVNCOMMANDBUFFERMEMORYCALLBACKPROC cb) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetMemoryCallback 对象指针非法 %p", (void *)c); return; } CB(c)->cb = cb; }
+NVN(nvnCommandBufferSetMemoryCallbackData, void, NVNcommandBuffer *c, void *d) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetMemoryCallbackData 对象指针非法 %p", (void *)c); return; } CB(c)->cb_data = d; }
 static uint8_t *align8(uint8_t *p) { return (uint8_t *)(((uintptr_t)p + 7) & ~(uintptr_t)7); }
 // 诊断 DM_NVN_CMDSTAT=1：每 300 帧记一行命令录制的用量——每帧录了多少字节 / 多少条、游戏每次给多大一段命令内存、每帧补内存回调几次、宿主补段几次、
 // 各类命令的条数与字节（找「我们的记录比真机命令大多少」）。只计数，不改录制 / 回放
@@ -613,13 +723,15 @@ static uint8_t *hostseg_take(void) {
     return m;
 }
 NVN(nvnCommandBufferAddCommandMemory, void, NVNcommandBuffer *c, const NVNmemoryPool *p, ptrdiff_t off, size_t n) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferAddCommandMemory 对象指针非法 %p", (void *)c); return; }
     const pool_t *pl = (const pool_t *)p;
     if (!pl || n < 64) { if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.hostseg++; pthread_mutex_unlock(&g_cs_mu); } cmd_new_segment(CB(c), hostseg_take(), HOSTSEG_SZ); return; }
     if (!pl->mem) { LOG("【红】AddCommandMemory 池没有 CPU 存储"); return; }
     if (cs_on()) { pthread_mutex_lock(&g_cs_mu); g_cs.grants++; g_cs.grant_bytes += n; if (!g_cs.grant_min || n < g_cs.grant_min) g_cs.grant_min = n; if (n > g_cs.grant_max) g_cs.grant_max = n; pthread_mutex_unlock(&g_cs_mu); }
     cmd_new_segment(CB(c), pl->mem + off, n);
 }
-NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) { (void)c; (void)m; (void)n; }
+NVN(nvnCommandBufferAddControlMemory, void, NVNcommandBuffer *c, void *m, size_t n) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferAddControlMemory 对象指针非法 %p", (void *)c); return; } (void)c; (void)m; (void)n; }
 // 取一条记录的空间；不够则按 NVN 约定回调游戏补命令内存
 // Get space for one record; if not enough, call back into the game per the NVN convention to add command memory
 static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
@@ -633,34 +745,42 @@ static uint8_t *cmd_alloc(cmd_t *o, uint32_t size) {
     uint8_t *p = o->cur; o->cur += size; put_hdr(p, 0, size); return p;
 }
 NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBeginRecording 对象指针非法 %p", (void *)c); return; }
     cmd_t *o = CB(c);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1;
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_BEGIN, 8); o->begin = p;
 }
 NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferEndRecording 对象指针非法 %p", (void *)c); return 0; }
     cmd_t *o = CB(c);
     uint8_t *p = cmd_alloc(o, 8); put_hdr(p, OP_END, 8);
     o->recording = 0;
     return (NVNcommandHandle)o->begin;
 }
-NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) { return ((const cmd_t *)c)->recording != 0; }
+NVN(nvnCommandBufferIsRecording, NVNboolean, const NVNcommandBuffer *c) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferIsRecording 对象指针非法 %p", (void *)c); return 0; } return ((const cmd_t *)c)->recording != 0; }
 NVN(nvnCommandBufferCopyCommands, void, NVNcommandBuffer *c, int n, const NVNcommandHandle *h) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferCopyCommands 对象指针非法 %p", (void *)c); return; }
     for (int i = 0; i < n; i++) { uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_CALL, 16); memcpy(p + 8, &h[i], 8); }
 }
 NVN(nvnCommandBufferSignalEvent, void, NVNcommandBuffer *c, const NVNevent *e, NVNeventSignalMode m, NVNeventSignalLocation loc, int flags, uint32_t v) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSignalEvent 对象指针非法 %p", (void *)c); return; }
     (void)loc; (void)flags;
     uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_SIGNAL_EVENT, 24);
     const ev_t *ev = (const ev_t *)e; volatile uint32_t *val = ev->val; uint32_t mm = m;
     memcpy(p + 8, &val, 8); memcpy(p + 16, &mm, 4); memcpy(p + 20, &v, 4);
 }
 NVN(nvnCommandBufferResetCounter, void, NVNcommandBuffer *c, NVNcounterType t) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferResetCounter 对象指针非法 %p", (void *)c); return; }
     uint8_t *p = cmd_alloc(CB(c), 16); put_hdr(p, OP_RESET_COUNTER, 16); uint64_t tt = t; memcpy(p + 8, &tt, 8);
 }
 NVN(nvnCommandBufferReportCounter, void, NVNcommandBuffer *c, NVNcounterType t, NVNbufferAddress a) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferReportCounter 对象指针非法 %p", (void *)c); return; }
     uint8_t *p = cmd_alloc(CB(c), 24); put_hdr(p, OP_REPORT_COUNTER, 24); uint64_t tt = t; memcpy(p + 8, &tt, 8); memcpy(p + 16, &a, 8);
 }
 NVN(nvnCommandBufferCopyBufferToBuffer, void, NVNcommandBuffer *c, NVNbufferAddress src, NVNbufferAddress dst, size_t n, int flags) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferCopyBufferToBuffer 对象指针非法 %p", (void *)c); return; }
     (void)flags;
     uint8_t *p = cmd_alloc(CB(c), 32); put_hdr(p, OP_COPY_B2B, 32); uint64_t nn = n;
     memcpy(p + 8, &src, 8); memcpy(p + 16, &dst, 8); memcpy(p + 24, &nn, 8);
@@ -668,6 +788,7 @@ NVN(nvnCommandBufferCopyBufferToBuffer, void, NVNcommandBuffer *c, NVNbufferAddr
 // uniform 更新：数据在录制时拷进命令内存（NVN 语义：录制后调用方可改原数据），提交时写进缓冲
 // uniform update: the data is copied into command memory at record time (NVN semantics: the caller may modify the original data after recording) and written into the buffer at submit
 NVN(nvnCommandBufferUpdateUniformBuffer, void, NVNcommandBuffer *c, NVNbufferAddress buf, size_t bufsz, ptrdiff_t off, size_t n, const void *data) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferUpdateUniformBuffer 对象指针非法 %p", (void *)c); return; }
     (void)bufsz;
     uint32_t sz = (uint32_t)(24 + n);
     uint8_t *p = cmd_alloc(CB(c), sz); put_hdr(p, OP_UPDATE_UB, (sz + 7) & ~7u);
@@ -691,56 +812,76 @@ static void *rec(NVNcommandBuffer *c, uint32_t op, size_t payload) {
 static void copy_view(view_t *dst, uint8_t *has, const NVNtextureView *v) { *has = v != NULL; if (v) *dst = *(const view_t *)v; }
 NVN(nvnCommandBufferSetRenderTargets, void, NVNcommandBuffer *c, int n, const NVNtexture *const *ct, const NVNtextureView *const *cv,
     const NVNtexture *dt, const NVNtextureView *dv) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetRenderTargets 对象指针非法 %p", (void *)c); return; }
     if (n < 0 || n > 8) { LOG("【红】SetRenderTargets 数量 %d", n); n = n < 0 ? 0 : 8; }
     p_set_rt *r = REC(c, OP_SET_RT, p_set_rt); r->n = n;
     for (int i = 0; i < n; i++) { r->color[i] = ct ? snap_tex(ct[i]) : NULL; copy_view(&r->cview[i], &r->has_cview[i], cv ? cv[i] : NULL); }
     r->depth = snap_tex(dt); copy_view(&r->dview, &r->has_dview, dv);
 }
 NVN(nvnCommandBufferClearColor, void, NVNcommandBuffer *c, int index, const float *rgba, int mask) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferClearColor 对象指针非法 %p", (void *)c); return; }
     p_clear_color *r = REC(c, OP_CLEAR_COLOR, p_clear_color); r->index = index; r->mask = mask; memcpy(r->rgba, rgba, 16);
 }
 NVN(nvnCommandBufferClearDepthStencil, void, NVNcommandBuffer *c, float depth, uint32_t dmask, int stencil, int smask) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferClearDepthStencil 对象指针非法 %p", (void *)c); return; }
     p_clear_ds *r = REC(c, OP_CLEAR_DS, p_clear_ds); *r = (p_clear_ds){depth, (int)B(dmask), stencil, smask};
 }
 NVN(nvnCommandBufferSetViewports, void, NVNcommandBuffer *c, int first, int n, const float *v) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetViewports 对象指针非法 %p", (void *)c); return; }
     if (n < 0 || first + n > 16) { LOG("【红】SetViewports first=%d n=%d", first, n); return; }
     p_viewports *r = REC(c, OP_VIEWPORTS, p_viewports); r->first = first; r->n = n;
     for (int i = 0; i < n; i++) memcpy(r->v[i], v + 4 * i, 16);
 }
-NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) { *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
-NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) { *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
+NVN(nvnCommandBufferSetScissor, void, NVNcommandBuffer *c, int x, int y, int w, int h) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetScissor 对象指针非法 %p", (void *)c); return; } *REC(c, OP_SCISSOR, p_scissor) = (p_scissor){x, y, w, h}; }
+NVN(nvnCommandBufferSetDepthRange, void, NVNcommandBuffer *c, float n, float f) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetDepthRange 对象指针非法 %p", (void *)c); return; } *REC(c, OP_DEPTH_RANGE, p_depth_range) = (p_depth_range){n, f}; }
 NVN(nvnCommandBufferBindProgram, void, NVNcommandBuffer *c, const NVNprogram *p, int stages) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindProgram 对象指针非法 %p", (void *)c); return; }
     *REC(c, OP_BIND_PROGRAM, p_bind_program) = (p_bind_program){snap_prog(p), stages};
 }
 static void bind_state(NVNcommandBuffer *c, int kind, const void *st, size_t n) { p_bind_state *r = REC(c, OP_BIND_STATE, p_bind_state); r->kind = kind; memcpy(r->bytes, st, n); }
-NVN(nvnCommandBufferBindBlendState, void, NVNcommandBuffer *c, const NVNblendState *st) { bind_state(c, 0, st, sizeof(blend_st)); }
-NVN(nvnCommandBufferBindColorState, void, NVNcommandBuffer *c, const NVNcolorState *st) { bind_state(c, 1, st, sizeof(color_st)); }
-NVN(nvnCommandBufferBindChannelMaskState, void, NVNcommandBuffer *c, const NVNchannelMaskState *st) { bind_state(c, 2, st, sizeof(chmask_st)); }
-NVN(nvnCommandBufferBindMultisampleState, void, NVNcommandBuffer *c, const NVNmultisampleState *st) { bind_state(c, 3, st, sizeof(ms_st)); }
-NVN(nvnCommandBufferBindPolygonState, void, NVNcommandBuffer *c, const NVNpolygonState *st) { bind_state(c, 4, st, sizeof(poly_st)); }
-NVN(nvnCommandBufferBindDepthStencilState, void, NVNcommandBuffer *c, const NVNdepthStencilState *st) { bind_state(c, 5, st, sizeof(ds_st)); }
+NVN(nvnCommandBufferBindBlendState, void, NVNcommandBuffer *c, const NVNblendState *st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindBlendState 对象指针非法 %p", (void *)c); return; } bind_state(c, 0, st, sizeof(blend_st)); }
+NVN(nvnCommandBufferBindColorState, void, NVNcommandBuffer *c, const NVNcolorState *st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindColorState 对象指针非法 %p", (void *)c); return; } bind_state(c, 1, st, sizeof(color_st)); }
+NVN(nvnCommandBufferBindChannelMaskState, void, NVNcommandBuffer *c, const NVNchannelMaskState *st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindChannelMaskState 对象指针非法 %p", (void *)c); return; } bind_state(c, 2, st, sizeof(chmask_st)); }
+NVN(nvnCommandBufferBindMultisampleState, void, NVNcommandBuffer *c, const NVNmultisampleState *st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindMultisampleState 对象指针非法 %p", (void *)c); return; } bind_state(c, 3, st, sizeof(ms_st)); }
+NVN(nvnCommandBufferBindPolygonState, void, NVNcommandBuffer *c, const NVNpolygonState *st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindPolygonState 对象指针非法 %p", (void *)c); return; } bind_state(c, 4, st, sizeof(poly_st)); }
+NVN(nvnCommandBufferBindDepthStencilState, void, NVNcommandBuffer *c, const NVNdepthStencilState *st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindDepthStencilState 对象指针非法 %p", (void *)c); return; } bind_state(c, 5, st, sizeof(ds_st)); }
 NVN(nvnCommandBufferBindVertexAttribState, void, NVNcommandBuffer *c, int n, const NVNvertexAttribState *st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindVertexAttribState 对象指针非法 %p", (void *)c); return; }
     if (n < 0 || n > 16) { LOG("【红】BindVertexAttribState n=%d", n); return; }
     p_bind_vattr *r = RECN(c, OP_BIND_VATTR, p_bind_vattr, st, n); r->first = 0; r->n = n; memcpy(r->st, st, 4 * n);
 }
 NVN(nvnCommandBufferBindVertexStreamState, void, NVNcommandBuffer *c, int n, const NVNvertexStreamState *st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindVertexStreamState 对象指针非法 %p", (void *)c); return; }
     if (n < 0 || n > 16) { LOG("【红】BindVertexStreamState n=%d", n); return; }
     p_bind_vstream *r = RECN(c, OP_BIND_VSTREAM, p_bind_vstream, st, n); r->first = 0; r->n = n; memcpy(r->st, st, 8 * n);
 }
 NVN(nvnCommandBufferBindVertexBuffers, void, NVNcommandBuffer *c, int first, int n, const NVNbufferRange *rg) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindVertexBuffers 对象指针非法 %p", (void *)c); return; }
     if (n < 0 || first + n > 16) { LOG("【红】BindVertexBuffers first=%d n=%d", first, n); return; }
     p_bind_vbuf *r = RECN(c, OP_BIND_VBUF, p_bind_vbuf, r, n); r->first = first; r->n = n; memcpy(r->r, rg, sizeof *rg * n);
 }
 NVN(nvnCommandBufferBindUniformBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindUniformBuffer 对象指针非法 %p", (void *)c); return; }
     *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindUniformBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindUniformBuffers 对象指针非法 %p", (void *)c); return; }
     for (int i = 0; i < n; i++) *REC(c, OP_BIND_UBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
 }
 NVN(nvnCommandBufferBindStorageBuffer, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNbufferAddress a, size_t n) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindStorageBuffer 对象指针非法 %p", (void *)c); return; }
     *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, i, a, n};
 }
 NVN(nvnCommandBufferBindStorageBuffers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNbufferRange *rg) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindStorageBuffers 对象指针非法 %p", (void *)c); return; }
     for (int i = 0; i < n; i++) *REC(c, OP_BIND_SSBO, p_bind_buf) = (p_bind_buf){st, first + i, rg[i].address, rg[i].size};
 }
 static void bind_handles(NVNcommandBuffer *c, int op, int st, int first, int n, const uint64_t *h) {
@@ -750,61 +891,83 @@ static void bind_handles(NVNcommandBuffer *c, int op, int st, int first, int n, 
 // 图像（可写贴图）：句柄 = 贴图池号（GetImageHandle 原样返回；游戏不调 RegisterImage，图像与贴图共用登记）
 // Image (writable texture): handle = texture pool index (GetImageHandle returns it as-is; the game does not call RegisterImage, images and textures share registration)
 NVN(nvnCommandBufferBindImages, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNimageHandle *h) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindImages 对象指针非法 %p", (void *)c); return; }
     bind_handles(c, OP_BIND_IMG, st, first, n, (const uint64_t *)h);
 }
 NVN(nvnCommandBufferBindSeparateTextures, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNseparateTextureHandle *h) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindSeparateTextures 对象指针非法 %p", (void *)c); return; }
     bind_handles(c, OP_BIND_TEX, st, first, n, (const uint64_t *)h);
 }
 NVN(nvnCommandBufferBindSeparateSamplers, void, NVNcommandBuffer *c, NVNshaderStage st, int first, int n, const NVNseparateSamplerHandle *h) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindSeparateSamplers 对象指针非法 %p", (void *)c); return; }
     bind_handles(c, OP_BIND_SAMP, st, first, n, (const uint64_t *)h);
 }
 NVN(nvnCommandBufferBindSeparateSampler, void, NVNcommandBuffer *c, NVNshaderStage st, int i, NVNseparateSamplerHandle h) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBindSeparateSampler 对象指针非法 %p", (void *)c); return; }
     bind_handles(c, OP_BIND_SAMP, st, i, 1, &h.value);
 }
-NVN(nvnCommandBufferSetStencilValueMask, void, NVNcommandBuffer *c, NVNface f, int m) { *REC(c, OP_STENCIL, p_stencil) = (p_stencil){f, m, 0, 0, 0}; }
-NVN(nvnCommandBufferSetStencilMask, void, NVNcommandBuffer *c, NVNface f, int m) { *REC(c, OP_STENCIL, p_stencil) = (p_stencil){f, 0, m, 0, 1}; }
-NVN(nvnCommandBufferSetStencilRef, void, NVNcommandBuffer *c, NVNface f, int v) { *REC(c, OP_STENCIL, p_stencil) = (p_stencil){f, 0, 0, v, 2}; }
+NVN(nvnCommandBufferSetStencilValueMask, void, NVNcommandBuffer *c, NVNface f, int m) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetStencilValueMask 对象指针非法 %p", (void *)c); return; } *REC(c, OP_STENCIL, p_stencil) = (p_stencil){f, m, 0, 0, 0}; }
+NVN(nvnCommandBufferSetStencilMask, void, NVNcommandBuffer *c, NVNface f, int m) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetStencilMask 对象指针非法 %p", (void *)c); return; } *REC(c, OP_STENCIL, p_stencil) = (p_stencil){f, 0, m, 0, 1}; }
+NVN(nvnCommandBufferSetStencilRef, void, NVNcommandBuffer *c, NVNface f, int v) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetStencilRef 对象指针非法 %p", (void *)c); return; } *REC(c, OP_STENCIL, p_stencil) = (p_stencil){f, 0, 0, v, 2}; }
 NVN(nvnCommandBufferSetPolygonOffsetClamp, void, NVNcommandBuffer *c, float fa, float un, float cl) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetPolygonOffsetClamp 对象指针非法 %p", (void *)c); return; }
     *REC(c, OP_POLY_OFFSET, p_poly_offset) = (p_poly_offset){fa, un, cl};
 }
-NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n) { *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n}; }
+NVN(nvnCommandBufferDrawArrays, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, int first, int n) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferDrawArrays 对象指针非法 %p", (void *)c); return; } *REC(c, OP_DRAW, p_draw) = (p_draw){pr, first, n}; }
 NVN(nvnCommandBufferDrawElementsInstanced, void, NVNcommandBuffer *c, NVNdrawPrimitive pr, NVNindexType it, int n, NVNbufferAddress ib,
     int bv, int bi, int inst) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferDrawElementsInstanced 对象指针非法 %p", (void *)c); return; }
     *REC(c, OP_DRAW_IDX, p_draw_idx) = (p_draw_idx){pr, it, n, bv, bi, inst, ib};
 }
 NVN(nvnCommandBufferDispatchCompute, void, NVNcommandBuffer *c, int x, int y, int z) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferDispatchCompute 对象指针非法 %p", (void *)c); return; }
     // 跳板是尾跳（br），这里的返回地址就是游戏里的调用点
     // The thunk is a tail jump (br), so the return address here is the call site in the game
     *REC(c, OP_DISPATCH, p_dispatch) = (p_dispatch){x, y, z, (uint64_t)__builtin_return_address(0)};
 }
-NVN(nvnCommandBufferBarrier, void, NVNcommandBuffer *c, int bits) { *(int32_t *)rec(c, OP_BARRIER, 8) = bits; }
-NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) { REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; }
-NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) { REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; }
+NVN(nvnCommandBufferBarrier, void, NVNcommandBuffer *c, int bits) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBarrier 对象指针非法 %p", (void *)c); return; } *(int32_t *)rec(c, OP_BARRIER, 8) = bits; }
+NVN(nvnCommandBufferSetTexturePool, void, NVNcommandBuffer *c, const NVNtexturePool *p) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetTexturePool 对象指针非法 %p", (void *)c); return; } REC(c, OP_SET_TEX_POOL, p_set_pool)->pool = (const dpool_t *)p; }
+NVN(nvnCommandBufferSetSamplerPool, void, NVNcommandBuffer *c, const NVNsamplerPool *p) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetSamplerPool 对象指针非法 %p", (void *)c); return; } REC(c, OP_SET_SAMP_POOL, p_set_pool)->pool = (const dpool_t *)p; }
 
 NVN(nvnCommandBufferCopyBufferToTexture, void, NVNcommandBuffer *c, NVNbufferAddress src, const NVNtexture *t, const NVNtextureView *v,
     const NVNcopyRegion *r, int flags) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferCopyBufferToTexture 对象指针非法 %p", (void *)c); return; }
     p_copy_b2t *o = REC(c, OP_COPY_B2T, p_copy_b2t); o->src = src; o->tex = snap_tex(t); copy_view(&o->view, &o->has_view, v); o->r = *r; o->flags = flags;
 }
 NVN(nvnCommandBufferCopyTextureToBuffer, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r,
     NVNbufferAddress dst, int flags) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferCopyTextureToBuffer 对象指针非法 %p", (void *)c); return; }
     p_copy_b2t *o = REC(c, OP_COPY_T2B, p_copy_b2t); o->src = dst; o->tex = snap_tex(t); copy_view(&o->view, &o->has_view, v); o->r = *r; o->flags = flags;
 }
 // 用给定值清贴图区域（浮点 / 无符号整数两版；mask = 通道写掩码）
 // Clear a texture region with the given value (float / unsigned integer versions; mask = channel write mask)
 NVN(nvnCommandBufferClearTexture, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const float *rgba, int mask) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferClearTexture 对象指针非法 %p", (void *)c); return; }
     p_clear_tex *o = REC(c, OP_CLEAR_TEX, p_clear_tex); o->tex = snap_tex(t); copy_view(&o->view, &o->has_view, v); o->r = *r; o->mask = mask; o->is_uint = 0; memcpy(o->c.f, rgba, 16);
 }
 NVN(nvnCommandBufferClearTextureui, void, NVNcommandBuffer *c, const NVNtexture *t, const NVNtextureView *v, const NVNcopyRegion *r, const uint32_t *rgba, int mask) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferClearTextureui 对象指针非法 %p", (void *)c); return; }
     p_clear_tex *o = REC(c, OP_CLEAR_TEX, p_clear_tex); o->tex = snap_tex(t); copy_view(&o->view, &o->has_view, v); o->r = *r; o->mask = mask; o->is_uint = 1; memcpy(o->c.u, rgba, 16);
 }
 NVN(nvnCommandBufferCopyTextureToTexture, void, NVNcommandBuffer *c, const NVNtexture *s, const NVNtextureView *sv, const NVNcopyRegion *sr,
     const NVNtexture *d, const NVNtextureView *dv, const NVNcopyRegion *dr, int flags) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferCopyTextureToTexture 对象指针非法 %p", (void *)c); return; }
     p_copy_t2t *o = REC(c, OP_COPY_T2T, p_copy_t2t); o->src = snap_tex(s); o->dst = snap_tex(d);
     copy_view(&o->sv, &o->has_sv, sv); copy_view(&o->dv, &o->has_dv, dv); o->sr = *sr; o->dr = *dr; o->flags = flags;
 }
-NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_STRIDE, p_copy_stride)->stride = st; }
-NVN(nvnCommandBufferSetCopyImageStride, void, NVNcommandBuffer *c, ptrdiff_t st) { REC(c, OP_COPY_IMAGE_STRIDE, p_copy_stride)->stride = st; }
-NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) { memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
+NVN(nvnCommandBufferSetCopyRowStride, void, NVNcommandBuffer *c, ptrdiff_t st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetCopyRowStride 对象指针非法 %p", (void *)c); return; } REC(c, OP_COPY_STRIDE, p_copy_stride)->stride = st; }
+NVN(nvnCommandBufferSetCopyImageStride, void, NVNcommandBuffer *c, ptrdiff_t st) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetCopyImageStride 对象指针非法 %p", (void *)c); return; } REC(c, OP_COPY_IMAGE_STRIDE, p_copy_stride)->stride = st; }
+NVN(nvnCommandBufferSetBlendColor, void, NVNcommandBuffer *c, const float *v) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetBlendColor 对象指针非法 %p", (void *)c); return; } memcpy(REC(c, OP_BLEND_COLOR, p_blend_color)->rgba, v, 16); }
 
 // ---------- 状态对象：就地打包（nvn_obj.h） ----------
 // ---------- State objects: packed in place (nvn_obj.h) ----------
@@ -1057,6 +1220,7 @@ static uint64_t x_present_ticket(uint64_t job) {   // 出图任务执行完后�
     return tk;
 }
 NVN(nvnQueueSubmitCommands, void, NVNqueue *q, int n, const NVNcommandHandle *h) {
+    if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueSubmitCommands 对象指针非法 %p", (void *)q); return; }
     gfx_enter();
     ((queue_t *)q)->submits++;
     xjob j = {XJ_SUBMIT, n, n > 0 ? malloc((size_t)n * sizeof *h) : NULL};   // 句柄数组是游戏的，入队时拷一份 | The handle array belongs to the game; copy it when enqueuing
@@ -1118,15 +1282,21 @@ __attribute__((constructor)) static void nvn_nops_register(void) {
 // ---------- 窗口 / 出图 ----------
 // ---------- Window / present ----------
 #define WB(b) ((win_builder_t *)(b))
-NVN(nvnWindowBuilderSetDefaults, void, NVNwindowBuilder *b) { NVNdevice *dev = WB(b)->dev; memset(b, 0, sizeof(win_builder_t)); WB(b)->dev = dev; WB(b)->interval = 1; }
-NVN(nvnWindowBuilderSetDevice, void, NVNwindowBuilder *b, NVNdevice *d) { WB(b)->dev = d; }
-NVN(nvnWindowBuilderSetNativeWindow, void, NVNwindowBuilder *b, NVNnativeWindow w) { WB(b)->native = w; }
+NVN(nvnWindowBuilderSetDefaults, void, NVNwindowBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnWindowBuilderSetDefaults 对象指针非法 %p", (void *)b); return; } NVNdevice *dev = WB(b)->dev; memset(b, 0, sizeof(win_builder_t)); WB(b)->dev = dev; WB(b)->interval = 1; }
+NVN(nvnWindowBuilderSetDevice, void, NVNwindowBuilder *b, NVNdevice *d) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnWindowBuilderSetDevice 对象指针非法 %p", (void *)b); return; } WB(b)->dev = d; }
+NVN(nvnWindowBuilderSetNativeWindow, void, NVNwindowBuilder *b, NVNnativeWindow w) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnWindowBuilderSetNativeWindow 对象指针非法 %p", (void *)b); return; } WB(b)->native = w; }
 NVN(nvnWindowBuilderSetTextures, void, NVNwindowBuilder *b, int n, NVNtexture *const *t) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnWindowBuilderSetTextures 对象指针非法 %p", (void *)b); return; }
     if (n < 0 || n > 4) { LOG("【红】WindowBuilderSetTextures 数量 %d", n); n = n < 0 ? 0 : 4; }
     WB(b)->ntex = n; for (int i = 0; i < n; i++) WB(b)->tex[i] = t[i];
 }
 NVN(nvnWindowBuilderSetPresentInterval, void, NVNwindowBuilder *b, int v) { WB(b)->interval = v; }
 NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
+    if (!nvn_obj_ok(w, sizeof(win_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnWindowInitialize 对象指针非法 %p", (void *)w); return 0; }
+    if (!nvn_obj_ok(b, 8)) { static int _b; if (_b++ < 6) LOG("【红】nvnWindowInitialize builder 指针非法 %p", (void *)b); return 0; }
     const win_builder_t *s = (const win_builder_t *)b; win_t *o = (win_t *)w;
     memset(o, 0, sizeof *o); o->magic = MAGIC('W', 'I', 'N', 'D'); o->native = s->native; o->ntex = s->ntex; o->interval = s->interval;
     memcpy(o->tex, s->tex, sizeof o->tex);
@@ -1135,8 +1305,10 @@ NVN(nvnWindowInitialize, NVNboolean, NVNwindow *w, const NVNwindowBuilder *b) {
         o->ntex ? (int)CTX(o->tex[0])->d.width : 0, o->ntex ? (int)CTX(o->tex[0])->d.height : 0, o->ntex ? CTX(o->tex[0])->d.format : 0);
     return 1;
 }
-NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) { if (((win_t *)w)->interval != v) LOG("[nvn] 游戏设出图间隔 %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; }
+NVN(nvnWindowSetPresentInterval, void, NVNwindow *w, int v) {
+    if (!nvn_obj_ok(w, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnWindowSetPresentInterval 对象指针非法 %p", (void *)w); return; } if (((win_t *)w)->interval != v) LOG("[nvn] 游戏设出图间隔 %d → %d", ((win_t *)w)->interval, v); ((win_t *)w)->interval = v; }
 NVN(nvnWindowSetCrop, void, NVNwindow *w, int x, int y, int ww, int hh) {
+    if (!nvn_obj_ok(w, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnWindowSetCrop 对象指针非法 %p", (void *)w); return; }
     win_t *o = (win_t *)w; int v[4] = {x, y, ww, hh};
     if (memcmp(o->crop, v, sizeof v)) LOG("[nvn] WindowCrop %d,%d %dx%d", x, y, ww, hh);
     memcpy(o->crop, v, sizeof v);
@@ -1154,6 +1326,7 @@ static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
+    if (!nvn_obj_ok(w, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnWindowAcquireTexture 对象指针非法 %p", (void *)w); return 0; }
     win_t *o = (win_t *)w;
     *idx = o->ntex ? o->next++ % o->ntex : 0;
     // 垂直同步阻塞在这里（真机 NVN：交换链里的贴图都在等显示时，等下一张被释放），不在出图里——游戏常持锁调出图
@@ -1481,6 +1654,7 @@ static uint64_t present_period(const win_t *o) {
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
+    if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueuePresentTexture 对象指针非法 %p", (void *)q); return; }
     (void)q; win_t *o = (win_t *)w; o->presents++;
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;
     // 第一次进局的读取画面：后台管线预热没跑完就在这里等它（读取画面多停一会儿），进局后不在提交线程现编管线。预热早已完成时一次判断即过
@@ -1677,65 +1851,102 @@ static void *nvn_extra_lookup(const char *name) {
 #define BB(b) ((buffer_builder_t *)(b))
 #define BUF(b) ((buffer_t *)(b))
 NVN(nvnBufferBuilderSetDefaults, void, NVNbufferBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferBuilderSetDefaults 对象指针非法 %p", (void *)b); return; }
     NVNdevice *dev = BB(b)->dev; memset(b, 0, sizeof(buffer_builder_t)); BB(b)->dev = dev;
 }
-NVN(nvnBufferBuilderSetDevice, void, NVNbufferBuilder *b, NVNdevice *d) { BB(b)->dev = d; }
+NVN(nvnBufferBuilderSetDevice, void, NVNbufferBuilder *b, NVNdevice *d) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferBuilderSetDevice 对象指针非法 %p", (void *)b); return; } BB(b)->dev = d; }
 NVN(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *b, NVNmemoryPool *p, ptrdiff_t off, size_t n) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferBuilderSetStorage 对象指针非法 %p", (void *)b); return; }
     BB(b)->pool = (pool_t *)p; BB(b)->off = off; BB(b)->size = n;
 }
 NVN(nvnBufferBuilderGetMemoryPool, NVNmemoryPool, const NVNbufferBuilder *b) {
-    NVNmemoryPool r; memset(&r, 0, sizeof r); *(const void **)(void *)&r = BB(b)->pool; return r;
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferBuilderGetMemoryPool 对象指针非法 %p", (void *)b);
+        NVNmemoryPool z; memset(&z, 0, sizeof z); return z; }
+    NVNmemoryPool r; memset(&r, 0, sizeof r); *(const void **)(void *)&r = BB(b)->pool;
+    static int n; if (n++ < 8) LOG("[nvn] BufferBuilderGetMemoryPool pool=%p off=%#llx size=%#llx sret=%p",
+                                   (void *)BB(b)->pool, (long long)BB(b)->off, (unsigned long long)BB(b)->size, (void *)&r);
+    return r;
 }
-NVN(nvnBufferBuilderGetMemoryOffset, ptrdiff_t, const NVNbufferBuilder *b) { return BB(b)->off; }
+NVN(nvnBufferBuilderGetMemoryOffset, ptrdiff_t, const NVNbufferBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferBuilderGetMemoryOffset 对象指针非法 %p", (void *)b); return 0; } return BB(b)->off; }
 NVN(nvnBufferBuilderGetSize, size_t, const NVNbufferBuilder *b) { return BB(b)->size; }
 NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *b, const NVNbufferBuilder *bb) {
+    if (!nvn_obj_ok(b, sizeof(buffer_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnBufferInitialize 对象指针非法 %p", (void *)b); return 0; }
+    if (!nvn_obj_ok(bb, 8)) { static int _b; if (_b++ < 6) LOG("【红】nvnBufferInitialize builder 指针非法 %p", (void *)bb); return 0; }
     const buffer_builder_t *s = (const buffer_builder_t *)bb; buffer_t *o = BUF(b);
     o->magic = MAGIC('B', 'U', 'F', 'F'); o->flags = s->flags; o->size = s->size;
     o->pool = s->pool; o->off = s->off;
     o->mem = s->pool ? s->pool->mem + s->off : NULL;
+    { static int nb; if (nb++ < 12) LOG("[nvn] BufferInitialize %p pool=%p off=%#llx size=%#llx mem=%p",
+                                         (void *)b, (void *)s->pool, (long long)s->off, (unsigned long long)s->size, (void *)o->mem); }
     if (!o->mem) LOG("【红】BufferInitialize 没有存储 pool=%p off=%#llx size=%#llx", (void *)s->pool, (long long)s->off, (unsigned long long)s->size);
     else OLOG("Buffer %p mem=%p size=%#llx", (void *)b, (void *)o->mem, (unsigned long long)o->size);
     return o->mem ? 1 : 0;
 }
-NVN(nvnBufferFinalize, void, NVNbuffer *b) { BUF(b)->magic = 0; }
-NVN(nvnBufferSetDebugLabel, void, NVNbuffer *b, const char *l) { (void)b; (void)l; }
-NVN(nvnBufferMap, void *, const NVNbuffer *b) { return BUF(b)->mem; }
-NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *b) { return (NVNbufferAddress)(uintptr_t)BUF(b)->mem; }
-NVN(nvnBufferGetSize, size_t, const NVNbuffer *b) { return BUF(b)->size; }
-NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *b) { return (NVNmemoryPool *)BUF(b)->pool; }
-NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *b) { return BUF(b)->off; }
-NVN(nvnBufferGetDebugID, uint64_t, const NVNbuffer *b) { return (uint64_t)(uintptr_t)b; }
-NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b, ptrdiff_t o, size_t n) { (void)b; (void)o; (void)n; }
-NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t o, size_t n) { (void)b; (void)o; (void)n; }
+NVN(nvnBufferFinalize, void, NVNbuffer *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferFinalize 对象指针非法 %p", (void *)b); return; } BUF(b)->magic = 0; }
+NVN(nvnBufferSetDebugLabel, void, NVNbuffer *b, const char *l) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferSetDebugLabel 对象指针非法 %p", (void *)b); return; } (void)b; (void)l; }
+NVN(nvnBufferMap, void *, const NVNbuffer *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferMap 对象指针非法 %p", (void *)b); return 0; } return BUF(b)->mem; }
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferGetAddress 对象指针非法 %p", (void *)b); return 0; } return (NVNbufferAddress)(uintptr_t)BUF(b)->mem; }
+NVN(nvnBufferGetSize, size_t, const NVNbuffer *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferGetSize 对象指针非法 %p", (void *)b); return 0; } return BUF(b)->size; }
+NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferGetMemoryPool 对象指针非法 %p", (void *)b); return 0; } return (NVNmemoryPool *)BUF(b)->pool; }
+NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferGetMemoryOffset 对象指针非法 %p", (void *)b); return 0; } return BUF(b)->off; }
+NVN(nvnBufferGetDebugID, uint64_t, const NVNbuffer *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferGetDebugID 对象指针非法 %p", (void *)b); return 0; } return (uint64_t)(uintptr_t)b; }
+NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b, ptrdiff_t o, size_t n) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferFlushMappedRange 对象指针非法 %p", (void *)b); return; } (void)b; (void)o; (void)n; }
+NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t o, size_t n) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnBufferInvalidateMappedRange 对象指针非法 %p", (void *)b); return; } (void)b; (void)o; (void)n; }
 
 // 贴图 builder 的 2D/3D 尺寸与读取（本 SDK 用 SetSize2D 而不是 SetWidth/SetHeight）
 NVN(nvnTextureBuilderSetSize2D, void, NVNtextureBuilder *b, int w, int h) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetSize2D 对象指针非法 %p", (void *)b); return; }
     TB(b)->d.width = (uint32_t)w; TB(b)->d.height = (uint32_t)h; TB(b)->d.depth = 1;
 }
 NVN(nvnTextureBuilderSetSize3D, void, NVNtextureBuilder *b, int w, int h, int d) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetSize3D 对象指针非法 %p", (void *)b); return; }
     TB(b)->d.width = (uint32_t)w; TB(b)->d.height = (uint32_t)h; TB(b)->d.depth = (uint32_t)d;
 }
-NVN(nvnTextureBuilderGetWidth, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.width; }
-NVN(nvnTextureBuilderGetHeight, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.height; }
-NVN(nvnTextureBuilderGetDepth, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.depth; }
-NVN(nvnTextureBuilderGetLevels, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.levels; }
-NVN(nvnTextureBuilderGetFormat, NVNformat, const NVNtextureBuilder *b) { return (NVNformat)TB(b)->d.format; }
-NVN(nvnTextureBuilderGetSamples, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.samples; }
-NVN(nvnTextureBuilderGetTarget, NVNtextureTarget, const NVNtextureBuilder *b) { return (NVNtextureTarget)TB(b)->d.target; }
+NVN(nvnTextureBuilderGetWidth, int, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetWidth 对象指针非法 %p", (void *)b); return 0; } return (int)TB(b)->d.width; }
+NVN(nvnTextureBuilderGetHeight, int, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetHeight 对象指针非法 %p", (void *)b); return 0; } return (int)TB(b)->d.height; }
+NVN(nvnTextureBuilderGetDepth, int, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetDepth 对象指针非法 %p", (void *)b); return 0; } return (int)TB(b)->d.depth; }
+NVN(nvnTextureBuilderGetLevels, int, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetLevels 对象指针非法 %p", (void *)b); return 0; } return (int)TB(b)->d.levels; }
+NVN(nvnTextureBuilderGetFormat, NVNformat, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetFormat 对象指针非法 %p", (void *)b); return 0; } return (NVNformat)TB(b)->d.format; }
+NVN(nvnTextureBuilderGetSamples, int, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetSamples 对象指针非法 %p", (void *)b); return 0; } return (int)TB(b)->d.samples; }
+NVN(nvnTextureBuilderGetTarget, NVNtextureTarget, const NVNtextureBuilder *b) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderGetTarget 对象指针非法 %p", (void *)b); return 0; } return (NVNtextureTarget)TB(b)->d.target; }
 // 通道 swizzle / 深度模具采样模式：当前 nvn_texdesc 没这两个字段，先记成空操作
 // （只影响采样通道重排与深度比较采样，不影响尺寸/格式/内容）。
 NVN(nvnTextureBuilderSetSwizzle, void, NVNtextureBuilder *b, NVNtextureSwizzle r, NVNtextureSwizzle g, NVNtextureSwizzle a, NVNtextureSwizzle al) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetSwizzle 对象指针非法 %p", (void *)b); return; }
     (void)b; (void)r; (void)g; (void)a; (void)al;
 }
-NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b, NVNtextureDepthStencilMode m) { (void)b; (void)m; }
+NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b, NVNtextureDepthStencilMode m) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureBuilderSetDepthStencilMode 对象指针非法 %p", (void *)b); return; } (void)b; (void)m; }
 
 // 描述符池容量（引擎按它算句柄上限）
-NVN(nvnTexturePoolGetSize, int, const NVNtexturePool *p) { return ((const dpool_t *)p)->n; }
-NVN(nvnSamplerPoolGetSize, int, const NVNsamplerPool *p) { return ((const dpool_t *)p)->n; }
+NVN(nvnTexturePoolGetSize, int, const NVNtexturePool *p) {
+    if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTexturePoolGetSize 对象指针非法 %p", (void *)p); return 0; } return ((const dpool_t *)p)->n; }
+NVN(nvnSamplerPoolGetSize, int, const NVNsamplerPool *p) {
+    if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerPoolGetSize 对象指针非法 %p", (void *)p); return 0; } return ((const dpool_t *)p)->n; }
 
 // 快清除颜色登记：只是把颜色登记进设备表，无 CPU 可见结果
 NVN(nvnDeviceRegisterFastClearColor, NVNboolean, NVNdevice *d, const float *c, NVNformat f) { (void)d; (void)c; (void)f; return 1; }
-NVN(nvnSamplerBuilderSetReductionFilter, void, NVNsamplerBuilder *b, NVNsamplerReduction r) { (void)b; (void)r; }
+NVN(nvnSamplerBuilderSetReductionFilter, void, NVNsamplerBuilder *b, NVNsamplerReduction r) {
+    if (!nvn_obj_ok(b, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnSamplerBuilderSetReductionFilter 对象指针非法 %p", (void *)b); return; } (void)b; (void)r; }
 NVN_NOPROTO(nvnQueueBuilderSetQueuePriority, void, NVNqueueBuilder *b, int p) { (void)b; (void)p; }
 
 // 状态对象：缺的这几个都是「记录进状态、回放时用」的，取值按 NVN/GL 语义
@@ -1748,3 +1959,92 @@ NVN(nvnMultisampleStateSetCoverageModulationMode, void, NVNmultisampleState *s, 
 NVN(nvnMultisampleStateSetCoverageToColorEnable, void, NVNmultisampleState *s, uint32_t v) { ((ms_st *)s)->cov2color_en = (uint8_t)(v != 0); }
 NVN(nvnMultisampleStateSetCoverageToColorOutput, void, NVNmultisampleState *s, int i) { ((ms_st *)s)->cov2color_out = (uint8_t)i; }
 NVN(nvnMultisampleStateSetSampleLocationsGridEnable, void, NVNmultisampleState *s, uint32_t v) { ((ms_st *)s)->sl_grid = (uint8_t)(v != 0); }
+
+// ───────────── 引擎会调、参考工程里仍是「报红桩」的读取器 ─────────────
+// 它们只是把对象里已经存好的字段读回来；返回 0（报红桩的行为）会让引擎拿错
+// 尺寸/格式去建描述符与数组。语义直接来自 NVN 头。
+// Getters this game calls that were still "red stubs" in the reference port.
+// They just return fields we already store; returning 0 made the engine build
+// descriptors and arrays with wrong sizes/formats.
+#define VW(v) ((view_t *)(v))
+#define TX(t) ((const tex_t *)(t))
+NVN(nvnTextureGetTarget, NVNtextureTarget, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetTarget 对象指针非法 %p", (void *)t); return 0; } return (NVNtextureTarget)TX(t)->d.target; }
+NVN(nvnTextureGetLevels, int, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetLevels 对象指针非法 %p", (void *)t); return 0; } return (int)TX(t)->d.levels; }
+NVN(nvnTextureGetFormat, NVNformat, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetFormat 对象指针非法 %p", (void *)t); return 0; } return (NVNformat)TX(t)->d.format; }
+NVN(nvnTextureGetSamples, int, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetSamples 对象指针非法 %p", (void *)t); return 0; } return (int)TX(t)->d.samples; }
+NVN(nvnTextureGetStride, ptrdiff_t, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetStride 对象指针非法 %p", (void *)t); return 0; } return (ptrdiff_t)TX(t)->d.stride; }
+NVN(nvnTextureGetFlags, NVNtextureFlags, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetFlags 对象指针非法 %p", (void *)t); return 0; } return (NVNtextureFlags)TX(t)->d.flags; }
+// 通道 swizzle / 深度模具采样模式没有存（见 builder 的同名 setter）
+NVN(nvnTextureGetSwizzle, void, const NVNtexture *t, NVNtextureSwizzle *r, NVNtextureSwizzle *g, NVNtextureSwizzle *b, NVNtextureSwizzle *a) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetSwizzle 对象指针非法 %p", (void *)t); return; }
+    (void)t; if (r) *r = NVN_TEXTURE_SWIZZLE_R; if (g) *g = NVN_TEXTURE_SWIZZLE_G;
+    if (b) *b = NVN_TEXTURE_SWIZZLE_B; if (a) *a = NVN_TEXTURE_SWIZZLE_A;
+}
+NVN(nvnTextureGetDepthStencilMode, NVNtextureDepthStencilMode, const NVNtexture *t) {
+    if (!nvn_obj_ok(t, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureGetDepthStencilMode 对象指针非法 %p", (void *)t); return 0; }
+    (void)t; return NVN_TEXTURE_DEPTH_STENCIL_MODE_DEPTH;
+}
+// 图像与贴图共用登记表（参考工程的约定：GetImageHandle 原样返回池号）
+NVN(nvnTexturePoolRegisterImage, void, const NVNtexturePool *tp, int id, const NVNtexture *t, const NVNtextureView *v) {
+    if (!nvn_obj_ok(tp, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTexturePoolRegisterImage 对象指针非法 %p", (void *)tp); return; }
+    (void)tp; mtl_reg_tex(id, (const tex_t *)t, (const view_t *)v);
+}
+NVN(nvnTextureViewSetSwizzle, void, NVNtextureView *v, NVNtextureSwizzle r, NVNtextureSwizzle g, NVNtextureSwizzle b, NVNtextureSwizzle a) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewSetSwizzle 对象指针非法 %p", (void *)v); return; }
+    (void)v; (void)r; (void)g; (void)b; (void)a;
+}
+NVN(nvnTextureViewSetDepthStencilMode, void, NVNtextureView *v, NVNtextureDepthStencilMode m) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewSetDepthStencilMode 对象指针非法 %p", (void *)v); return; } (void)v; (void)m; }
+NVN(nvnTextureViewGetLevels, NVNboolean, const NVNtextureView *v, int *base, int *n) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewGetLevels 对象指针非法 %p", (void *)v); return 0; }
+    if (!VW(v)->set_levels) return 0;
+    if (base) *base = VW(v)->base_level; if (n) *n = VW(v)->nlevels; return 1;
+}
+NVN(nvnTextureViewGetLayers, NVNboolean, const NVNtextureView *v, int *min, int *n) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewGetLayers 对象指针非法 %p", (void *)v); return 0; }
+    if (!VW(v)->set_layers) return 0;
+    if (min) *min = VW(v)->min_layer; if (n) *n = VW(v)->nlayers; return 1;
+}
+NVN(nvnTextureViewGetFormat, NVNboolean, const NVNtextureView *v, NVNformat *f) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewGetFormat 对象指针非法 %p", (void *)v); return 0; }
+    if (!VW(v)->set_format) return 0; if (f) *f = (NVNformat)VW(v)->format; return 1;
+}
+NVN(nvnTextureViewGetTarget, NVNboolean, const NVNtextureView *v, NVNtextureTarget *t) {
+    if (!nvn_obj_ok(v, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnTextureViewGetTarget 对象指针非法 %p", (void *)v); return 0; }
+    if (!VW(v)->set_target) return 0; if (t) *t = (NVNtextureTarget)VW(v)->target; return 1;
+}
+// 顶点状态读取器：引擎用它们反推顶点布局（原来返回 0 会把 stride 当 0）
+NVN(nvnVertexAttribStateGetFormat, void, const NVNvertexAttribState *s, NVNformat *f, ptrdiff_t *off) {
+    const va_st *a = (const va_st *)s;
+    if (f) *f = (NVNformat)a->fmt; if (off) *off = (ptrdiff_t)a->offset;
+}
+NVN(nvnVertexAttribStateGetStreamIndex, int, const NVNvertexAttribState *s) { return (int)((const va_st *)s)->stream; }
+NVN(nvnVertexStreamStateGetStride, ptrdiff_t, const NVNvertexStreamState *s) { return (ptrdiff_t)((const vs_st *)s)->stride; }
+NVN(nvnVertexStreamStateGetDivisor, int, const NVNvertexStreamState *s) { return (int)((const vs_st *)s)->divisor; }
+NVN(nvnBlendStateGetBlendFunc, void, const NVNblendState *s, NVNblendFunc *sr, NVNblendFunc *dr, NVNblendFunc *sa, NVNblendFunc *da) {
+    const blend_st *b = (const blend_st *)s;
+    if (sr) *sr = (NVNblendFunc)b->src_rgb; if (dr) *dr = (NVNblendFunc)b->dst_rgb;
+    if (sa) *sa = (NVNblendFunc)b->src_a; if (da) *da = (NVNblendFunc)b->dst_a;
+}
+// 命令缓冲：这些只影响光栅细节，记成状态位/空操作即可（没有 CPU 可见结果）
+NVN(nvnCommandBufferSetAlphaRef, void, NVNcommandBuffer *c, float v) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetAlphaRef 对象指针非法 %p", (void *)c); return; } (void)c; (void)v; }
+NVN(nvnCommandBufferSetDepthClamp, void, NVNcommandBuffer *c, uint32_t v) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetDepthClamp 对象指针非法 %p", (void *)c); return; } (void)c; (void)v; }
+NVN(nvnCommandBufferSetConservativeRasterEnable, void, NVNcommandBuffer *c, uint32_t v) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferSetConservativeRasterEnable 对象指针非法 %p", (void *)c); return; } (void)c; (void)v; }
+// 带扩展阶段的着色器绑定：与 SetShaders 同一份存储（n 可到 6）
+NVN_NOPROTO(nvnProgramSetShadersExt, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
+    prog_t *o = (prog_t *)p;
+    if (n < 0 || n > 6) { LOG("【红】ProgramSetShadersExt 阶段数 %d", n); return 0; }
+    snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o);
+    o->nstage = n; memcpy(o->sd, sd, (size_t)n * sizeof *sd); o->serial = nvn_new_serial();
+    OLOG("ProgramSetShadersExt %p n=%d", (void *)p, n);
+    return 1;
+}
