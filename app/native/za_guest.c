@@ -959,7 +959,24 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 }
                 return;
             }
-            // ★ 悬空指针的**只读布尔查询**（main+0x250b0b0）：
+            // ★ 取虚函数指针时对象为空（main+0x2553d48 `ldr x0,[x0,x8]`，x8 来自
+            //   一张函数表）。置 0 会让调用方 `blr 0`；给它「返回 0 的桩」最安全。
+            if (pcx == gb0 + 0x2553d48ul && ucx->uc_mcontext.regs[0] == 0 &&
+                *(volatile unsigned int *)(uintptr_t)pcx == 0xf8686800u)
+            {
+                static int nv;
+                ucx->uc_mcontext.regs[0] = gb0 + 0x6048700ul;
+                ucx->uc_mcontext.pc = pcx + 4;
+                if (nv++ < 6) {
+                    char b[160];
+                    char *q = b;
+                    q = za_put_str(q, "ZaGuest: ★ 空对象取虚函数→给返回0桩（第 ");
+                    q = za_put_dec(q, (unsigned long long)nv);
+                    q = za_put_str(q, " 次）");
+                    za_fatal_write(b, (size_t)(q - b));
+                }
+                return;
+            }
             //     ldr x8,[x0,#0x28] ; cbz ; ldr x8,[x8,#0x20] ; cbz ; ldrb w8,[x8,#0x110]
             //   字段指向未映射内存时，语义上等价于「没有这个对象」⇒ 返回 false 最温和。
             //   它只影响一个布尔查询，不改任何资源状态。
@@ -3654,7 +3671,15 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
         //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
         //   main 的 BSS（pc=main+0x76b732c）。call 类指令不适合这套探针，已移除。
-        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x600);
+        // 「返回 0」桩：虚函数指针为空时的替身（mov x0,#0; ret）。
+        // 真机 main+0x2553d48 `ldr x0,[x0,x8]` 在 obj=null 时取不到虚函数；
+        // 置 0 会让调用方 `blr 0`，给一个真能调、返回 0 的桩更安全。
+        {
+            unsigned int *st = (unsigned int *)(base + 0x6048700u);
+            st[0] = 0xd2800000u;   // mov x0, #0
+            st[1] = 0xd65f03c0u;   // ret
+        }
+        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x800);
         mprotect(base + ZA_MPROBE_STUB, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
               (unsigned)ZA_MPROBE_STUB, (unsigned)ZA_MPROBE_SLOT);
