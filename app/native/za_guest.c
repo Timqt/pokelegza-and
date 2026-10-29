@@ -939,6 +939,10 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 { 0x1757a98u, 0x1757ab0u, 1 },
                 // main+0x173e6b4: `ldr x0,[x8,#0x58]`，函数尾 0x173e6c4 (ret) → w0=0
                 { 0x173e6b8u, 0x173e6c4u, 1 },
+                // main+0x250b0e0: `cbz x0,ret0 ; ldr x8,[x0,#0x68] ; ldrb w8,[x8]`
+                //   补零页让 [x0+0x68] 变成 0，而这里没有对 x8 判空 ⇒ 崩在 0x250b0e8。
+                //   直接走 ret 的 w0=0 分支（=「该标志位为 0」）。
+                { 0x250b0e8u, 0x250b0f4u, 1 },
             };
             for (unsigned i = 0; i < sizeof fix / sizeof fix[0]; i++) {
                 if (pcx != gb0 + fix[i].fault) continue;
@@ -973,7 +977,8 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 int in_sdk2 = za_sdk_base && pcv2 >= za_sdk_base &&
                               pcv2 < za_sdk_base + za_sdk_size;
                 unsigned long long saddr = (unsigned long long)(uintptr_t)info->si_addr;
-                if ((in_main2 || in_sdk2) && saddr >= 0x1000ull) {
+                // 注意：store 的小地址（空指针写入）也要进来，所以这里不按 saddr 过滤。
+                if (in_main2 || in_sdk2) {
                     unsigned int w = *(volatile unsigned int *)(uintptr_t)pcv2;
                     unsigned int rtn = w & 0x1fu, rnn = (w >> 5) & 0x1fu;
                     int is_ld = 0, is_st = 0;
@@ -984,8 +989,10 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                     case 0x79000000u: case 0xb8000000u: is_st = 1; break;
                     default: break;
                     }
-                    // store：把**基址**重定向到安全页，写落在我们自己的页里（无副作用）
-                    if (is_st && rnn != 31 && rnn != 30) {
+                    // store：把**基址**重定向到安全页，写落在我们自己的页里（无副作用）。
+                    // ⚠ 空指针写入的 si_addr 很小（如 8），不能用「>= 0x1000」过滤，
+                    //   否则整族漏掉（真机 main+0x2553ed8 `str x0,[x19,#8]`，x19=0）。
+                    if (is_st && rnn != 31 && rnn != 30 && saddr < 0x4000000000ull) {
                         static unsigned long stpc[8];
                         static unsigned stn[8];
                         int slot = 0;
@@ -1011,7 +1018,9 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                             return;      // pc 不变，重执这条 store
                         }
                     }
-                    if (is_ld && rtn != 31 && rnn != 30) {
+                    // 小的近空读交给后面的「近空读恢复」（它会置 0 并跳过，语义更准）
+                    if (is_ld && saddr < 0x1000ull) { /* fallthrough */ }
+                    else if (is_ld && rtn != 31 && rnn != 30) {
                         static unsigned long badpc[8];
                         static unsigned cnt[8];
                         int slot = 0, i;
@@ -1216,11 +1225,17 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
     //   严格条件：si_addr < 0x1000、pc 在 main/sdk 映像内、故障指令确实是
     //   `ldr Rt,[Xn,#imm]` 且 Xn+imm == si_addr。满足就把 Rt 置 0、pc += 4 继续；
     //   其余一律走原来的致命流程（不改判别的故障）。
-    // ⚠ 实测：恢复出来的状态是自相矛盾的（后续会读到一个垃圾指针，
-    //   main+0x250b0b8 崩在 0x6ee3...）。它只适合**定位**，不能当修复用。
-    //   默认关闭，需要时 ZA_NULLRECOVER=1 打开。
+    // ⚠ 早先实测它在「假表」时代会读出垃圾指针；现在配合补零页与定点跳转，
+    //   近空读置 0 通常是这类代码的**本意**（读完立刻判空/比 0）。
+    //   默认开启；files/za-no-nullrecover 或 ZA_NULLRECOVER=0 可关。
     static int nr_on = -1;
-    if (nr_on < 0) nr_on = getenv("ZA_NULLRECOVER") ? 1 : 0;
+    if (nr_on < 0) {
+        const char *e = getenv("ZA_NULLRECOVER");
+        if (e && e[0] == '0') nr_on = 0;
+        else if (access("/data/user/0/org.pokelegza.android.port/files/za-no-nullrecover",
+                        F_OK) == 0) nr_on = 0;
+        else nr_on = 1;
+    }
     if (nr_on && ctx && sig == SIGSEGV && info &&
         (unsigned long long)(uintptr_t)info->si_addr < 0x1000ull)
     {
