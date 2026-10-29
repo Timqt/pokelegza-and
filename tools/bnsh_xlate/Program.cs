@@ -182,6 +182,41 @@ class Program
         return sb.ToString().Trim();
     }
 
+
+    // 资源反射：与 d2r 的 dmsh_xlate 的 <key>.res.json 同形状（cbufs/sbufs/textures/images），
+    // 供 dm 的 dmsh_vk.export → pack_game_shaders.pack 出 XGS1 着色器包。
+    // Resource reflection, same shape as dmsh_xlate's res.json; consumed by
+    // dmsh_vk.export → pack_game_shaders.pack to build the XGS1 bundle.
+    static void WriteRes(string path, ShaderProgram prog, string stage)
+    {
+        var root = new System.Text.Json.Nodes.JsonObject
+        {
+            ["stage"] = stage,
+            ["cbufs"] = new System.Text.Json.Nodes.JsonArray(),
+            ["sbufs"] = new System.Text.Json.Nodes.JsonArray(),
+            ["textures"] = new System.Text.Json.Nodes.JsonArray(),
+            ["images"] = new System.Text.Json.Nodes.JsonArray(),
+        };
+        var info = prog.Info;
+        foreach (var b in info.CBuffers)
+            root["cbufs"]!.AsArray().Add(new System.Text.Json.Nodes.JsonObject { ["binding"] = b.Binding, ["slot"] = b.Slot });
+        foreach (var b in info.SBuffers)
+            root["sbufs"]!.AsArray().Add(new System.Text.Json.Nodes.JsonObject {
+                ["binding"] = b.Binding, ["slot"] = b.Slot, ["cb_slot"] = b.SbCbSlot,
+                ["cb_offset"] = b.SbCbOffset, ["flags"] = (int)b.Flags });
+        foreach (var t in info.Textures)
+            root["textures"]!.AsArray().Add(new System.Text.Json.Nodes.JsonObject {
+                ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(),
+                ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength,
+                ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
+        foreach (var t in info.Images)
+            root["images"]!.AsArray().Add(new System.Text.Json.Nodes.JsonObject {
+                ["binding"] = t.Binding, ["type"] = (int)t.Type, ["format"] = t.Format.ToString(),
+                ["cbuf_slot"] = t.CbufSlot, ["handle"] = t.HandleIndex, ["array"] = t.ArrayLength,
+                ["separate"] = t.Separate, ["flags"] = (int)t.Flags });
+        File.WriteAllText(path, root.ToJsonString());
+    }
+
     static int Main(string[] args)
     {
         if (args.Length < 2) { Console.Error.WriteLine("用法: bnsh_xlate <BNSH 文件或目录> <输出目录> [--limit N]"); return 2; }
@@ -292,6 +327,7 @@ class Program
                 if (prog.BinaryCode == null || prog.BinaryCode.Length == 0) { skipped++; continue; }
                 string spvName = Path.GetFileNameWithoutExtension(path) + "_" + $"{sph:X8}_{stage}.spv";
                 File.WriteAllBytes(Path.Combine(sub, spvName), prog.BinaryCode);
+                WriteRes(Path.Combine(sub, Path.GetFileNameWithoutExtension(spvName) + ".res.json"), prog, stage);
                 stages[stage] = stages.TryGetValue(stage, out int c) ? c + 1 : 1;
                 ok++;
             }
@@ -358,6 +394,7 @@ class Program
                 if (prog.BinaryCode == null || prog.BinaryCode.Length == 0) { skipped++; continue; }
                 string name = $"{sph:X8}_{stage}";
                 File.WriteAllBytes(Path.Combine(outDir, name + ".spv"), prog.BinaryCode);
+                WriteRes(Path.Combine(outDir, name + ".res.json"), prog, stage.ToString());
                 ok++;
                 if (ok <= 10) Console.WriteLine($"  [OK] SPH@0x{sph:X} stage={stage} spirv={prog.BinaryCode.Length} 字节");
             }
