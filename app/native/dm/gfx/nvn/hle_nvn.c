@@ -99,10 +99,18 @@ static void nvn_init_slots(void) {
     g_nsem = hit;
 }
 
+// main 比 dm 的 523 项名字表多要的入口（定义在文件末尾）。绝不能返回 NULL：
+// main 会把取到的指针直接存进自己的函数表，NULL 在后续调用时就是跳转到 0。
+static void *nvn_extra_lookup(const char *name);
+
 static void *nvn_lookup(const char *name) {
     nvn_init_slots();
     for (unsigned i = 0; i < NVN_NFUNC; i++)
         if (!strcmp(nvn_names[i], name)) return nvn_thunk[i];
+    {
+        void *x = nvn_extra_lookup(name);
+        if (x) return x;
+    }
     LOG("【红】NVN 取址未知名字：%s", name ? name : "(null)");
     return NULL;
 }
@@ -1603,3 +1611,140 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     if (f >= 8 && slow_on()) slow_emit(f - 8);
     prev_out = now_ns();
 }
+
+// ───────────── main 额外要的 NVN 入口（dm 的 523 名字表里没有）─────────────
+// 真机实测：main 通过 nvnBootstrapLoader 取这 13 个名字，nvn_names 里没有 ⇒
+// 旧实现返回 NULL ⇒ main 把 NULL 存进自己的函数表，之后一调就跳转到 0。
+// 这里的入口**一律非空**：有等价实现的转调等价实现，其余按 NVN 语义做空操作
+// （都只影响 GPU 状态或性能提示，没有 CPU 可见结果）。
+// Extra NVN entry points main requests that are not in dm's 523-name table.
+// Returning NULL made main cache a NULL function pointer and jump to 0 later.
+static void hx_bind_tex(NVNcommandBuffer *c, NVNshaderStage st, int first, int n,
+                        const NVNtextureHandle *h) {
+    bind_handles(c, OP_BIND_TEX, st, first, n, (const uint64_t *)h);
+}
+static void hx_ub_def(NVNcommandBuffer *c, NVNshaderStage st, int first, int n,
+                      const NVNbufferRange *r) { h_nvnCommandBufferBindUniformBuffers(c, st, first, n, r); }
+static void hx_ssbo_def(NVNcommandBuffer *c, NVNshaderStage st, int first, int n,
+                        const NVNbufferRange *r) { h_nvnCommandBufferBindStorageBuffers(c, st, first, n, r); }
+static void hx_img_def(NVNcommandBuffer *c, NVNshaderStage st, int first, int n,
+                       const NVNimageHandle *h) { h_nvnCommandBufferBindImages(c, st, first, n, h); }
+static void hx_tex_def(NVNcommandBuffer *c, NVNshaderStage st, int first, int n,
+                       const NVNseparateTextureHandle *h) { h_nvnCommandBufferBindSeparateTextures(c, st, first, n, h); }
+static void hx_samp_def(NVNcommandBuffer *c, NVNshaderStage st, int first, int n,
+                        const NVNseparateSamplerHandle *h) { h_nvnCommandBufferBindSeparateSamplers(c, st, first, n, h); }
+static void hx_void2(void *a, uint64_t b) { (void)a; (void)b; }
+static void hx_void1u64(void *a, uint64_t b, uint64_t c) { (void)a; (void)b; (void)c; }
+static int hx_prog_subtile(const void *p) { (void)p; return 0x1000; }
+static int64_t hx_tex_view_offset(const void *b, const void *v) { (void)b; (void)v; return 0; }
+// 兜底：任何还没列到的名字都给这个（返回 0），绝不返回 NULL。
+static uint64_t hx_default(uint64_t a, uint64_t b, uint64_t c, uint64_t d,
+                           uint64_t e, uint64_t f, uint64_t g, uint64_t h) {
+    (void)a; (void)b; (void)c; (void)d; (void)e; (void)f; (void)g; (void)h;
+    static int n; if (n++ < 16) LOG("【黄】NVN 额外入口被调用（返回 0 的空实现）");
+    return 0;
+}
+static const nvn_impl nvn_extra_tab[] = {
+    {"nvnCommandBufferBindTexturesDeferred", (void *)hx_bind_tex},
+    {"nvnCommandBufferBindUniformBuffersDeferred", (void *)hx_ub_def},
+    {"nvnCommandBufferBindStorageBuffersDeferred", (void *)hx_ssbo_def},
+    {"nvnCommandBufferBindImagesDeferred", (void *)hx_img_def},
+    {"nvnCommandBufferBindSeparateTexturesDeferred", (void *)hx_tex_def},
+    {"nvnCommandBufferBindSeparateSamplersDeferred", (void *)hx_samp_def},
+    {"nvnCommandBufferSetProvokingVertexMode", (void *)hx_void2},
+    {"nvnCommandBufferOverrideSubtileSize", (void *)hx_void2},
+    {"nvnCommandBufferSetControlMemoryCallbackEnabled", (void *)hx_void2},
+    {"nvnCommandBufferSetZCullZF32CompressionEnable", (void *)hx_void2},
+    {"nvnDeviceSetAutomaticCheckpointsMask", (void *)hx_void2},
+    {"nvnProgramGetSubtileSize", (void *)hx_prog_subtile},
+    {"nvnTextureBuilderGetViewOffset", (void *)hx_tex_view_offset},
+};
+static void *nvn_extra_lookup(const char *name) {
+    if (!name) return (void *)hx_default;
+    for (unsigned k = 0; k < sizeof nvn_extra_tab / sizeof nvn_extra_tab[0]; k++)
+        if (!strcmp(nvn_extra_tab[k].name, name)) return nvn_extra_tab[k].fn;
+    LOG("【黄】NVN 未知名字走空实现：%s", name);
+    return (void *)hx_default;
+}
+
+// ───────────── buffer 一族 + 缺的 builder/状态入口 ─────────────
+// d2r 用不到（它直接拿内存池地址当 buffer 用），本作 SDK 全走 builder。这些入口在
+// 参考工程里是「报红桩」（返回 0 什么也不做），于是 nvnBufferInitialize 永远成功不了、
+// nvnBufferMap 永远返回 0 ⇒ 引擎拿到空指针后崩在别处（真机实测 main+0x16b6764）。
+// d2r does not need these (it uses memory-pool addresses as buffers); this SDK uses the
+// builder API. In the reference port they were "red stubs" (return 0, do nothing), so
+// nvnBufferInitialize never succeeded and nvnBufferMap always returned 0.
+#define BB(b) ((buffer_builder_t *)(b))
+#define BUF(b) ((buffer_t *)(b))
+NVN(nvnBufferBuilderSetDefaults, void, NVNbufferBuilder *b) {
+    NVNdevice *dev = BB(b)->dev; memset(b, 0, sizeof(buffer_builder_t)); BB(b)->dev = dev;
+}
+NVN(nvnBufferBuilderSetDevice, void, NVNbufferBuilder *b, NVNdevice *d) { BB(b)->dev = d; }
+NVN(nvnBufferBuilderSetStorage, void, NVNbufferBuilder *b, NVNmemoryPool *p, ptrdiff_t off, size_t n) {
+    BB(b)->pool = (pool_t *)p; BB(b)->off = off; BB(b)->size = n;
+}
+NVN(nvnBufferBuilderGetMemoryPool, NVNmemoryPool, const NVNbufferBuilder *b) {
+    NVNmemoryPool r; memset(&r, 0, sizeof r); *(const void **)(void *)&r = BB(b)->pool; return r;
+}
+NVN(nvnBufferBuilderGetMemoryOffset, ptrdiff_t, const NVNbufferBuilder *b) { return BB(b)->off; }
+NVN(nvnBufferBuilderGetSize, size_t, const NVNbufferBuilder *b) { return BB(b)->size; }
+NVN(nvnBufferInitialize, NVNboolean, NVNbuffer *b, const NVNbufferBuilder *bb) {
+    const buffer_builder_t *s = (const buffer_builder_t *)bb; buffer_t *o = BUF(b);
+    o->magic = MAGIC('B', 'U', 'F', 'F'); o->flags = s->flags; o->size = s->size;
+    o->pool = s->pool; o->off = s->off;
+    o->mem = s->pool ? s->pool->mem + s->off : NULL;
+    if (!o->mem) LOG("【红】BufferInitialize 没有存储 pool=%p off=%#llx size=%#llx", (void *)s->pool, (long long)s->off, (unsigned long long)s->size);
+    else OLOG("Buffer %p mem=%p size=%#llx", (void *)b, (void *)o->mem, (unsigned long long)o->size);
+    return o->mem ? 1 : 0;
+}
+NVN(nvnBufferFinalize, void, NVNbuffer *b) { BUF(b)->magic = 0; }
+NVN(nvnBufferSetDebugLabel, void, NVNbuffer *b, const char *l) { (void)b; (void)l; }
+NVN(nvnBufferMap, void *, const NVNbuffer *b) { return BUF(b)->mem; }
+NVN(nvnBufferGetAddress, NVNbufferAddress, const NVNbuffer *b) { return (NVNbufferAddress)(uintptr_t)BUF(b)->mem; }
+NVN(nvnBufferGetSize, size_t, const NVNbuffer *b) { return BUF(b)->size; }
+NVN(nvnBufferGetMemoryPool, NVNmemoryPool *, const NVNbuffer *b) { return (NVNmemoryPool *)BUF(b)->pool; }
+NVN(nvnBufferGetMemoryOffset, ptrdiff_t, const NVNbuffer *b) { return BUF(b)->off; }
+NVN(nvnBufferGetDebugID, uint64_t, const NVNbuffer *b) { return (uint64_t)(uintptr_t)b; }
+NVN(nvnBufferFlushMappedRange, void, const NVNbuffer *b, ptrdiff_t o, size_t n) { (void)b; (void)o; (void)n; }
+NVN(nvnBufferInvalidateMappedRange, void, const NVNbuffer *b, ptrdiff_t o, size_t n) { (void)b; (void)o; (void)n; }
+
+// 贴图 builder 的 2D/3D 尺寸与读取（本 SDK 用 SetSize2D 而不是 SetWidth/SetHeight）
+NVN(nvnTextureBuilderSetSize2D, void, NVNtextureBuilder *b, int w, int h) {
+    TB(b)->d.width = (uint32_t)w; TB(b)->d.height = (uint32_t)h; TB(b)->d.depth = 1;
+}
+NVN(nvnTextureBuilderSetSize3D, void, NVNtextureBuilder *b, int w, int h, int d) {
+    TB(b)->d.width = (uint32_t)w; TB(b)->d.height = (uint32_t)h; TB(b)->d.depth = (uint32_t)d;
+}
+NVN(nvnTextureBuilderGetWidth, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.width; }
+NVN(nvnTextureBuilderGetHeight, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.height; }
+NVN(nvnTextureBuilderGetDepth, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.depth; }
+NVN(nvnTextureBuilderGetLevels, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.levels; }
+NVN(nvnTextureBuilderGetFormat, NVNformat, const NVNtextureBuilder *b) { return (NVNformat)TB(b)->d.format; }
+NVN(nvnTextureBuilderGetSamples, int, const NVNtextureBuilder *b) { return (int)TB(b)->d.samples; }
+NVN(nvnTextureBuilderGetTarget, NVNtextureTarget, const NVNtextureBuilder *b) { return (NVNtextureTarget)TB(b)->d.target; }
+// 通道 swizzle / 深度模具采样模式：当前 nvn_texdesc 没这两个字段，先记成空操作
+// （只影响采样通道重排与深度比较采样，不影响尺寸/格式/内容）。
+NVN(nvnTextureBuilderSetSwizzle, void, NVNtextureBuilder *b, NVNtextureSwizzle r, NVNtextureSwizzle g, NVNtextureSwizzle a, NVNtextureSwizzle al) {
+    (void)b; (void)r; (void)g; (void)a; (void)al;
+}
+NVN(nvnTextureBuilderSetDepthStencilMode, void, NVNtextureBuilder *b, NVNtextureDepthStencilMode m) { (void)b; (void)m; }
+
+// 描述符池容量（引擎按它算句柄上限）
+NVN(nvnTexturePoolGetSize, int, const NVNtexturePool *p) { return ((const dpool_t *)p)->n; }
+NVN(nvnSamplerPoolGetSize, int, const NVNsamplerPool *p) { return ((const dpool_t *)p)->n; }
+
+// 快清除颜色登记：只是把颜色登记进设备表，无 CPU 可见结果
+NVN(nvnDeviceRegisterFastClearColor, NVNboolean, NVNdevice *d, const float *c, NVNformat f) { (void)d; (void)c; (void)f; return 1; }
+NVN(nvnSamplerBuilderSetReductionFilter, void, NVNsamplerBuilder *b, NVNsamplerReduction r) { (void)b; (void)r; }
+NVN_NOPROTO(nvnQueueBuilderSetQueuePriority, void, NVNqueueBuilder *b, int p) { (void)b; (void)p; }
+
+// 状态对象：缺的这几个都是「记录进状态、回放时用」的，取值按 NVN/GL 语义
+NVN(nvnBlendStateGetBlendTarget, int, const NVNblendState *s) { return (int)((const blend_st *)s)->target; }
+NVN(nvnColorStateSetLogicOp, void, NVNcolorState *s, NVNlogicOp op) { ((color_st *)s)->logic_op = (uint32_t)op & 0xf; }
+NVN(nvnColorStateSetAlphaTest, void, NVNcolorState *s, NVNalphaFunc f) { ((color_st *)s)->alpha_func = (uint32_t)f & 0xf; }
+NVN(nvnMultisampleStateSetAlphaToCoverageDither, void, NVNmultisampleState *s, uint32_t v) { ((ms_st *)s)->a2c_dither = (uint8_t)(v != 0); }
+NVN(nvnMultisampleStateSetRasterSamples, void, NVNmultisampleState *s, int n) { ((ms_st *)s)->raster_samples = (uint8_t)n; }
+NVN(nvnMultisampleStateSetCoverageModulationMode, void, NVNmultisampleState *s, NVNcoverageModulationMode m) { ((ms_st *)s)->cov_mod = (uint8_t)m; }
+NVN(nvnMultisampleStateSetCoverageToColorEnable, void, NVNmultisampleState *s, uint32_t v) { ((ms_st *)s)->cov2color_en = (uint8_t)(v != 0); }
+NVN(nvnMultisampleStateSetCoverageToColorOutput, void, NVNmultisampleState *s, int i) { ((ms_st *)s)->cov2color_out = (uint8_t)i; }
+NVN(nvnMultisampleStateSetSampleLocationsGridEnable, void, NVNmultisampleState *s, uint32_t v) { ((ms_st *)s)->sl_grid = (uint8_t)(v != 0); }

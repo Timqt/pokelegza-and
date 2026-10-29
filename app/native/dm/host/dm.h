@@ -20,7 +20,17 @@
 #endif
 
 #define MAX_MOD 8
+// ★ 2026-10-29：安卓的 app 进程 stderr 是 /dev/null，dm 原来全写 fprintf(stderr)
+//   ⇒ 整个图形层在真机上是「哑」的（NVN 取址未知名字/未实现被调用/管线错误一条都
+//   看不到）。这里在安卓上改走 logcat（tag=dm），其它平台保持原样。
+#ifdef __ANDROID__
+#include <android/log.h>
+#define DM_LOG_BUF 900
+#define LOG(...) do { char _dm_b[DM_LOG_BUF]; snprintf(_dm_b, sizeof _dm_b, __VA_ARGS__); \
+    __android_log_write(ANDROID_LOG_INFO, "dm", _dm_b); } while (0)
+#else
 #define LOG(...) do { fprintf(stderr, "[dm] " __VA_ARGS__); fputc('\n', stderr); } while (0)
+#endif
 #define die(...) do { LOG("FATAL " __VA_ARGS__); abort(); } while (0)
 
 typedef struct { uint32_t st_name; uint8_t st_info, st_other; uint16_t st_shndx; uint64_t st_value, st_size; } Elf64_Sym;

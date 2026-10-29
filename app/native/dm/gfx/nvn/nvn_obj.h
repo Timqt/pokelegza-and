@@ -23,6 +23,19 @@ typedef struct { uint32_t magic; NVNdevice *dev; uint64_t submits; } queue_t;   
 typedef struct { NVNdevice *dev; void *mem; uint64_t size; uint32_t flags; } pool_builder_t;  FITS(pool_builder_t, NVNmemoryPoolBuilder);
 typedef struct { uint32_t magic, flags; uint8_t *mem; uint64_t size; } pool_t;                FITS(pool_t, NVNmemoryPool);
 
+// ★ 2026-10-29：d2r 从不调 buffer builder（它直接用内存池地址），所以参考工程里没有
+//   buffer 一族实现；本作（Z-A）的 SDK 全部走 builder 取址。builder 与对象都是**游戏
+//   分配、只交给 NVN** 的不透明内存，布局由我们自己定，只要求 Set*/Get* 自洽且不越界
+//   （FITS 静态断言兜住越界）。
+// d2r never uses the buffer builder API (it addresses memory pools directly), so the
+// reference port has no buffer implementation; this game's SDK goes through the builder.
+// Both structs live in game-allocated opaque memory that only NVN touches, so the layout
+// is ours as long as Set*/Get* agree and never exceed the reserved size (FITS checks that).
+typedef struct { NVNdevice *dev; pool_t *pool; int64_t off; uint64_t size; uint32_t flags; } buffer_builder_t;
+FITS(buffer_builder_t, NVNbufferBuilder);
+typedef struct { uint32_t magic, flags; uint64_t size; uint8_t *mem; pool_t *pool; int64_t off; } buffer_t;
+FITS(buffer_t, NVNbuffer);
+
 typedef struct { const pool_t *pool; int64_t off; int32_t n; } dpool_t;                       // 贴图 / 采样器描述符池 | Texture / sampler descriptor pool
 FITS(dpool_t, NVNtexturePool); FITS(dpool_t, NVNsamplerPool);
 

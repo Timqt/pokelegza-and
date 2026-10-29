@@ -73,18 +73,47 @@ extern const char __stop_swhle[] __attribute__((weak, visibility("hidden")));
 
 static int za_gfx_ready_scan;
 
-// 按改编名查参考图形层的实现；没有返回 NULL。
-// 顺序：强制接管表（nvnBootstrapLoader 等）在前，普通 HLE 表在后。
-void *za_gfx_hle_lookup(const char *name)
+// 定义在下面「开关与窗口」一节；这里要用来判断是否接管 NVIDIA 入口。
+int za_gfx_active(void);
+
+static void za_gfx_count_once(void)
 {
-    if (!name || !*name) return NULL;
-    if (!za_gfx_ready_scan)
-    {
-        za_gfx_ready_scan = 1;
-        size_t nf = (size_t)(__stop_swforce - __start_swforce) / sizeof(za_force_ent);
-        size_t nh = (size_t)(__stop_swhle - __start_swhle) / sizeof(za_hle_ent);
-        ZLOGI("图形层符号表: 强制接管 %zu 条，HLE %zu 条", nf, nh);
-    }
+    if (za_gfx_ready_scan) return;
+    za_gfx_ready_scan = 1;
+    size_t nf = (size_t)(__stop_swforce - __start_swforce) / sizeof(za_force_ent);
+    size_t nh = (size_t)(__stop_swhle - __start_swhle) / sizeof(za_hle_ent);
+    ZLOGI("图形层符号表: 强制接管 %zu 条，HLE %zu 条", nf, nh);
+}
+
+// 只查**强制接管**表（dm 的 HLE_FORCE 条目）。
+// ⚠ 这张表必须优先于我们自己的 za_host_syms：`nvnBootstrapLoader` 在两边都有，
+//   落到我们那个空实现上，图形层就整个变成死代码（真机实测：Vulkan 设备建好了、
+//   窗口也有，但每个 NVN 入口都在我们的影子层里返回假成功，submit 永远 0）。
+//   演示模式（/data/local/tmp/za-demo-vk）下不接管，保留旧的三角形路径。
+//
+// ⚠ 2026-10-29 真机：整表接管后启动 0.7 秒就崩在 main+0x16b6764
+//   （`stp q0,q0,[x0]`，x0=0 —— 对象池查找返回空、调用方不判空）。
+//   逐个排除的实测结果：
+//     · vi 的 4 个入口不是原因（排除后同样崩在同一处）——SDK 里还有别的模块
+//       在读 vi 状态，`nn::vi::Initialize` 换成空实现只会让状态机永不初始化，
+//       所以 vi 一律保持我们自己的 za_vi_*。
+//     · `nn::nv::InitializeGraphics` 是最可疑的一个：它负责建 GPU arena，dm 版
+//       是空实现 ⇒ 引擎的池结构（main+0x16ccfb8 里读 [obj+0x80]/[+0x78]、
+//       [arena+0x110]/[+0x30]）永远是空的 ⇒ 池查找返回 0 ⇒ 调用方不判空就写。
+//   所以这里**只接 nvnBootstrapLoader 这一个 C 名字**（图形接口本体），
+//   所有 `_ZN…`（C++ 的 nn::nv / nn::vi）继续走 SDK/我们自己的实现。
+//   等 NVN 层真的跑起来、确认 nv::* 该换成谁之后再逐个放开。
+static int za_gfx_force_allow(const char *name)
+{
+    if (strncmp(name, "_ZN", 3) == 0) return 0;   // C++ 入口：暂不接管
+    return 1;
+}
+
+void *za_gfx_force_lookup(const char *name)
+{
+    if (!name || !*name || !za_gfx_active()) return NULL;
+    za_gfx_count_once();
+    if (!za_gfx_force_allow(name)) return NULL;
     if (__start_swforce)
     {
         const za_force_ent *e = (const za_force_ent *)__start_swforce;
@@ -92,6 +121,17 @@ void *za_gfx_hle_lookup(const char *name)
         for (size_t i = 0; i < n; i++)
             if (e[i].name && !strcmp(e[i].name, name)) return e[i].fn;
     }
+    return NULL;
+}
+
+// 按改编名查参考图形层的实现；没有返回 NULL。
+// 顺序：强制接管表（nvnBootstrapLoader 等）在前，普通 HLE 表在后。
+void *za_gfx_hle_lookup(const char *name)
+{
+    if (!name || !*name) return NULL;
+    za_gfx_count_once();
+    void *f = za_gfx_force_lookup(name);
+    if (f) return f;
     if (__start_swhle)
     {
         const za_hle_ent *e = (const za_hle_ent *)__start_swhle;

@@ -3383,6 +3383,7 @@ static unsigned char *za_guest_main_base;
 // ⚠ **模块导出表优先于 dlsym**：裸 malloc/free 是 main NSO 导出的**客机自己的 musl 分配器**，
 //   落到 dlsym 会变成 bionic 的分配器 ⇒ SDK 与客机不是同一套堆。
 void *za_gfx_hle_lookup(const char *name);
+void *za_gfx_force_lookup(const char *name);
 void *za_resolve_host(const char *name)
 {
     if (name)
@@ -3392,9 +3393,17 @@ void *za_resolve_host(const char *name)
         memcpy(za_last_sym, name, n);
         za_last_sym[n] = 0;
     }
+    // 参考工程图形层的**强制接管**表（dm 的 HLE_FORCE 条目，ELF 段 swforce）。
+    // ⚠ 必须排在我们的 za_host_syms 之前：`nvnBootstrapLoader` 两边都有，
+    //   先查我们那张表就会用影子层把图形层整体遮掉 —— 真机实测 Vulkan 设备
+    //   建成功、窗口也有，但每个 NVN 入口都在影子层里假成功，submit 永远 0。
+    {
+        void *f = za_gfx_force_lookup(name);
+        if (f) return f;
+    }
     for (const za_host_sym_t *h = za_host_syms; h->name; h++)
         if (!strcmp(h->name, name)) return h->fn;
-    // 参考工程图形层的接管表（dm/ 的 HLE_FORCE 条目，放在 ELF 段 swforce/swhle）。
+    // 参考工程图形层的普通 HLE 表（放在 ELF 段 swhle）。
     // ⚠ 必须排在模块导出表之前：nvnBootstrapLoader 是 SDK 里也有定义的，
     //   落回 SDK 就会执行真机 NS 的 NVN 驱动（桌面 GPU 命令，安卓上必崩）。
     void *p = za_gfx_hle_lookup(name);
