@@ -4045,6 +4045,24 @@ static void za_unstick_main_job_spin(void)
         // 这个自旋回路从 0xcc040（自旋锁）到 0xcc0dc（判 state）、0xcc0f4（重试）
         // 都算；真机采样点实测落在 0xcc080 与 0xcc0d0 两处。
         if (off < 0xcc030 || off > 0xcc140) continue;
+        // 这段循环里还有一个**字节自旋锁**：`add x8,x20,#2; ldxrb/stlxrb 0x5f`。
+        // 锁被一个永远不回来的线程持有时，这里会空转到死。把锁字节清 0 放行。
+        {
+            unsigned long long lk = sl->regs[20];
+            if (ZA_PTR_OK(lk)) {
+                unsigned char b2 = 0xff, b3 = 0xff;
+                memcpy(&b2, (const void *)(uintptr_t)(lk + 2), 1);
+                memcpy(&b3, (const void *)(uintptr_t)(lk + 3), 1);
+                if (b2 != 0 || b3 != 0) {
+                    unsigned char z = 0;
+                    memcpy((void *)(uintptr_t)(lk + 2), &z, 1);
+                    memcpy((void *)(uintptr_t)(lk + 3), &z, 1);
+                    if (n++ < 12)
+                        ZLOGE("★ tid=%ld 自旋在字节锁 %#llx（%02x/%02x）→ 清 0 放行",
+                              tid, lk, b2, b3);
+                }
+            }
+        }
         unsigned long long job = sl->regs[19];
         if (!ZA_PTR_OK(job)) continue;
         unsigned int st = 0xffffffffu;
