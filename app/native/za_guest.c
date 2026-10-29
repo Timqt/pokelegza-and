@@ -942,15 +942,48 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 { 0x173e6b8u, 0x173e6c4u, 0 },
                 // main+0x250b0e0: `cbz x0,ret0 ; ldr x8,[x0,#0x68] ; ldrb w8,[x8]`
                 //   补零页让 [x0+0x68] 变成 0，而这里没有对 x8 判空 ⇒ 崩在 0x250b0e8。
-                // ★ 2026-10-29 真机：这条查询的**返回值决定调用方走哪条路**——
-                //   返回 0（「没准备好」）⇒ 调用方去**构建**：`ldr x0,[entry,#0x68]`
-                //   拿到 NULL 再 `bl 0x2553eb0`，于是 program 对象 = 0+0x10，
-                //   nvnProgramInitialize(0x10) 一路把空对象传下去（最后 blr 垃圾）。
-                //   返回 1（「已就绪」）⇒ 跳过构建，空对象不再被创建/使用。
-                //   引擎缺的是这层 wrapper 的**分配**；在拿不到分配者之前，跳过比
-                //   造一个会被它 free 掉的假对象安全。
-                { 0x250b0e8u, 0x250b0f4u, 1 },
+                // ★ 2026-10-29 真机（两次实测，结论相反）：
+                //   · 返回 0（「没准备好」）⇒ 调用方去**构建**：`ldr x0,[entry,#0x68]`
+                //     拿到 NULL 去调构造器 ⇒ program = 0+0x10，空对象一路下传。
+                //   · 返回 1（「已就绪」）⇒ 跳过构建，之后别处按「已初始化」用这些
+                //     子对象 ⇒ 它们的 vptr 从没被写过（堆残留是字符串字节
+                //     0x74736e75007463）⇒ blr 到数据，SIGBUS。
+                //   ⇒ 两条路都不行，缺的是**这块 wrapper 的存储**。这里直接补给
+                //   它：从静态池取一块 0x200 字节写进 [entry+0x68]，然后让查询照
+                //   原样返回 false（读到 0），引擎就会**正常构建**进这块内存。
+                //   ⚠ 静态池不归客机分配器管：如果引擎最终 free() 它们，会在
+                //   销毁阶段炸；目前的优先级是先让首帧流程走通。
+                { 0x250b0e8u, 0x250b0f4u, 0 },
             };
+            // ★ 先补存储：main+0x250b0e8 `ldrb w8,[x8]` 且 x8==0，x0=entry。
+            //   给 entry->0x68 塞一块零内存 → 重执该 ldrb（读 0 → 查询返回 false
+            //   → 调用方走「构建」分支，把对象初始化进我们这块内存）。
+            if (pcx == gb0 + 0x250b0e8ul &&
+                *(volatile unsigned int *)(uintptr_t)pcx == 0x39400108u &&
+                ucx->uc_mcontext.regs[8] == 0 && ucx->uc_mcontext.regs[0] != 0)
+            {
+                static unsigned char pool[192][0x200] __attribute__((aligned(16)));
+                static int used;
+                if (used < 192) {
+                    unsigned long long blk = (unsigned long long)(uintptr_t)pool[used++];
+                    unsigned long long entry = (unsigned long long)ucx->uc_mcontext.regs[0];
+                    struct iovec lo = { &blk, 8 }, ro = { (void *)(uintptr_t)(entry + 0x68), 8 };
+                    if (process_vm_writev(getpid(), &lo, 1, &ro, 1, 0) == 8) {
+                        ucx->uc_mcontext.regs[8] = blk;
+                        static int nblk;
+                        if (nblk++ < 6) {
+                            char b[176];
+                            char *q = b;
+                            q = za_put_str(q, "ZaGuest: ★ 补 wrapper 存储 entry=");
+                            q = za_put_hex(q, entry);
+                            q = za_put_str(q, " blk=");
+                            q = za_put_hex(q, blk);
+                            za_fatal_write(b, (size_t)(q - b));
+                        }
+                        return;   // pc 不变，重执 ldrb
+                    }
+                }
+            }
             for (unsigned i = 0; i < sizeof fix / sizeof fix[0]; i++) {
                 if (pcx != gb0 + fix[i].fault) continue;
                 static int nfix;
