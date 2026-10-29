@@ -4397,8 +4397,6 @@ static void za_hook_m_dequeue(unsigned long long *r);static void za_hook_m_enq2(
 static void za_hook_m_enq3(unsigned long long *r);
 static void za_hook_m_jobenqueue(unsigned long long *r);
 static void za_hook_m_openfile(unsigned long long *r);
-static void za_hook_m_allocreq(unsigned long long *r);
-static void za_hook_m_alloctail(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
                                   void (*hook)(unsigned long long *));
@@ -4573,14 +4571,14 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd848fc, ZA_MPROBE_STUB + 0x480, ZA_MPROBE_SLOT + 0x48, za_hook_m_jobenqueue);
         za_install_main_probe(base, 0xd82644, ZA_MPROBE_STUB + 0x500, ZA_MPROBE_SLOT + 0x50, za_hook_m_enq2);
         za_install_main_probe(base, 0x16ffeb0, ZA_MPROBE_STUB + 0x580, ZA_MPROBE_SLOT + 0x58, za_hook_m_enq3);
-        // 引擎分配器失败现场（首帧墙的新解释：游戏自己 abort 了）：
-        //   abort 帧链 = main+0x102d3dc ← 0xf8aa3c ← 0x98efc0 ← 0x98eb78
-        //   main+0x102cf70 是个带「每线程在飞数组(16 格)」的分配封装：
-        //     计数 [TP+0x40]+0x98 == 0x10 ⇒ terminate；
-        //     blr [分配器 vtable+0x10](size=w1, align=w2) 返回 0 ⇒ 也 abort。
-        //   0x102d180 记录请求参数，0x102d3c8 是两条路都会经过的 abort 尾巴。
-        za_install_main_probe(base, 0x102d180, ZA_MPROBE_STUB + 0x600, ZA_MPROBE_SLOT + 0x60, za_hook_m_allocreq);
-        za_install_main_probe(base, 0x102d3c8, ZA_MPROBE_STUB + 0x680, ZA_MPROBE_SLOT + 0x68, za_hook_m_alloctail);
+        // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
+        //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
+        //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
+        //   ZA_IMAGE_SIZE(0x5f7a000) 之外，故障处理器认不出，按「野调用→返回 0」
+        //   把 PC 设成 x30 —— 等于让 0x102cf70 提前返回，调用方拿着垃圾 x20 继续跑，
+        //   真机实测 5 秒内 23 次野调用后崩在宿主堆地址 0x6f5b0ec550。
+        //   结论：这条路径只能靠 abort 帧链（za_sdk.c 的 abort-entry）读，不能改代码。
+        (void)0;
         // ⚠ 试过在 main+0x19554c0（`bl nn::fs::OpenFile`）装探针来抓路径：
         //   这条指令是 **bl**，桩重放后 x30 指向桩内，实测把后续控制流带进了
         //   main 的 BSS（pc=main+0x76b732c）。call 类指令不适合这套探针，已移除。
@@ -5050,6 +5048,106 @@ static void za_unstick_main_job_spin(void)
     }
 }
 
+// ★ 2026-10-30：Havok 反射注册表成环 —— 主线程 100% CPU 空转的真因。
+//   main+0xa8d470 是「把对象 x0 移到链表尾」（move-to-tail）：
+//     x9 = head = *(main+0x5f39498)；沿 [node+0x20] 往下走；
+//     找到 x0 先摘下来，走到 NULL 再把 x0 接到尾部。
+//   真机实测（进程活着时直接 dump BSS）：0x105f54e90 → … → 0x103d7f470 → 回到
+//   0x105f54e90，是**14 个节点的环**，而 x0（0x103d7f498）不在环里 ⇒ `cmp/b.eq`
+//   永不成立，主线程在 main+0xa8d484 烧满一个核，帧再也提交不出去。
+//   节点名字是 `$hkReflect::Version::PatchRegistry` / `$ReflectStrings` /
+//   `$AfterReflectNewLock` —— Havok 的类型注册表（多线程 move-to-tail 未串行化
+//   时正是环的典型成因）。
+//   这里做「有界遍历 + 重复检测」：发现回到走过的节点，就把那一跳改成 NULL，
+//   链表恢复线性，自旋线程走到表尾把 x0 接上、继续干活。
+//   默认开启；files/za-no-lrufix 可关（A/B 用）。
+#define ZA_LRU_HEAD_OFF 0x5f39498ul     // main+0x5f39498 = 链表头
+#define ZA_LRU_FN_LO    0xa8d470ul      // move-to-tail 函数体范围
+#define ZA_LRU_FN_HI    0xa8d4bcul
+
+static int za_lru_fix_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-no-lrufix",
+                   F_OK) != 0;
+    return m;
+}
+
+static int za_grd(unsigned long a, void *dst, size_t n)
+{
+    struct iovec lo = { dst, n }, ro = { (void *)(uintptr_t)a, n };
+    return process_vm_readv(getpid(), &lo, 1, &ro, 1, 0) == (ssize_t)n;
+}
+static int za_gwr(unsigned long a, const void *src, size_t n)
+{
+    struct iovec lo = { (void *)(uintptr_t)src, n }, ro = { (void *)(uintptr_t)a, n };
+    return process_vm_writev(getpid(), &lo, 1, &ro, 1, 0) == (ssize_t)n;
+}
+
+static void za_unstick_lru_cycle(void)
+{
+    if (!za_lru_fix_mode()) return;
+    unsigned long gb = (unsigned long)(uintptr_t)za_guest_base;
+    if (!gb) return;
+    // 只有真的采到「某条线程在 move-to-tail 里」才动链表，避免误伤。
+    int stuck = 0;
+    for (int i = 0; i < 32; i++) {
+        long tid = za_samp_tab[i].tid;
+        unsigned long pc = za_samp_tab[i].pc;
+        if (tid <= 0 || pc < gb) continue;
+        unsigned long off = pc - gb;
+        if (off >= ZA_LRU_FN_LO && off < ZA_LRU_FN_HI) { stuck = 1; break; }
+    }
+    if (!stuck) return;
+
+    unsigned long head = 0;
+    if (!za_grd(gb + ZA_LRU_HEAD_OFF, &head, 8) || !head) return;
+
+    enum { ZA_LRU_MAX = 8192 };
+    static unsigned long path[ZA_LRU_MAX];
+    static int fixed_n;
+    if (fixed_n >= 8) return;
+    int n = 0;
+    unsigned long cur = head, prev = 0;
+    while (cur && n < ZA_LRU_MAX) {
+        int dup = 0;
+        for (int k = 0; k < n; k++)
+            if (path[k] == cur) { dup = k + 1; break; }
+        if (dup) {
+            unsigned long zero = 0;
+            char nm[48] = "";
+            unsigned long name = 0;
+            if (za_grd(cur, &name, 8)) {
+                const unsigned char *p = (const unsigned char *)(uintptr_t)name;
+                (void)p;
+                // 名字是客机 rodata 里的字符串，只用来点名人/不追求完整
+                for (int k = 0; k < 40; k++) {
+                    unsigned char c = 0;
+                    if (!za_grd((unsigned long)name + (unsigned long)k, &c, 1) || !c) break;
+                    if (c < 0x20 || c > 0x7e) break;
+                    nm[k] = (char)c;
+                }
+            }
+            int cut = prev && za_gwr(prev + 0x20, &zero, 8);
+            fixed_n++;
+            ZLOGE("★ Havok 注册表成环：head=%#lx，第 %d 个节点 %#lx（%s）与第 %d 个重复"
+                  "（环长 %d）⇒ %s", head, n, cur, nm[0] ? nm : "?", dup - 1, n - (dup - 1),
+                  cut ? "已切断上一跳的 next，放自旋线程继续" : "切断失败");
+            return;
+        }
+        path[n++] = cur;
+        prev = cur;
+        unsigned long nx = 0;
+        if (!za_grd(cur + 0x20, &nx, 8)) {
+            ZLOGE("★ Havok 注册表：第 %d 个节点 %#lx 的 next 读不到，停止扫描", n, cur);
+            return;
+        }
+        cur = nx;
+    }
+    ZLOGE("★ Havok 注册表：扫了 %d 个节点没发现环（可能是超长链表，不动它）", n);
+}
+
 // ★ 线程级「两次采样」对照表。
 //   停摆表只列「在 svc 里睡着」的线程；**纯用户态自旋**的线程根本不进那张表
 //   （它不发 svc），而它往往就是真正卡住整条流水线的那一条（真机实测主线程
@@ -5128,8 +5226,10 @@ void za_dump_thread_pcs2(void)
                               q[0], q[1], q[2], q[3], (long long)((q[1] - q[0]) / 8));
                 }
                 if (sl)
-                    ZLOGE("        regs x0=%#lx x1=%#lx x2=%#lx x3=%#lx x21=%#lx x22=%#lx x23=%#lx",
+                    ZLOGE("        regs x0=%#lx x1=%#lx x2=%#lx x3=%#lx x8=%#lx x9=%#lx"
+                          " x10=%#lx x21=%#lx x22=%#lx x23=%#lx",
                           sl->regs[0], sl->regs[1], sl->regs[2], sl->regs[3],
+                          sl->regs[8], sl->regs[9], sl->regs[10],
                           sl->regs[21], sl->regs[22], sl->regs[23]);
             }
         }
@@ -5152,6 +5252,8 @@ void za_dump_progress_stall(void)
     // 自旋的线程根本不在等待表里）。
     za_force_stuck_jobs();
     za_unstick_main_job_spin();
+    // 反射注册表成环（主线程 100% CPU 于 main+0xa8d484）：切断闭环那一跳。
+    za_unstick_lru_cycle();
     {
         // 实验开关：files/za-lqgrow —— 把塞满的消息队列扩容，破「队满→生产者全堵」。
         static int lg = -1;
@@ -5514,36 +5616,6 @@ static void za_hook_m_enq3(unsigned long long *r)
     }
     ZLOGI("★ 真正入队 0x16ffeb0: x0=%#llx x1=%#llx x2=%#llx vt=%#llx 数量=%llu idx=%#llx lr=%#llx",
           r[0], r[1], r[2], vt, cnt, idx, r[19]);
-}
-
-// ★ 2026-10-30：引擎分配器（main+0x102cf70）的请求/失败现场。
-//   它每次分配都把对象指针压进「每线程在飞数组」（[TP+0x40]+0x98 是下标，
-//   满 0x10 直接 terminate），分配本身是一次虚调用 `blr [vt+0x10](size,align)`，
-//   返回 0 同样 abort。两个探针分别抓请求参数和 abort 尾巴上的现场。
-static unsigned long long za_alloc_req_sz, za_alloc_req_al, za_alloc_req_n;
-
-static void za_hook_m_allocreq(unsigned long long *r)
-{
-    unsigned long long k = __atomic_add_fetch(&za_alloc_req_n, 1, __ATOMIC_RELAXED);
-    za_alloc_req_sz = r[1];                 // w1 = size
-    za_alloc_req_al = r[2];                 // w2 = align
-    if (k <= 6) ZLOGI("★ 引擎分配请求 #%llu: size=%llu align=%llu", k, r[1], r[2]);
-}
-
-static void za_hook_m_alloctail(unsigned long long *r)
-{
-    static int n;
-    if (n++ >= 3) return;
-    // 探针桩保存了 x0..x17 + x29(fp) + x30(lr) ⇒ r[18] 就是 main+0x102cf70 的帧指针。
-    // 它的 prologue：x29=fp0、x24/x23=fp+0x10/0x18、x22/x21=fp+0x20/0x28、x20/x19=fp+0x30/0x38。
-    unsigned long fp = (unsigned long)r[18], x22 = 0, x19 = 0, alloc = 0, cnt = 0;
-    za_read_word(fp + 0x20, &x22);
-    za_read_word(fp + 0x38, &x19);
-    if (x22) za_read_word(x22 + 0x98, &cnt);
-    if (x19) za_read_word(x19 + 8, &alloc);
-    ZLOGI("★ 分配器 abort 尾巴：fp=%#lx x22=%#lx 在飞计数=%lu x19=%#lx 分配器=%#lx"
-          "｜最近请求 size=%llu align=%llu（累计 %llu 次）",
-          fp, x22, cnt, x19, alloc, za_alloc_req_sz, za_alloc_req_al, za_alloc_req_n);
 }
 
 // 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。
