@@ -3372,9 +3372,37 @@ static unsigned za_ngc_check(void *self, unsigned *masks, unsigned pat,
     return 0;
 }
 
+
+// ── 大块释放追踪（诊断）──────────────────────────────────────────────
+// 真机现象：整条 UAF 链的起点是 main+0x250b0b8 解引用一块**已释放的宿主堆
+// slab**。要回答「谁放掉的」，就得看 free() 的调用者 —— 客机调 free 时 x30
+// 就是它自己的返回地址。只记录大块（≥32KB），否则日志会被小对象刷爆。
+#include <malloc.h>
+static void za_free_trace(void *p)
+{
+    if (p) {
+        static int n;
+        if (n < 24) {
+            size_t sz = malloc_usable_size(p);
+            if (sz >= 32768) {
+                n++;
+                unsigned long ret;
+                __asm__ __volatile__("mov %0, x30" : "=r"(ret));
+                ZLOGE("★ free(%p size=%zu) ← 客机返回地址 %#lx", p, sz, ret);
+            }
+        }
+    }
+    free(p);
+}
+static void za_delete_trace(void *p) { za_free_trace(p); }
+
 static const za_host_sym_t za_host_syms[] = {
     // loader 提供的「runtime object file」（真机由 nnrtld 提供）
     { "__nnDetailNintendoSdkRuntimeObjectFile", (void *)za_host_runtime_object_file },
+    // 诊断：大块 free 的调用者（见 za_free_trace 的注释）
+    { "free", (void *)za_free_trace },
+    { "_ZdlPv", (void *)za_delete_trace },
+    { "_ZdlPvm", (void *)za_delete_trace },
 
     // ── hid 初始化：先接管成「成功」──────────────────────────────
     // nn::hid::InitializeNpad 会通过 CMIF 连 hid 服务、建共享内存；
