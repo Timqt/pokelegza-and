@@ -619,6 +619,38 @@ static void za_log_sdk_state(unsigned long x19, unsigned long x8)
 
 // 拦截 32..62 的实时信号（63 留给 PC 采样器）：只记录「信号号 / 故障 PC / siginfo」后转给致命处理
 static void za_rt_catch(int sig, siginfo_t *info, void *ctx);
+static void za_rt_catch(int sig, siginfo_t *info, void *ctx);
+
+// 读一个客机对象所属的类名（itanium ABI：vptr[-1] = typeinfo，typeinfo+8 = 名字）。
+// 用途：整条 UAF 链的「第一个坏读」上把对象类型挖出来，否则只能看到一堆站点。
+static void za_log_obj_rtti(unsigned long long obj_raw)
+{
+    unsigned long long o = obj_raw & 0x00FFFFFFFFFFFFFFull;
+    if (o < 0x10000ull || o >= 0x800000000000ull) return;
+    unsigned long long vptr = 0, ti = 0, nm = 0;
+    struct iovec a = { &vptr, 8 }, b = { (void *)(uintptr_t)o, 8 };
+    if (process_vm_readv(getpid(), &a, 1, &b, 1, 0) != 8 || !vptr) return;
+    unsigned long long vp = vptr & 0x00FFFFFFFFFFFFFFull;
+    struct iovec c2 = { &ti, 8 }, d2 = { (void *)(uintptr_t)(vp - 8), 8 };
+    if (process_vm_readv(getpid(), &c2, 1, &d2, 1, 0) != 8 || !ti) return;
+    unsigned long long tp = ti & 0x00FFFFFFFFFFFFFFull;
+    struct iovec e2 = { &nm, 8 }, f2 = { (void *)(uintptr_t)(tp + 8), 8 };
+    if (process_vm_readv(getpid(), &e2, 1, &f2, 1, 0) != 8 || !nm) return;
+    char name[96];
+    struct iovec g2 = { name, sizeof name - 1 }, h2 = { (void *)(uintptr_t)(nm & 0x00FFFFFFFFFFFFFFull), sizeof name - 1 };
+    ssize_t got = process_vm_readv(getpid(), &g2, 1, &h2, 1, 0);
+    name[got > 0 ? got : 0] = 0;
+    char bb[220];
+    char *qq = bb;
+    qq = za_put_str(qq, "ZaGuest: ★ 坏读对象 obj=");
+    qq = za_put_hex(qq, o);
+    qq = za_put_str(qq, " vtable=");
+    qq = za_put_hex(qq, vp);
+    qq = za_put_str(qq, " rtti=");
+    qq = za_put_str(qq, name);
+    za_fatal_write(bb, (size_t)(qq - bb));
+}
+
 static void za_fatal_handler(int sig, siginfo_t *info, void *ctx);
 
 // 帧快照（定义在 za_horizon.c）：0x14457c 三条 svc 时刻的整帧内容
@@ -1107,6 +1139,13 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                         }
                         if (cnt[slot] < 64) {
                             cnt[slot]++;
+                            {
+                                static int once;
+                                if (once < 3 && in_main2 && (pcv2 - gb0) == 0x250b0b8ul) {
+                                    once++;
+                                    za_log_obj_rtti((unsigned long long)ucx->uc_mcontext.regs[0]);
+                                }
+                            }
                             // ★ 置 0 会被调用方原样往下传（真机：x21=0 → 崩在
                             //   main+0x254f4f8 的 `str x8,[x0]`）。改成指向一页全零的
                             //   安全内存：非空（过 cbz）、任何读取都得 0、写入也只是
@@ -1139,6 +1178,42 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 *(volatile unsigned int *)(uintptr_t)pcx == 0xf9401108u)   // ldr x8,[x8,#0x20]
             {
                 static int nq;
+                // ★ 2026-10-29：这是整条 UAF 链的**第一个**坏读（后面所有崩溃都是
+                //   它的连锁反应）。先把「这个对象是什么类型」挖出来：读 vtable，
+                //   顺着 RTTI 拿类名（itanium ABI：vptr[-1] = typeinfo，
+                //   typeinfo+8 = 名字字符串）。
+                {
+                    unsigned long long obj = (unsigned long long)ucx->uc_mcontext.regs[0];
+                    unsigned long long o = obj & 0x00FFFFFFFFFFFFFFull;
+                    if (nq < 3 && o >= 0x10000ull && o < 0x800000000000ull) {
+                        unsigned long long vptr = 0, ti = 0, nm = 0;
+                        struct iovec a = { &vptr, 8 }, b = { (void *)(uintptr_t)o, 8 };
+                        if (process_vm_readv(getpid(), &a, 1, &b, 1, 0) == 8 && vptr) {
+                            unsigned long long vp = vptr & 0x00FFFFFFFFFFFFFFull;
+                            struct iovec c2 = { &ti, 8 }, d2 = { (void *)(uintptr_t)(vp - 8), 8 };
+                            if (process_vm_readv(getpid(), &c2, 1, &d2, 1, 0) == 8 && ti) {
+                                unsigned long long tp = ti & 0x00FFFFFFFFFFFFFFull;
+                                struct iovec e2 = { &nm, 8 }, f2 = { (void *)(uintptr_t)(tp + 8), 8 };
+                                if (process_vm_readv(getpid(), &e2, 1, &f2, 1, 0) == 8 && nm) {
+                                    char name[96];
+                                    struct iovec g2 = { name, sizeof name - 1 }, h2 = { (void *)(uintptr_t)(nm & 0x00FFFFFFFFFFFFFFull), sizeof name - 1 };
+                                    ssize_t got = process_vm_readv(getpid(), &g2, 1, &h2, 1, 0);
+                                    if (got > 0) { name[got] = 0; }
+                                    else name[0] = 0;
+                                    char bb[200]; char *qq = bb;
+                                    qq = za_put_str(qq, "ZaGuest: ★ 首个坏读对象 obj=");
+                                    qq = za_put_hex(qq, o);
+                                    qq = za_put_str(qq, " vtable=");
+                                    qq = za_put_hex(qq, vp);
+                                    qq = za_put_str(qq, " rtti=\"");
+                                    qq = za_put_str(qq, name);
+                                    qq = za_put_str(qq, "\"");
+                                    za_fatal_write(bb, (size_t)(qq - bb));
+                                }
+                            }
+                        }
+                    }
+                }
                 ucx->uc_mcontext.regs[0] = 0;                    // w0 = false
                 ucx->uc_mcontext.pc = gb0 + 0x250b0d0ul;         // mov w0,wzr; ret
                 if (nq++ < 6) {
@@ -4243,6 +4318,7 @@ void za_dump_thread_pcs2(void)
         }
     }
 }
+
 
 // 自旋型停摆的快照。客机自旋时 svc 计数一直在涨，旧的 no_progress 判定
 // 永远不会触发；但 NVN 一个提交都没有，说明它其实没前进。

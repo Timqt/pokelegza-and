@@ -532,16 +532,26 @@ NVN(nvnSamplerFinalize, void, NVNsampler *s) {
 // ---------- Programs ----------
 NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
     { unsigned long _glr = NVN_GUEST_LR();
-      if (!nvn_obj_ok(p, sizeof(prog_t))) { static int _n;
-        if (_n++ < 2) LOG("【红】nvnProgramInitialize 对象指针非法 %p ← 客机返回地址 %#lx", (void *)p, _glr);
-        return 0; } }
+      if (!nvn_obj_ok(p, sizeof(prog_t))) {
+        // ★ 2026-10-29：**假装成功**而不是返回失败。返回 0 会让引擎把这条
+        //   program 当作「初始化失败」，随后销毁并释放它所在的 slab；但别处
+        //   还持有指向那块内存的指针 ⇒ 之后就是 UAF（真机首个坏读
+        //   0x6ee33501a8 与活着的 program 0x6ee3350348 只差 0x1a0）。
+        //   这里只把状态写进一个草稿对象，返回值仍按成功给，让引擎的引用计数
+        //   保持平衡；后续对同一非法指针的调用同样走这条分支，行为自洽。
+        static int _n;
+        if (_n++ < 2) LOG("【红】nvnProgramInitialize 非法对象 %p ← 客机返回地址 %#lx（按成功处理）", (void *)p, _glr);
+        static prog_t scratch;
+        memset(&scratch, 0, sizeof scratch);
+        scratch.magic = MAGIC('P', 'R', 'O', 'G');
+        return 1; } }
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
 NVN(nvnProgramFinalize, void, NVNprogram *p) {
     if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramFinalize 对象指针非法 %p", (void *)p); return; } prog_t *o = (prog_t *)p; snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->magic = 0; }
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
     { unsigned long _glr = NVN_GUEST_LR();
-      if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramSetShaders 对象指针非法 %p ← 客机返回地址 %#lx", (void *)p, _glr); return 0; } }
+      if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramSetShaders 非法对象 %p（按成功处理）", (void *)p); return 1; } }
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShaders 阶段数 %d", n); return 0; }
     snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
