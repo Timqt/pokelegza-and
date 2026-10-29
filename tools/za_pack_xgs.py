@@ -35,6 +35,33 @@ DEFAULT_VAL = r"D:\feiniukexinhome\Code\d2r-and\build-tools-win\ndk28\android-nd
 
 
 
+
+def normalize_pool_textures(res):
+    """把「纹理池句柄」补成 dmsh_vk 能解的形式。
+
+    Ryujinx 给的 cbuf_slot < 0 表示这个贴图/图像来自**纹理池**，此时 handle 是
+    游戏调 nvnTexturePoolRegisterTexture(pool, id, …) 时用的 id（实测 8/10/12/16…），
+    而不是常量缓冲 c[2] 里的字节偏移，dmsh_vk.decode_tex 因此解不出槽号。
+    我们的 HLE 登记的也是同一个 id（mtl_reg_tex(id, …)），所以槽号就是该 id。
+    这里把它编码成 c[2] 里对应的偏移字（贴图表 0x168、图像表 0x120，每槽 8 字节），
+    让解码器算出 slot == id。
+    Ryujinx reports cbuf_slot < 0 for pool textures; handle is then the pool
+    registration id (our HLE registers textures by the same id), not a c[2] byte
+    offset. Re-encode it as the equivalent c[2] offset word.
+    """
+    for table, base in (("textures", 0x168), ("images", 0x120)):
+        for t in res.get(table) or []:
+            if int(t.get("cbuf_slot", -1)) >= 0:
+                continue
+            hid = int(t.get("handle", -1))
+            ty = (hid >> 28) & 0xF
+            hid &= 0x3FFF
+            if hid < 0 or hid >= 128:
+                continue                       # 不是池 id，交给原始解码
+            t["cbuf_slot"] = 2                 # tb = 2 ⇒ 走 c[2]
+            t["handle"] = ((base + 8 * hid) // 4) | (ty << 28)
+    return res
+
 # ── 能力/扩展裁剪（替代 spirv-opt --trim-capabilities）──────────────────
 # NDK 自带的 spirv-opt 没有这个开关（真机/构建机上实测 `Unknown flag`），而引擎
 # xbg_game.cpp 的 validate_capabilities 是**白名单**：遇到没列进 switch 的能力
@@ -187,12 +214,17 @@ def main():
     reasons = collections.Counter()
     done = 0
     skipped = []
+
+    # 先配对再去重：同一个控制段键会出现在很多容器里（实测 42,896 个 SPH 只对应
+    # 18,391 个唯一键，平均 2.3 份拷贝），按键去重后只处理一份。
+    # Pair first, then dedupe by key: the same control key appears in many containers
+    # (42,896 SPH vs 18,391 keys), so only one copy per key is processed.
+    picked = {}
     for spv_path in sorted(args.spv_dir.rglob("*.spv")):
-        if spv_path.with_suffix(".res.json").exists() is False:
+        if not spv_path.with_suffix(".res.json").exists():
             stats["缺 res.json"] += 1
             continue
-        name = spv_path.stem
-        parts = name.rsplit("_", 2)
+        parts = spv_path.stem.rsplit("_", 2)
         if len(parts) != 3:
             stats["名字不合规"] += 1
             continue
@@ -202,24 +234,32 @@ def main():
         except ValueError:
             stats["名字不合规"] += 1
             continue
-        stage = STAGE.get(stage_c)
-        if stage is None:
+        if STAGE.get(stage_c) is None:
             stats["未知阶段"] += 1
             continue
         b0 = starts.get(bnsh)
         if b0 is None:
             stats["没有该容器"] += 1
-            skipped.append(name)
+            skipped.append(spv_path.stem)
             continue
         ctl = keys.get((bnsh, b0 + sph, stage_c.lower()))
         if ctl is None:
             stats["没有控制段键"] += 1
-            skipped.append(name)
+            skipped.append(spv_path.stem)
             continue
+        if ctl not in picked:
+            picked[ctl] = spv_path
+    stats["唯一键"] = len(picked)
+    print("配对到唯一键 %d 个" % len(picked))
+
+    for ctl, spv_path in sorted(picked.items()):
+        stage_c = spv_path.stem.rsplit("_", 2)[2]
+        stage = STAGE[stage_c]
         if args.limit and done >= args.limit:
             break
 
         res = json.loads(spv_path.with_suffix(".res.json").read_text(encoding="utf-8"))
+        res = normalize_pool_textures(res)
         con = res.get("stage")
         if con and STAGE.get(con, stage) != stage:
             stage = STAGE.get(con, stage)
