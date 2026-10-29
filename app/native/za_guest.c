@@ -1039,8 +1039,14 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                 if (in_main2 || in_sdk2) {
                     unsigned int w = *(volatile unsigned int *)(uintptr_t)pcv2;
                     unsigned int rtn = w & 0x1fu, rnn = (w >> 5) & 0x1fu;
-                    int is_ld = 0, is_st = 0;
-                    switch (w & 0xffc00000u) {
+                    int is_ld = 0, is_st = 0, is_pair = 0;
+                    // ★ 2026-10-29：引擎大量使用**配对读写**（ldp/stp）。以前只解码
+                    //   单寄存器，配对指令一律落回致命流程 ⇒ 一条都救不回来
+                    //   （真机 main+0x2554030 `ldp x8,x9,[x0]`）。
+                    //   0xa9400000/0xa9000000 是 64 位、偏移为 imm7*8 的 ldp/stp。
+                    if ((w & 0xffc00000u) == 0xa9400000u) { is_ld = 1; is_pair = 1; }
+                    else if ((w & 0xffc00000u) == 0xa9000000u) { is_st = 1; is_pair = 1; }
+                    else switch (w & 0xffc00000u) {
                     case 0xf9400000u: case 0xb9400000u: case 0x39400000u:
                     case 0x79400000u: case 0xb9800000u: is_ld = 1; break;
                     case 0xf9000000u: case 0xb9000000u: case 0x39000000u:
@@ -1069,6 +1075,10 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                         }
                         if (stn[slot] < 64) {
                             stn[slot]++;
+                            if (is_pair) {
+                                ucx->uc_mcontext.pc = pcv2 + 4;   // 配对写：整条跳过
+                                return;
+                            }
                             ucx->uc_mcontext.regs[rnn] =
                                 (unsigned long)(uintptr_t)za_zero_page;
                             if (stn[slot] <= 3) {
@@ -1103,6 +1113,10 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                             //   落到我们自己的页里。
                             if (rtn != 31) ucx->uc_mcontext.regs[rtn] =
                                 (unsigned long)(uintptr_t)za_zero_page;
+                            if (is_pair) {
+                                int rt2 = (int)((w >> 10) & 0x1fu);
+                                if (rt2 != 31) ucx->uc_mcontext.regs[rt2] = 0;
+                            }
                             ucx->uc_mcontext.pc = pcv2 + 4;
                             if (cnt[slot] <= 3) {
                                 char b[176];
