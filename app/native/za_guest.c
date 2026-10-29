@@ -125,6 +125,101 @@ static char *za_put_hex(char *p, unsigned long long v)
     return p;
 }
 
+// 在 /proc/self/maps 里找 addr 的「所属/前后」映射，写一行可读描述。
+// 为什么需要：悬空指针只给出一个绝对地址，光看 0x6ee30dc1c8 无法判断它是
+// 客机堆、我们 mmap 的栈、还是宿主 Scudo 大块（scudo:secondary）。真机上
+// 这三个来源对应完全不同的修法，而 /proc/self/maps 一次就能分辨。
+// 只用 open/read：这段可能在任意线程的致命路径上跑，尽量不碰 libc 的锁。
+// Where does a dangling address live? /proc/self/maps answers it in one shot
+// (guest heap vs. our mmap vs. the host's Scudo secondary arena).
+static void za_maps_near(unsigned long long a, char *out, size_t cap)
+{
+    static char mbuf[384 * 1024];
+    static int busy;
+    int fd;
+    ssize_t n;
+    size_t used = 0;
+    unsigned long long prev_lo = 0, prev_hi = 0;
+    unsigned long long next_lo = 0;
+    char prev_name[72] = "", next_name[72] = "";
+    char prev_perm[5] = "", next_perm[5] = "";
+    if (!cap) return;
+    if (busy) { out[0] = 0; return; }
+    busy = 1;
+    out[0] = 0;
+    fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) { busy = 0; return; }
+    while (used < sizeof mbuf - 1) {
+        n = read(fd, mbuf + used, sizeof mbuf - 1 - used);
+        if (n <= 0) break;
+        used += (size_t)n;
+    }
+    close(fd);
+    mbuf[used] = 0;
+    {
+        char *p = mbuf;
+        while (p && *p) {
+            char *e = strchr(p, '\n');
+            char *q;
+            unsigned long long lo, hi;
+            char perm[5] = "----";
+            const char *nm;
+            if (e) *e = 0;
+            lo = strtoull(p, &q, 16);
+            if (*q == '-') {
+                hi = strtoull(q + 1, &q, 16);
+                while (*q == ' ') q++;
+                if (q[0] && q[1] && q[2] && q[3]) {
+                    perm[0] = q[0]; perm[1] = q[1]; perm[2] = q[2]; perm[3] = q[3];
+                    while (*q && *q != ' ') q++;              // perms
+                    for (int k = 0; k < 3; k++) {             // offset / dev / inode
+                        while (*q == ' ') q++;
+                        while (*q && *q != ' ') q++;
+                    }
+                    while (*q == ' ') q++;
+                }
+                nm = q;
+                if (hi <= a) {
+                    prev_lo = lo; prev_hi = hi;
+                    memcpy(prev_perm, perm, 5);
+                    snprintf(prev_name, sizeof prev_name, "%.71s", nm);
+                } else if (lo > a && !next_lo) {
+                    next_lo = lo;
+                    memcpy(next_perm, perm, 5);
+                    snprintf(next_name, sizeof next_name, "%.71s", nm);
+                }
+            }
+            p = e ? e + 1 : NULL;
+        }
+    }
+    {
+        char *q = out;
+        char *end = out + cap - 1;
+        q = za_put_str(q, "前一个=[");
+        q = za_put_hex(q, prev_lo);
+        q = za_put_str(q, "-");
+        q = za_put_hex(q, prev_hi);
+        q = za_put_str(q, " ");
+        q = za_put_str(q, prev_perm);
+        q = za_put_str(q, " ");
+        q = za_put_str(q, prev_name);
+        q = za_put_str(q, "]");
+        if (a >= prev_lo && a < prev_hi) { q = za_put_str(q, "← 地址落在里面"); }
+        if (next_lo) {
+            q = za_put_str(q, " 后一个=[");
+            q = za_put_hex(q, next_lo);
+            q = za_put_str(q, " ");
+            q = za_put_str(q, next_perm);
+            q = za_put_str(q, " ");
+            q = za_put_str(q, next_name);
+            q = za_put_str(q, "]");
+        }
+        if (q > end) q = end;
+        *q = 0;
+    }
+    busy = 0;
+}
+
 // 把地址换算成「模块名+偏移」，光看绝对地址没法反查汇编
 static char *za_put_addr(char *p, unsigned long a)
 {
@@ -1255,6 +1350,16 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                                         }
                                         ZLOGE("[nvn-diag] 首个坏读的块 blk=%#llx 可读=%d 头=%#llx %#llx %#llx %#llx | %#llx %#llx %#llx %#llx | [blk+0x28]=%#llx 可读=%d",
                                             b, okr, q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7], q[5], fmapped);
+                                        // 块本身和悬空字段各查一次 /proc/self/maps：
+                                        // 一眼看出它们在「客机堆 / 我们 mmap 的区域 / 宿主
+                                        // Scudo 大块」中的哪一类 —— 三者的修法完全不同。
+                                        {
+                                            char mm[400];
+                                            za_maps_near(b, mm, sizeof mm);
+                                            ZLOGE("[nvn-diag] 块所在映射 %s", mm);
+                                            za_maps_near(q[5] & 0x00FFFFFFFFFFFFFFull, mm, sizeof mm);
+                                            ZLOGE("[nvn-diag] 悬空字段所在映射 %s", mm);
+                                        }
                                     }
                                 }
                                 if (nchain++ < 2) {
