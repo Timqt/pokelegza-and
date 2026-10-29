@@ -932,22 +932,30 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
         //   最后在消息处理里把假名字当对象解引用（真机崩在 main+0x250b0b8，
         //   x8 指向未映射的 0x...6ee36451a8）。返回空名字才是这条路径的本意。
         if (gb0) {
-            struct { unsigned int fault, target; int zero_x0; } fix[] = {
+            // set_x0: -1 = 不动 x0，0 = 让函数返回 0，1 = 让函数返回 1
+            struct { unsigned int fault, target; int set_x0; } fix[] = {
                 // main+0x1757a6c: 失败分支在 0x1757a8c（返回静态空串）
-                { 0x1757a70u, 0x1757a8cu, 0 },
+                { 0x1757a70u, 0x1757a8cu, -1 },
                 // main+0x1757a98: 失败分支在 0x1757ab0（mov w0,wzr; ret）
-                { 0x1757a98u, 0x1757ab0u, 1 },
+                { 0x1757a98u, 0x1757ab0u, 0 },
                 // main+0x173e6b4: `ldr x0,[x8,#0x58]`，函数尾 0x173e6c4 (ret) → w0=0
-                { 0x173e6b8u, 0x173e6c4u, 1 },
+                { 0x173e6b8u, 0x173e6c4u, 0 },
                 // main+0x250b0e0: `cbz x0,ret0 ; ldr x8,[x0,#0x68] ; ldrb w8,[x8]`
                 //   补零页让 [x0+0x68] 变成 0，而这里没有对 x8 判空 ⇒ 崩在 0x250b0e8。
-                //   直接走 ret 的 w0=0 分支（=「该标志位为 0」）。
+                // ★ 2026-10-29 真机：这条查询的**返回值决定调用方走哪条路**——
+                //   返回 0（「没准备好」）⇒ 调用方去**构建**：`ldr x0,[entry,#0x68]`
+                //   拿到 NULL 再 `bl 0x2553eb0`，于是 program 对象 = 0+0x10，
+                //   nvnProgramInitialize(0x10) 一路把空对象传下去（最后 blr 垃圾）。
+                //   返回 1（「已就绪」）⇒ 跳过构建，空对象不再被创建/使用。
+                //   引擎缺的是这层 wrapper 的**分配**；在拿不到分配者之前，跳过比
+                //   造一个会被它 free 掉的假对象安全。
                 { 0x250b0e8u, 0x250b0f4u, 1 },
             };
             for (unsigned i = 0; i < sizeof fix / sizeof fix[0]; i++) {
                 if (pcx != gb0 + fix[i].fault) continue;
                 static int nfix;
-                if (fix[i].zero_x0) ucx->uc_mcontext.regs[0] = 0;
+                if (fix[i].set_x0 >= 0)
+                    ucx->uc_mcontext.regs[0] = (unsigned long)fix[i].set_x0;
                 ucx->uc_mcontext.pc = gb0 + fix[i].target;
                 if (nfix++ < 6) {
                     char b[160];

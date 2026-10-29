@@ -172,6 +172,41 @@ void za_gfx_set_window(ANativeWindow *window)
     ZLOGI("图形层窗口 -> %p", (void *)window);
 }
 
+// ───────── 图形层进度统计（宿主侧，每 5 秒一行）─────────
+// dm 的逐帧报表只在 present 时打印；首帧一直出不来时日志里什么都没有，无法判断
+// 「引擎到底走到没走到提交」。这里直接读引擎自己的计数器，把 submit/draw/present
+// 变成可观测的量。
+// The engine's own counters, sampled from the host every 5 s: dm only prints its
+// per-frame report on present, so with no first frame there was no way to tell
+// whether submission/draw were ever reached.
+typedef struct { uint64_t submissions, draws, dispatches, presents, shader_loads; } za_xbg_stats;
+int xbg_game_get_stats(za_xbg_stats *out);
+
+static pthread_t g_stat_th;
+static volatile int g_stat_run;
+
+static void *za_gfx_stat_thread(void *arg)
+{
+    (void)arg;
+    za_xbg_stats last = {0, 0, 0, 0, 0};
+    for (int i = 0; g_stat_run && i < 600; i++) {
+        struct timespec t = { 5, 0 };
+        nanosleep(&t, NULL);
+        za_xbg_stats s;
+        memset(&s, 0, sizeof s);
+        xbg_game_get_stats(&s);
+        if (memcmp(&s, &last, sizeof s) != 0) {
+            ZLOGI("★ 图形层统计：submit=%llu draw=%llu dispatch=%llu present=%llu shader=%llu",
+                  (unsigned long long)s.submissions, (unsigned long long)s.draws,
+                  (unsigned long long)s.dispatches, (unsigned long long)s.presents,
+                  (unsigned long long)s.shader_loads);
+            last = s;
+        }
+    }
+    return NULL;
+}
+
+
 static void *za_gfx_init_thread(void *arg)
 {
     (void)arg;
@@ -181,6 +216,9 @@ static void *za_gfx_init_thread(void *arg)
     {
         g_init_state = 2;
         ZLOGI("图形层初始化完成");
+        g_stat_run = 1;
+        if (pthread_create(&g_stat_th, NULL, za_gfx_stat_thread, NULL) == 0)
+            pthread_detach(g_stat_th);
     }
     else
     {
@@ -208,5 +246,6 @@ void za_gfx_start(const char *shader_root)
     }
     pthread_detach(th);
 }
+
 
 int za_gfx_init_state(void) { return g_init_state; }

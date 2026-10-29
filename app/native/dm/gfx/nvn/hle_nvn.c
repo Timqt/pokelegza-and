@@ -80,6 +80,27 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 
 static int g_log;
 
+// 客机侧的返回地址：NVN 跳板（nvn_thunks.S）只改 x16/x17，不动 x30，
+// 所以实现函数入口处的 x30 仍然是客机那条 blr 的返回地址。
+// 用途：引擎拿「空对象+偏移」来调 NVN 时，直接看是**哪段客机代码**给的。
+// The guest-side return address: the thunks only touch x16/x17, so x30 at the
+// implementation's entry is still the guest's `blr` return address.
+#define NVN_GUEST_LR() ({ unsigned long _lr_; __asm__ volatile("mov %0, x30" : "=r"(_lr_)); _lr_; })
+#define NVN_GUEST_FP() ({ unsigned long _fp_; __asm__ volatile("mov %0, x29" : "=r"(_fp_)); _fp_; })
+// 客机 fp 链（-O2 下 hle_nvn 自己不用 x29，所以 x29 仍是客机那一帧）
+static void nvn_guest_fp_chain(unsigned long fp, const char *tag)
+{
+    for (int i = 0; i < 4 && fp; i++) {
+        if (fp & 7) break;
+        unsigned long nf = *(volatile unsigned long *)(uintptr_t)fp;
+        unsigned long lr = *(volatile unsigned long *)(uintptr_t)(fp + 8);
+        LOG("        [%s] fp[%d] lr=%#lx", tag, i, lr);
+        if (nf <= fp || nf - fp > 0x100000ul) break;
+        fp = nf;
+    }
+}
+
+
 // ───────── 对象指针合法性检查 ─────────
 // 真机实测：客机会把「空对象 + 偏移」当对象传进来（nvnProgramInitialize(p=0x10)，
 // 之后我们 memset(p) 直接踩到 0x84 打死宿主）。影子层只写几个小字段所以从没炸过。
@@ -522,13 +543,18 @@ NVN(nvnSamplerFinalize, void, NVNsampler *s) {
 // ---------- 程序 ----------
 // ---------- Programs ----------
 NVN(nvnProgramInitialize, NVNboolean, NVNprogram *p, NVNdevice *d) {
-    if (!nvn_obj_ok(p, sizeof(prog_t))) { static int _n; if (_n++ < 6) LOG("【红】nvnProgramInitialize 对象指针非法 %p", (void *)p); return 0; }
+    { unsigned long _glr = NVN_GUEST_LR();
+      if (!nvn_obj_ok(p, sizeof(prog_t))) { static int _n;
+        if (_n++ < 2) { LOG("【红】nvnProgramInitialize 对象指针非法 %p ← 客机返回地址 %#lx", (void *)p, _glr);
+                        nvn_guest_fp_chain(NVN_GUEST_FP(), "progInit"); }
+        return 0; } }
     (void)d; memset(p, 0, sizeof(prog_t)); ((prog_t *)p)->magic = MAGIC('P', 'R', 'O', 'G'); return 1;
 }
 NVN(nvnProgramFinalize, void, NVNprogram *p) {
     if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramFinalize 对象指针非法 %p", (void *)p); return; } prog_t *o = (prog_t *)p; snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->magic = 0; }
 NVN(nvnProgramSetShaders, NVNboolean, NVNprogram *p, int n, const NVNshaderData *sd) {
-    if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramSetShaders 对象指针非法 %p", (void *)p); return 0; }
+    { unsigned long _glr = NVN_GUEST_LR();
+      if (!nvn_obj_ok(p, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnProgramSetShaders 对象指针非法 %p ← 客机返回地址 %#lx", (void *)p, _glr); return 0; } }
     prog_t *o = (prog_t *)p;
     if (n < 0 || n > 6) { LOG("【红】ProgramSetShaders 阶段数 %d", n); return 0; }
     snap_drop(&o->snap, o->serial, offsetof(prog_t, serial)); mtl_prog_release(o); o->nstage = n; memcpy(o->sd, sd, n * sizeof *sd); o->serial = nvn_new_serial();
