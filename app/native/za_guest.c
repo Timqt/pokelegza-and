@@ -5597,6 +5597,31 @@ void za_dump_progress_stall(void)
                 unsigned long long b = *(volatile unsigned long long *)(uintptr_t)(q + off + 8);
                 ZLOGE("   enq+%#llx: %#llx %#llx", off, a, b);
             }
+            // E5：MPSC 容器是「每 lane 0x80」布局（0x194e850/0x194e94c 反汇编）：
+            //   lane+0x08 = 哈希桶表指针、+0x10 = 取模基数、+0x40 = 环计数区
+            //   （16 字节一对 [begin,end]，门闩值 = end-begin）。
+            // 停摆时把前 8 条 lane 的环计数倒出来：哈希有命令但环计数为 0
+            // ⇒ 87 个未消费命令的下落（入哈希没入环 / 或在无人认领的 lane）。
+            {
+                unsigned long long vt2 = *(volatile unsigned long long *)(uintptr_t)q;
+                if (vt2 == 0x103a29f48ull) {   // push 时记录的这个类才按 lane 布局倒
+                    for (int lane = 0; lane < 8; lane++) {
+                        unsigned long long base = q + (unsigned long long)lane * 0x80;
+                        unsigned long long tbl = 0, mod = 0, cb = 0, ce = 0;
+                        memcpy(&tbl, (const void *)(uintptr_t)(base + 0x08), 8);
+                        memcpy(&mod, (const void *)(uintptr_t)(base + 0x10), 8);
+                        unsigned long long *rp = NULL;
+                        memcpy(&rp, (const void *)(uintptr_t)(base + 0x40), 8);
+                        if (ZA_PTR_OK((unsigned long long)(uintptr_t)rp)) {
+                            memcpy(&cb, (const void *)(uintptr_t)rp, 8);
+                            memcpy(&ce, (const void *)(uintptr_t)((unsigned long long)(uintptr_t)rp + 8), 8);
+                        }
+                        ZLOGE("   lane%d: 桶表=%#llx 取模=%#llx 环[%#llx]=%llu,%llu 待=%lld",
+                              lane, tbl, mod, (unsigned long long)(uintptr_t)rp, cb, ce,
+                              (long long)(ce - cb));
+                    }
+                }
+            }
         }
         // 「谁认识这个池对象」：扫全线程栈找出持有它的线程。
         //   只被 worker 认识 ⇒ 生产方从来没拿到过这个池（问题在池的分发侧）；
