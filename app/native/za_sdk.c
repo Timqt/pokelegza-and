@@ -155,9 +155,42 @@ static void za_probe_log(const char *name, const unsigned long long *r)
         if (ok) ZLOGI("   %s arg%d = \"%s\"", name, i, (const char *)p);
     }
 }
+// E19：断言消息可能不是 C 字符串（可能是 {fmt,args} 结构或非 UTF-8），
+// 直接 dump 原始字节（hex + ASCII 双行），不做「像不像字符串」的猜测。
+static void za_assert_dump(unsigned long long p, const char *what)
+{
+    if (p < 0x10000) return;
+    unsigned char buf[96];
+    size_t got = 0;
+    while (got + 8 <= sizeof buf) {
+        unsigned long long w = 0;
+        if (!za_safe_rd(p + got, &w, 8)) break;
+        memcpy(buf + got, &w, 8);
+        got += 8;
+    }
+    if (!got) { ZLOGI("   %s@%#llx 不可读", what, p); return; }
+    char hex[96 * 3 + 4], asc[96 + 4];
+    int h = 0, a = 0;
+    for (size_t i = 0; i < got; i++) {
+        h += snprintf(hex + h, sizeof hex - (size_t)h, "%02x ", buf[i]);
+        asc[a++] = (buf[i] >= 0x20 && buf[i] < 0x7f) ? (char)buf[i] : '.';
+    }
+    hex[h] = 0; asc[a] = 0;
+    ZLOGI("   %s@%#llx hex: %s", what, p, hex);
+    ZLOGI("   %s@%#llx asc: |%s|", what, p, asc);
+}
+
 static void za_hook_assert_entry(unsigned long long *r) { za_probe_log("assert-entry", r); }
 static void za_hook_assert_wrap(unsigned long long *r)  { za_probe_log("assert-wrap", r); }
-static void za_hook_assert_var(unsigned long long *r)   { za_probe_log("assert-va", r); }
+static void za_hook_assert_var(unsigned long long *r)
+{
+    static int n;
+    za_probe_log("assert-va", r);
+    if (n++ >= 3) return;
+    // x0..x4 常是同一 SDK 字符串地址（断言宏的结构体地址）；x5 实测是客机堆缓冲
+    za_assert_dump(r[0], "assert x0");
+    za_assert_dump(r[5], "assert x5");
+}
 static void za_hook_assert_onfail(unsigned long long *r) { za_probe_log("assert-onfail", r); }
 // 安全读：帧链上的地址可能落在已被 munmap 的段里，直接解引用会把宿主打死。
 static int za_safe_rd(unsigned long long a, void *dst, size_t n)
