@@ -4212,7 +4212,10 @@ static void za_guest_free_impl(void *p)
             }
         }
     }
-    if (!za_alloc_mode()) { za_musl_free(p); return; }
+    if (!za_alloc_mode()) {
+        if (za_mem_guest_owns(p)) { za_mem_guest_free(p); return; }   // E34
+        za_musl_free(p); return;
+    }
     za_hdr_t h;
     if (!za_hdr_get(p, &h)) { za_musl_free(p); return; }
     za_free_total++;
@@ -4245,11 +4248,24 @@ static void za_alloc_log(const char *fmt, ...)
     ZLOGE("%s", b);
     za_alloc_log_busy = 0;
 }
+// ★ E34：客机堆里的大块（≥64KB）也改成从客机自有区出。
+//   E33 实测：fs vtable 大块路由后，残留的悬空读全部落在**宿主堆**里的对象
+//   （0xb4000076_… 的 grsc 容器等），说明它们是客机 malloc 出来的。
+static int za_mallocbig_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-mallocbig",
+                   F_OK) == 0;
+    return m;
+}
 static void *za_guest_malloc_impl(size_t n)
 {
     unsigned long lr0 = ZA_CALLER_LR();
     void *p;
-    if (!za_alloc_mode()) p = za_main_malloc(n);
+    if (!za_alloc_mode() && za_mallocbig_mode() && n >= 0x10000)
+        p = za_mem_guest_alloc(n, 16);              // E34：大块不交宿主堆
+    else if (!za_alloc_mode()) p = za_main_malloc(n);
     else p = za_hdr_alloc(n ? n : 1, 16);
     if (p && n >= 0x10000) {
         static int na;
@@ -4259,6 +4275,9 @@ static void *za_guest_malloc_impl(size_t n)
 }
 static void *za_guest_calloc_impl(size_t a, size_t b)
 {
+    if (!za_alloc_mode() && za_mallocbig_mode() && b && a * b >= 0x10000 &&
+        a <= (size_t)-1 / b)
+        return za_mem_guest_alloc(a * b, 16);        // 本区分配已是清零的
     if (!za_alloc_mode()) {
         void *(*f)(size_t, size_t) =
             (void *(*)(size_t, size_t))za_mod_lookup(&za_main_mod, "calloc");
@@ -4272,6 +4291,14 @@ static void *za_guest_calloc_impl(size_t a, size_t b)
 }
 static void *za_guest_realloc_impl(void *p, size_t n)
 {
+    if (!za_alloc_mode() && za_mem_guest_owns(p)) {   // E34：本区的块自己搬
+        void *q = za_mem_guest_alloc(n ? n : 1, 16);
+        if (!q) return NULL;
+        size_t old = za_mem_guest_usable(p);
+        memcpy(q, p, old < n ? old : n);
+        za_mem_guest_free(p);
+        return q;
+    }
     if (!za_alloc_mode()) {
         void *(*f)(void *, size_t) =
             (void *(*)(void *, size_t))za_mod_lookup(&za_main_mod, "realloc");
@@ -5082,6 +5109,19 @@ static int za_vtguest_mode(void)
     return m;
 }
 
+// ★ E33：只把 ≥64KB 的大块（BNSH 资源容器那一族）路由到客机自有区。
+//   E32 全量路由时启动就停摆：小块的调用频次极高，而当时分配器本身有
+//   「回收块可能小于请求」和「对齐后 free 找错头」两个 bug（已在 za_mem.c 修掉）。
+//   这轮先只让大块过新分配器，风险面最小。
+static int za_vtguest_big_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-vtguestbig",
+                   F_OK) == 0;
+    return m;
+}
+
 void *za_fs_vt_alloc(void *obj, unsigned long size, unsigned long align)
 {
     unsigned long lr0 = ZA_CALLER_LR();
@@ -5091,7 +5131,8 @@ void *za_fs_vt_alloc(void *obj, unsigned long size, unsigned long align)
     if ((align & (align - 1)) != 0) align = 16;      // 非 2 的幂：退回 16
     // 接管模式下走同一套自带头部堆（接管模式本身有问题，默认不用）
     if (za_alloc_mode()) p = za_guest_aligned_impl((size_t)align, size ? (size_t)size : 1);
-    else if (za_vtguest_mode()) {
+    else if (za_vtguest_mode() ||
+             (size >= 0x10000 && za_vtguest_big_mode())) {
         p = za_mem_guest_alloc(size ? (size_t)size : 1, (size_t)align);
         if (!p) return NULL;
     }

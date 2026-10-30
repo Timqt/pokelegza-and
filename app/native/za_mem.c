@@ -688,11 +688,16 @@ unsigned long long za_mem_query_memory(unsigned long long addr, unsigned long lo
 //   以及 ART 的 arena 虚表被清零（Jit thread pool 崩在 MemMapArenaPool::TrimMaps）。
 //   所以客机可写的东西一律从这块**独立 mmap 区**里出，一个字节都不碰宿主堆。
 #define ZA_SHARE_BASE 0x4000000000ull       // 256GB：arm64 用户空间常见 39 位(512GB)，1TB 会 EPERM
-#define ZA_SHARE_CAP  0x40000000ull         // 1GB 虚拟（按需提交）
+// ★ E33：1GB 太小。把 ≥64KB 的大块（BNSH 资源容器、纹理上传缓冲）也路由到
+//   这里以后，10 秒就报「客机共享区耗尽（已用 0x3f2c50c0）」，启动直接停摆。
+//   这些大块本来就在 Scudo 里占着真实内存，只是换个地址来源；16GB 是虚拟上限，
+//   MAP_NORESERVE + 按需提交，实际提交多少就是游戏真正用到多少。
+#define ZA_SHARE_CAP  0x400000000ull        // 16GB 虚拟（按需提交）
 
 typedef struct za_share_hdr {
     struct za_share_hdr *next;              // 空闲链（仅空闲块用）
-    size_t size;                            // 本块总大小（含头）
+    size_t cap;                             // 整块容量（4KB 对齐，含头与对齐余量）
+    size_t blk;                             // 头相对块首的偏移（对齐时 > 0；free 用它找回块首）
 } za_share_hdr;
 
 static unsigned char *g_share;
@@ -730,42 +735,59 @@ static int za_share_class(size_t sz)
 }
 
 // 客机可见的零初始化内存；align 必须是 2 的幂。返回 NULL 表示区域耗尽。
+// ★ E33 修的三个真 bug（E32 全量路由到本区后启动停摆，根因就在这）：
+//   ① 按尺寸档复用：档 c 里的块容量在 (2^(c-1), 2^c] 之间，而档是按**新请求**
+//      算的 ⇒ 可能取到比请求小的块，直接越界写下一块。
+//   ② free 用 (hdr*)p-1 找头，但对齐时返回的是对齐后的地址，头不在那前面
+//      ⇒ 释放写成垃圾，空闲链被破坏。
+//   ③ 容量按 2 的幂取整：64KB 的请求实际占 128KB，大块路由后十几秒就把区撑爆。
+//   现在：块容量是精确值（≥4KB 时按页取整），复用按容量校验、档位向上找，
+//   头放在返回地址正前方并记录块首偏移。
 void *za_mem_guest_alloc(size_t size, size_t align)
 {
     if (!za_share_init()) return NULL;
     if (align < 16) align = 16;
-    size_t need = (size ? size : 1) + sizeof(za_share_hdr);
-    need = (need + 15) & ~(size_t)15;
-    int c = za_share_class(need);
+    if (align > 0x10000) align = 0x10000;            // 再大就没意义了，且会爆档
+    size_t want = sizeof(za_share_hdr) + (size ? size : 1) + align;
+    int c = za_share_class(want);
     if (c > 39) return NULL;
     pthread_mutex_lock(&g_lock);
-    za_share_hdr *h = g_share_free[c];
-    if (h) {
-        g_share_free[c] = h->next;
-    } else {
-        if (g_share_used + need > ZA_SHARE_CAP) {
+    za_share_hdr *b = NULL;
+    for (int k = c; k <= 39 && !b; k++) {
+        za_share_hdr **pp = &g_share_free[k];
+        while (*pp) {
+            if ((*pp)->cap >= want) {                // 容量校验：装不下就继续找
+                b = *pp;
+                *pp = b->next;
+                break;
+            }
+            pp = &(*pp)->next;
+        }
+    }
+    if (!b) {
+        size_t cap = want >= 0x1000 ? ((want + 0xFFF) & ~(size_t)0xFFF)
+                                    : ((want + 15) & ~(size_t)15);
+        if (g_share_used + cap > ZA_SHARE_CAP) {
             pthread_mutex_unlock(&g_lock);
             ZLOGE("客机共享区耗尽（已用 %#zx / %#llx）", g_share_used,
                   (unsigned long long)ZA_SHARE_CAP);
             return NULL;
         }
-        h = (za_share_hdr *)(g_share + g_share_used);
-        h->size = need;
-        g_share_used += need;
+        b = (za_share_hdr *)(g_share + g_share_used);
+        g_share_used += cap;
+        b->cap = cap;
     }
     pthread_mutex_unlock(&g_lock);
-    void *p = (void *)(h + 1);
+    size_t cap = b->cap;
+    // 头放到对齐后的地址正前方：free 用 (hdr*)p-1 就能找回它
+    uintptr_t p = ((uintptr_t)b + sizeof(za_share_hdr) + align - 1) &
+                  ~(uintptr_t)(align - 1);
+    za_share_hdr *h = (za_share_hdr *)p - 1;
+    h->cap = cap;
+    h->blk = (size_t)((unsigned char *)h - (unsigned char *)b);
     // 复用的块必须清零（calloc 语义：客机假定拿到的是干净的）
-    memset(p, 0, h->size - sizeof *h);
-    if (align > 16) {
-        uintptr_t a = ((uintptr_t)p + align - 1) & ~(uintptr_t)(align - 1);
-        if (a != (uintptr_t)p) {
-            size_t pad = (size_t)(a - (uintptr_t)p);
-            if (h->size - sizeof *h < pad + size) return NULL;   // 放不下就放弃对齐
-            p = (void *)a;
-        }
-    }
-    return p;
+    memset((void *)p, 0, cap - h->blk - sizeof(za_share_hdr));
+    return (void *)p;
 }
 
 int za_mem_guest_owns(const void *p)
@@ -775,14 +797,27 @@ int za_mem_guest_owns(const void *p)
     return v >= b && v < b + g_share_used;
 }
 
+size_t za_mem_guest_usable(const void *p)
+{
+    if (!za_mem_guest_owns(p)) return 0;
+    const za_share_hdr *h = (const za_share_hdr *)p - 1;
+    if (h->blk > h->cap || h->cap > ((size_t)1 << 39)) return 0;
+    return h->cap - h->blk - sizeof(za_share_hdr);
+}
+
 void za_mem_guest_free(void *p)
 {
     if (!za_mem_guest_owns(p)) return;
     za_share_hdr *h = (za_share_hdr *)p - 1;
-    int c = za_share_class(h->size);
+    if (h->blk > h->cap || h->cap > ((size_t)1 << 39)) return;   // 头被写坏：宁可不回收
+    unsigned char *blk = (unsigned char *)h - h->blk;
+    za_share_hdr *b = (za_share_hdr *)blk;
+    int c = za_share_class(h->cap);
     if (c > 39) return;
     pthread_mutex_lock(&g_lock);
-    h->next = g_share_free[c];
-    g_share_free[c] = h;
+    /* 头被对齐偏移到块内：容量必须仍在块首的记录里 */
+    b->cap = h->cap;
+    b->next = g_share_free[c];
+    g_share_free[c] = b;
     pthread_mutex_unlock(&g_lock);
 }

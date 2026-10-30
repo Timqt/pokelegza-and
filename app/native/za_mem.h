@@ -31,6 +31,8 @@ void za_mem_note_mapping(unsigned long long addr, unsigned long long size, int o
 void *za_mem_guest_alloc(size_t size, size_t align);
 void za_mem_guest_free(void *p);
 int za_mem_guest_owns(const void *p);
+// 这块（本区内的）分配实际能安全用多少字节；不在本区返回 0。
+size_t za_mem_guest_usable(const void *p);
 
 // 这段地址是否落在我们自己的预留区内（svc#44/#45 改权限前必须先问）
 int za_mem_owns(unsigned long long addr, unsigned long long size);
