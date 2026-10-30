@@ -37,8 +37,11 @@ FILES = "/data/user/0/%s/files" % PKG
 
 def adb(*args, **kw):
     env = dict(os.environ, MSYS_NO_PATHCONV="1")
+    # ★ 真机 logcat 里偶发非 UTF-8 字节（厂商日志），text=True 默认解码会抛
+    #   UnicodeDecodeError ⇒ 整轮日志变成 0 行、结论全是假的。errors=replace 兜住。
     return subprocess.run(["adb", "-s", DEV] + list(args), capture_output=True,
-                          text=True, env=env, **kw)
+                          text=True, encoding="utf-8", errors="replace",
+                          env=env, **kw)
 
 
 def run_as(shell_cmd):

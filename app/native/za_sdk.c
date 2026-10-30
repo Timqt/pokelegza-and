@@ -103,6 +103,8 @@ static int *za_probe_budget(const char *name)
     b[nb].name = name; b[nb].used = 0;
     return &b[nb++].used;
 }
+static int za_safe_rd(unsigned long long a, void *dst, size_t n);   // 定义在下面
+
 static void za_probe_log(const char *name, const unsigned long long *r)
 {
     int *used = za_probe_budget(name);
@@ -111,15 +113,38 @@ static void za_probe_log(const char *name, const unsigned long long *r)
     ZLOGI("★ 探针 %s: x0=%#llx x1=%#llx x2=%#llx x3=%#llx x4=%#llx x5=%#llx x6=%#llx x7=%#llx"
           "  fp=%#llx lr=%#llx", name, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7],
           r[18], r[19]);
-    // 把「看起来是 SDK/main 映像内地址」的参数当 C 字符串打出来
+    // 把「看起来是 C 字符串」的参数打出来：映像内直接读，客机堆用 process_vm_readv。
+    // ★ 实测：SceneThread 的断言消息在客机堆 0xb4000077708a5bbc，旧版只认映像内
+    //   地址 ⇒ 断言内容全是空字符串。
     for (int i = 0; i < 6; i++)
     {
         unsigned long long v = r[i];
+        if (v < 0x10000) continue;
         int in_sdk = (za_sdk_base && v >= za_sdk_base && v < za_sdk_base + za_sdk_size);
         int in_main = (za_guest_base && v >= (unsigned long long)(uintptr_t)za_guest_base &&
                        v < (unsigned long long)(uintptr_t)za_guest_base + ZA_IMAGE_SIZE);
-        if (!in_sdk && !in_main) continue;
-        const unsigned char *p = (const unsigned char *)(uintptr_t)v;
+        unsigned char buf[160];
+        const unsigned char *p;
+        if (in_sdk || in_main) {
+            p = (const unsigned char *)(uintptr_t)v;
+        } else {
+            // 分块探读：整体 160 字节一读会因为跨页/尾部未映射而全丢
+            // （实测断言消息缓冲只有前几百字节可读）。
+            size_t got = 0;
+            int hit_nul = 0;
+            while (got + 8 <= sizeof buf - 1) {
+                unsigned long long w = 0;
+                if (!za_safe_rd(v + got, &w, 8)) break;
+                memcpy(buf + got, &w, 8);
+                got += 8;
+                if (memchr(&w, 0, 8)) { hit_nul = 1; break; }
+                if (got >= 128) break;
+            }
+            (void)hit_nul;
+            if (got < 2) continue;
+            buf[got] = 0;
+            p = buf;
+        }
         int ok = 0;
         for (int k = 0; k < 128; k++)
         {
