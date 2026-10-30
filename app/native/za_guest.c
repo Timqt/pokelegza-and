@@ -4620,6 +4620,10 @@ static void za_hook_m_rb_enter(unsigned long long *r);     // E12: 0xd7fa3c
 static void za_hook_m_rb_fdb0(unsigned long long *r);      // E12: 0xd7fa64
 static void za_hook_m_rb_d81f60(unsigned long long *r);    // E12: 0xd81f60
 static void za_hook_m_find(unsigned long long *r);         // E14: 0x1706640
+static void za_hook_m_vt0(unsigned long long *r);          // E16
+static void za_hook_m_vt1(unsigned long long *r);
+static void za_hook_m_vt2(unsigned long long *r);
+static void za_hook_m_vt3(unsigned long long *r);
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -4835,6 +4839,11 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd81f60,  ZA_MPROBE_STUB3,         ZA_MPROBE_SLOT + 0x100, za_hook_m_rb_d81f60);
         // E14：P 的哈希 find（只读遍历，不改变 count）
         za_install_main_probe(base, 0x1706640, ZA_MPROBE_STUB3 + 0x80,  ZA_MPROBE_SLOT + 0x108, za_hook_m_find);
+        // E16：P 类 vtable 剩余槽位 + 同族 0x16ffb40
+        za_install_main_probe(base, 0x255aec0, ZA_MPROBE_STUB3 + 0x100, ZA_MPROBE_SLOT + 0x110, za_hook_m_vt0);
+        za_install_main_probe(base, 0x255af80, ZA_MPROBE_STUB3 + 0x180, ZA_MPROBE_SLOT + 0x118, za_hook_m_vt1);
+        za_install_main_probe(base, 0x255af04, ZA_MPROBE_STUB3 + 0x200, ZA_MPROBE_SLOT + 0x120, za_hook_m_vt2);
+        za_install_main_probe(base, 0x16ffb40, ZA_MPROBE_STUB3 + 0x280, ZA_MPROBE_SLOT + 0x128, za_hook_m_vt3);
         // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
         //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
         //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
@@ -5170,6 +5179,8 @@ volatile unsigned long long za_n_rb[3];
 // E14：P 的哈希 find（0x1706640）调用次数——count 不变只证明没 remove，
 // find 不改变 count，必须单独数：0=真没人读，>0=有人查
 volatile unsigned long long za_n_find, za_n_find_p;
+// E16：P 类 vtable 其余槽位（0x255aec0/0x255af80/0x255af04）+ 同族 0x16ffb40
+volatile unsigned long long za_n_vt[4];
 // E3：命令转发器 0x255ae70（消费侧证据）+ 队列析构 0x1703390（拆证据）
 volatile unsigned long long za_n_fwd, za_n_qdtor;
 
@@ -5687,6 +5698,13 @@ void za_dump_progress_stall(void)
             extern volatile unsigned long long za_n_find, za_n_find_p;
             ZLOGE("★ E14 哈希find: 总=%llu 查P的=%llu",
                   (unsigned long long)za_n_find, (unsigned long long)za_n_find_p);
+        }
+        // E16：P 类 vtable 剩余槽位 + 同族 0x16ffb40 的执行次数
+        {
+            extern volatile unsigned long long za_n_vt[4];
+            ZLOGE("★ E16 槽位: aec0=%llu af80=%llu af04=%llu ffb40=%llu",
+                  (unsigned long long)za_n_vt[0], (unsigned long long)za_n_vt[1],
+                  (unsigned long long)za_n_vt[2], (unsigned long long)za_n_vt[3]);
         }
         // worker 真正在等的那个池对象：把 +0x2c0..+0x360 的关键字段全倒出来。
         //   前 4 个 64 位字就是「队列数组/数量/索引/停止标志」这几个；
@@ -6316,6 +6334,27 @@ static void za_hook_m_rb_d81f60(unsigned long long *r) { za_rb_log(r, 2, "d81f60
 
 // E14：哈希 find（0x1706640）入口。x0 = map 基址。
 // 如果 map == P+0x70 ⇒ 有人在查 P 的条目（「106 不降」不等于没人读）。
+// ── E16：P 类 vtable 剩余槽位 + 同族函数 ───────────────────────
+// 槽位表（main+0x3a29f48）：[0]=0x1703390 析构、[8]=0x17034c0 调整器、
+// [0x10]=0x255ae70 转发器（已知 19 次）、[0x18]=0x255aec0、[0x20]=0x255aef0
+// （尾跳 0x255af80）、[0x38]/[0x40] 调整器、[0x48]=0x255af04。
+// 若某个槽位 0 次 ⇒ 引擎本该调的排水/派发方法从未被调（或它就被设计成
+// 由别的路径调）。同族 0x16ffb40（与 0x16ffd70 同构、带 [queue+0x120] 开关）
+// 也一并数：它是「另一条 push 路径」，若 0 次 ⇒ 从未走过。
+static void za_vt_log(unsigned long long *r, int idx, const char *name)
+{
+    __atomic_add_fetch(&za_n_vt[idx], 1, __ATOMIC_RELAXED);
+    static int n[4];
+    if (n[idx]++ >= 2) return;
+    ZLOGI("★ E16 槽位 %s: x0=%#llx x1=%#llx lr=main+%#llx",
+          name, r[0], r[1],
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+static void za_hook_m_vt0(unsigned long long *r) { za_vt_log(r, 0, "vt[0x18]=0x255aec0"); }
+static void za_hook_m_vt1(unsigned long long *r) { za_vt_log(r, 1, "vt[0x20]→0x255af80"); }
+static void za_hook_m_vt2(unsigned long long *r) { za_vt_log(r, 2, "vt[0x48]=0x255af04"); }
+static void za_hook_m_vt3(unsigned long long *r) { za_vt_log(r, 3, "同族0x16ffb40"); }
+
 static void za_hook_m_find(unsigned long long *r)
 {
     __atomic_add_fetch(&za_n_find, 1, __ATOMIC_RELAXED);
