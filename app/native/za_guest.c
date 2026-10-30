@@ -5137,6 +5137,11 @@ static int za_vtguest_mode(void)
 //   E32 全量路由时启动就停摆：小块的调用频次极高，而当时分配器本身有
 //   「回收块可能小于请求」和「对齐后 free 找错头」两个 bug（已在 za_mem.c 修掉）。
 //   这轮先只让大块过新分配器，风险面最小。
+// ⚠ E42 真机 A/B：这条路**会让游戏在加载后期进入 SDK 的致命自旋**
+//   （sdk+0x9c580 是一条 `b .`）。打开后 NVN 的 490MB MemoryPool 落在
+//   0x4014746000（客机区），随后 buffer/texture 初始化完就 abort；不开则
+//   同一个池落在宿主堆（0xb4000074b846b000），没有这条自旋。
+//   ⇒ 大块路由只能用于**非 NVN** 的大分配；默认保持关闭，别拿它当修复。
 static int za_vtguest_big_mode(void)
 {
     static int m = -1;
