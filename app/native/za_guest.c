@@ -4073,6 +4073,40 @@ int za_free_ring_find(unsigned long long p, unsigned long *lr, long *tid, unsign
     return 0;
 }
 
+// ── E1b：按调用点拦截的释放隔离区（files/za-quar-free）──────────────
+// 待裁决假设：abort 前那串「拆容器」释放（6 个固定调用点）、以及
+// main+0x17042f4 释放监视对象（2026-10-30 watch 命中），到底是致命原因，
+// 还是「操作失败后的清理」？只保留这几个调用点 free 的块不真归还，其余
+// 释放完全不受影响 ⇒ 一轮对照就能看出 abort/停摆 消不消失。
+// 调用点来源：2026-10-30 释放环（main+0x…，两轮 abort 现场顺序几乎一致）。
+#define ZA_QFR_N 256
+static const unsigned long za_quar_free_lrs[] = {
+    0x1bafe78, 0x16e9964, 0xd97084, 0x176fc14, 0xf94688, 0x16c06d8, // 拆容器序列
+    0x17042f4,                                                       // 监视对象被释放现场
+};
+static void *za_qfr_ptr[ZA_QFR_N];
+static unsigned long za_qfr_lr[ZA_QFR_N];
+static int za_qfr_n, za_qfr_full;
+static __thread int za_qfr_busy;   // 隔离区里不能再打日志（logcat 自己会 malloc）
+static int za_quar_free_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-quar-free",
+                   F_OK) == 0;
+    return m;
+}
+// lr 是否落在关注调用点集合里。返回 main+偏移；0 = 不在（或不在 main 里）。
+static unsigned long za_quar_free_lr_off(unsigned long lr)
+{
+    unsigned long long gb = (unsigned long long)(uintptr_t)za_guest_base;
+    if (!gb || lr < gb || lr >= gb + ZA_IMAGE_SIZE) return 0;
+    unsigned long off = (unsigned long)(lr - gb);
+    for (size_t i = 0; i < sizeof(za_quar_free_lrs) / sizeof(za_quar_free_lrs[0]); i++)
+        if (off == za_quar_free_lrs[i]) return off;
+    return 0;
+}
+
 static void za_guest_free_impl(void *p)
 {
     unsigned long lr0 = ZA_CALLER_LR();
@@ -4081,6 +4115,32 @@ static void za_guest_free_impl(void *p)
     {
         int w = za_watch_hit((unsigned long long)(uintptr_t)p);
         if (w) za_watch_log_free(p, lr0, w);
+    }
+    if (za_quar_free_mode()) {
+        unsigned long off = za_quar_free_lr_off(lr0);
+        if (off) {
+            if (za_qfr_n < ZA_QFR_N) {
+                za_qfr_ptr[za_qfr_n] = p;
+                za_qfr_lr[za_qfr_n] = lr0;
+                za_qfr_n++;
+                if (!za_qfr_busy && (za_qfr_n <= 16 || (za_qfr_n & 63) == 0)) {
+                    za_qfr_busy = 1;
+                    ZLOGE("★ [quar-free] 保留 %p（main+%#lx，第 %d 块）",
+                          p, off, za_qfr_n);
+                    za_qfr_busy = 0;
+                }
+                return;          // 不归还：裁决「释放是原因还是清理」
+            }
+            if (!za_qfr_full) {
+                za_qfr_full = 1;
+                if (!za_qfr_busy) {
+                    za_qfr_busy = 1;
+                    ZLOGE("★ [quar-free] 隔离区满（%d 块），关注释放改为照常归还",
+                          ZA_QFR_N);
+                    za_qfr_busy = 0;
+                }
+            }
+        }
     }
     if (!za_alloc_mode()) { za_musl_free(p); return; }
     za_hdr_t h;

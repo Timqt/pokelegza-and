@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PKG = "org.pokelegza.android.port"
 DEV = os.environ.get("ZA_DEVICE", "SCXOHA8TCUN7RWJ7")
 ACT = PKG + "/android.app.NativeActivity"
-MARKS = ["takeover", "quarantine", "nop-fill", "null-dangle", "kill-thread",
+MARKS = ["takeover", "quarantine", "quar-free", "nop-fill", "null-dangle", "kill-thread",
          "lqgrow", "fakewake", "no-lqgrow", "no-nullrecover"]
 LOG_DIR = ROOT / "work" / "device"
 # ⚠ 必须用**绝对路径**：run-as 的 sh -c 经过 adb 再转一层引号后，相对路径
@@ -99,6 +99,18 @@ def main():
           % (count(r"Texture 0x"), last(r"着色器自检累计：命中 (\d+)"),
              last(r"signal 0x[0-9a-f]+ pc=0x[0-9a-f]+ seg=\w+ off=0x[0-9a-f]+")))
     print("帧管线: %s" % last(r"★ 帧管线：.*"))
+    # E1 判据：提前释放族（fs 隔离 / 调用点隔离 / 监视命中）+ abort/停摆形态。
+    # 三轮同构建对比：base vs quarantine（fs/vt ≥32KB）vs quar-free（按调用点）。
+    print("E1隔离: fs隔离 %d 块 | 调用点隔离 %d 块 | 监视对象被释放 %d 次"
+          % (count(r"\[fs-quarantine\] 保留"), count(r"\[quar-free\] 保留"),
+             count(r"监视对象被释放")))
+    print("E1现场: abort释放环 %d 次 | 停摆释放环 %d 次 | abort帧 %d 行(主现场0x102d3dc ×%d) | 停摆同PC %d 次"
+          % (count(r"新→旧）abort 现场"), count(r"新→旧）停摆现场"),
+             count(r"abort fp\["), count(r"102d3dc"), count(r"停在同一 PC")))
+    print("E1监视: %s" % last(r"监视对象被释放 #\d+：p=\S+ 释放者 lr=\S+"))
+    if "quar-free" in active:
+        sites = sorted(set(re.findall(r"\[quar-free\] 保留 \S+（(main\+\S+?)，", raw)))
+        print("调用点隔离明细: %s" % (" ".join(sites) if sites else "(无)"))
     print("降级: 悬空读 %d / 悬空写 %d / 野调用 %d / 首次坏读 %d"
           % (count(r"悬空读取→置0"), count(r"悬空写入→安全页"),
              count(r"野调用→按返回0"), count(r"首个坏读调用链")))
