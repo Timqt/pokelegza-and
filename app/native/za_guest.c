@@ -74,6 +74,15 @@ unsigned char *za_guest_base = NULL;
 // E22：悬空读地址记录（信号处理器只裸写；归属由看门狗线程事后查 maps）。
 volatile unsigned long long za_dangle_addr[8];
 volatile unsigned int za_dangle_n;
+// E26：释放环本体提前到这里 —— 信号处理器里要把 za_fr_pos（释放序列号，
+// 等价时间戳）与悬空读地址一起记下，之后和环里条目对齐判定是不是
+// 「同一个释放-复用窗口」。
+#define ZA_FR_N 256
+typedef struct { unsigned long long p, sz, vt; unsigned long lr; long tid; } za_fr_t;
+static za_fr_t za_fr[ZA_FR_N];
+static volatile unsigned za_fr_pos;
+// 悬空读发生时的释放序列号（0 = 未记录）
+volatile unsigned za_dangle_frpos[8];
 volatile int za_stage_m5;                 /* M5 之后才允许「别名句柄」CMIF 应答 */
 volatile unsigned long za_sdk_base = 0;
 volatile unsigned long za_sdk_size = 0;
@@ -1434,6 +1443,9 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                                                                       __ATOMIC_RELAXED);
                                     if (dn < 8) {
                                         za_dangle_addr[dn] = saddr;
+                                        // E26：同时记释放序列号（=时间戳）
+                                        za_dangle_frpos[dn] =
+                                            __atomic_load_n(&za_fr_pos, __ATOMIC_RELAXED);
                                         __atomic_store_n(&za_dangle_n, dn + 1,
                                                          __ATOMIC_RELAXED);
                                     }
@@ -4033,12 +4045,7 @@ static void za_watch_log_free(void *p, unsigned long lr0, int which)
 //   —— 对象在还被引用时就被释放了。而 fs/vtable 那条释放路径直接调宿主 free，
 //   根本不进 za_guest_free_impl，所以光在导入表上打日志看不到它。
 //   这里把所有释放（两条路径都记）压进定长环，abort/停摆时倒出来对照地址。
-#define ZA_FR_N 256
-// vt = 块首 8 字节（C++ 对象的 vtable）。有了它才能回答「被释放的是哪一类对象」，
-// 也才能在 abort 现场的 x21/x19 与释放记录之间对上号。
-typedef struct { unsigned long long p, sz, vt; unsigned long lr; long tid; } za_fr_t;
-static za_fr_t za_fr[ZA_FR_N];
-static volatile unsigned za_fr_pos;
+// ★ E26：环本体提到文件顶部（信号处理器里要读 za_fr_pos 当时间戳），见上方。
 
 void za_free_ring_add(void *p, unsigned long long sz, unsigned long lr)
 {
@@ -5738,6 +5745,27 @@ void za_dump_progress_stall(void)
                 unsigned long long a = za_dangle_addr[i];
                 za_maps_near(a, m, sizeof m);
                 ZLOGE("★ E22 悬空读#%u addr=%#llx 归属：%s", i, a, m);
+                // E26：与释放环对齐——同页最近一次释放及其序列号
+                {
+                    unsigned pos = za_dangle_frpos[i];
+                    unsigned cur = __atomic_load_n(&za_fr_pos, __ATOMIC_RELAXED);
+                    unsigned have = cur < ZA_FR_N ? cur : ZA_FR_N;
+                    int found = 0;
+                    for (unsigned k = 0; k < have; k++) {
+                        unsigned idx = (cur - 1 - k) % ZA_FR_N;
+                        const za_fr_t *e = &za_fr[idx];
+                        if ((e->p & ~0xfffull) != (a & ~0xfffull)) continue;
+                        ZLOGE("   E26 同页释放: p=%#llx lr=%#lx tid=%ld 序列=%u；"
+                              "悬空读时序列=%u ⇒ %s",
+                              e->p, e->lr, e->tid, cur - 1 - k, pos,
+                              pos ? (pos >= cur - 1 - k ? "释放发生在读之前（同一窗口）"
+                                                        : "读在释放之前（竞态另一侧）")
+                                  : "环已绕圈，无法对齐");
+                        found = 1;
+                        break;
+                    }
+                    if (!found) ZLOGE("   E26 同页无释放记录（非由可见释放造成）");
+                }
             }
         }
         // E14：哈希 find 总次数 + 其中落在 P+0x70 的次数
