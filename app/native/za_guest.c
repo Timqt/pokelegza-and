@@ -5616,6 +5616,13 @@ static void za_hook_m_enq3(unsigned long long *r)
     }
     ZLOGI("★ 真正入队 0x16ffeb0: x0=%#llx x1=%#llx x2=%#llx vt=%#llx 数量=%llu idx=%#llx lr=%#llx",
           r[0], r[1], r[2], vt, cnt, idx, r[19]);
+    // ★ 2026-10-30：停摆后这个队列对象在 /proc/self/maps 里已经**不可读**。
+    //   到底是「入队当时就已是死对象」还是「之后才释放」，只能在入队点看一次。
+    {
+        char m[220];
+        za_maps_near(r[0], m, sizeof m);
+        ZLOGI("★ 入队目标归属：%s", m);
+    }
 }
 
 // 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。
