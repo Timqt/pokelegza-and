@@ -4571,6 +4571,7 @@ static void za_load_host_libs(void)
 #define ZA_MPROBE_SLOT  0x6049000u
 #define ZA_MPROBE_STUB2 0x604A000u   // E2b 第二桩页（bss 区，装上后补 RX）
 static void za_hook_m_poolinit(unsigned long long *r);
+static void za_dump_mpsc_lanes(unsigned long long q, const char *when);   // E6
 static void za_hook_m_poolloop(unsigned long long *r);
 static void za_hook_m_w2(unsigned long long *r);
 static void za_hook_m_w3(unsigned long long *r);
@@ -4589,6 +4590,7 @@ static void za_hook_m_reach940(unsigned long long *r);  // E2b: 0xd7f940 构造�
 static void za_hook_m_allocbail(unsigned long long *r); // E2b: 0xd7fa98 分配弃单
 static void za_hook_m_fwd(unsigned long long *r);       // E3: 0x255ae70 命令转发器
 static void za_hook_m_qdtor(unsigned long long *r);     // E3: 0x1703390 队列析构
+static void za_hook_m_picker(unsigned long long *r);    // E7: 0x194e850 派发侧选命令
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -4775,6 +4777,8 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         // E3：消费侧（命令转发器）+ 拆证据（队列析构）
         za_install_main_probe(base, 0x255ae70, ZA_MPROBE_STUB2 + 0x180, ZA_MPROBE_SLOT + 0x98, za_hook_m_fwd);
         za_install_main_probe(base, 0x1703390, ZA_MPROBE_STUB2 + 0x200, ZA_MPROBE_SLOT + 0xA0, za_hook_m_qdtor);
+        // E7：派发侧选命令入口——x0=派发器查询的容器，与被 push 的容器对账
+        za_install_main_probe(base, 0x194e850, ZA_MPROBE_STUB2 + 0x280, ZA_MPROBE_SLOT + 0xA8, za_hook_m_picker);
         // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
         //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
         //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
@@ -5604,23 +5608,8 @@ void za_dump_progress_stall(void)
             // ⇒ 87 个未消费命令的下落（入哈希没入环 / 或在无人认领的 lane）。
             {
                 unsigned long long vt2 = *(volatile unsigned long long *)(uintptr_t)q;
-                if (vt2 == 0x103a29f48ull) {   // push 时记录的这个类才按 lane 布局倒
-                    for (int lane = 0; lane < 8; lane++) {
-                        unsigned long long base = q + (unsigned long long)lane * 0x80;
-                        unsigned long long tbl = 0, mod = 0, cb = 0, ce = 0;
-                        memcpy(&tbl, (const void *)(uintptr_t)(base + 0x08), 8);
-                        memcpy(&mod, (const void *)(uintptr_t)(base + 0x10), 8);
-                        unsigned long long *rp = NULL;
-                        memcpy(&rp, (const void *)(uintptr_t)(base + 0x40), 8);
-                        if (ZA_PTR_OK((unsigned long long)(uintptr_t)rp)) {
-                            memcpy(&cb, (const void *)(uintptr_t)rp, 8);
-                            memcpy(&ce, (const void *)(uintptr_t)((unsigned long long)(uintptr_t)rp + 8), 8);
-                        }
-                        ZLOGE("   lane%d: 桶表=%#llx 取模=%#llx 环[%#llx]=%llu,%llu 待=%lld",
-                              lane, tbl, mod, (unsigned long long)(uintptr_t)rp, cb, ce,
-                              (long long)(ce - cb));
-                    }
-                }
+                if (vt2 == 0x103a29f48ull)   // push 时记录的这个类才按 lane 布局倒
+                    za_dump_mpsc_lanes(q, "停摆时");
             }
         }
         // 「谁认识这个池对象」：扫全线程栈找出持有它的线程。
@@ -5890,6 +5879,34 @@ static void za_hook_m_enq2(unsigned long long *r)
 // ① 任务没进这个队列，还是 ② 进了但没人取，看这几个字段就能分辨。
 // （变量本体定义在 za_job_by_tid 旁边，供停摆快照跨函数读取。）
 
+// E6：倒 MPSC 容器（vt 0x3a29f48）8 条 lane 的状态。push 时与停摆时各倒一次：
+// push 时就缺 ⇒ 构造缺口；push 时全有、停摆时缺 ⇒ 事后被改坏/拆掉。
+// 环指针做 /proc/self/maps 归属（E5 实测 lane5 的环 begin=136>end=5 待=-131，
+// 需要判「野指针 vs 上一代结构残骸」）。
+static void za_dump_mpsc_lanes(unsigned long long q, const char *when)
+{
+    for (int lane = 0; lane < 8; lane++) {
+        unsigned long long base = q + (unsigned long long)lane * 0x80;
+        unsigned long long tbl = 0, mod = 0, cb = 0, ce = 0, rp = 0;
+        // ⚠ 全部探读：lane 字段可能是垃圾值（E5 实测 lane5 的环指针能过
+        //   ZA_PTR_OK 但指向未映射页，裸 memcpy 把进程打死过一轮）。
+        za_read_bytes((unsigned long)(base + 0x08), &tbl, 8);
+        za_read_bytes((unsigned long)(base + 0x10), &mod, 8);
+        za_read_bytes((unsigned long)(base + 0x40), &rp, 8);
+        if (ZA_PTR_OK(rp)) {
+            za_read_bytes((unsigned long)rp, &cb, 8);
+            za_read_bytes((unsigned long)(rp + 8), &ce, 8);
+        }
+        ZLOGE("   [%s]lane%d: 桶表=%#llx 取模=%#llx 环[%#llx]=%llu,%llu 待=%lld",
+              when, lane, tbl, mod, rp, cb, ce, (long long)(ce - cb));
+        if (ZA_PTR_OK(rp)) {
+            char m[220];
+            za_maps_near(rp, m, sizeof m);
+            ZLOGE("      环归属：%s", m);
+        }
+    }
+}
+
 static void za_hook_m_enq3(unsigned long long *r)
 {
     // E3：第一次 push 时倒队列类的**真字段**。停摆快照那份会被地址复用污染
@@ -5921,6 +5938,8 @@ static void za_hook_m_enq3(unsigned long long *r)
                 ZLOGE("★ E3 项字段: +8=%#llx +10=%#llx +18=%u +1a=%u",
                       e8, e10, (unsigned)e18, (unsigned)e1a);
             }
+            // E6：push 时刻的 lane 全景（与停摆时对照 ⇒ 判「构造缺口」还是「事后改坏」）
+            za_dump_mpsc_lanes(r[0], "push时");
         }
     }
     za_enq_queue = r[0];
@@ -6068,6 +6087,28 @@ static void za_hook_m_qdtor(unsigned long long *r)
           r[0], vt,
           za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19],
           (long)syscall(SYS_gettid));
+}
+
+// E7：0x194e850（派发侧「按 lane 哈希桶选命令」）入口。
+// x0 = 派发器查询的容器、x1 = worker 描述（[desc+0x28]=lane）。
+// 与 enq3 记录的「被 push 容器」对账：两个地址不同 ⇒ 106 个命令推进了
+// 一个派发器从不读的容器（推错队列的精确形态）。
+static void za_hook_m_picker(unsigned long long *r)
+{
+    static int n;
+    if (n++ >= 8) return;
+    unsigned char lane = 0xFF;
+    unsigned long long vt = 0;
+    if (ZA_PTR_OK(r[1]))
+        za_read_bytes((unsigned long)(r[1] + 0x28), &lane, 1);   // ldrb w8,[desc+0x28]
+    if (ZA_PTR_OK(r[0]))
+        za_read_bytes((unsigned long)r[0], &vt, 8);
+    extern volatile unsigned long long za_enq_queue;
+    ZLOGE("★ E7 派发侧选命令: 容器=%#llx（被push容器=%#llx %s）lane=%u vt=%#llx lr=main+%#llx",
+          r[0], za_enq_queue,
+          r[0] == za_enq_queue ? "同一个" : "★不同★",
+          (unsigned)lane, vt,
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
 }
 
 // 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。
