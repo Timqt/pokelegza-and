@@ -4587,6 +4587,8 @@ static void za_hook_m_brancha(unsigned long long *r);   // E2: 0xa6a2e0
 static void za_hook_m_f2d0(unsigned long long *r);      // E2b: 0xd7f2d0 入口
 static void za_hook_m_reach940(unsigned long long *r);  // E2b: 0xd7f940 构造前
 static void za_hook_m_allocbail(unsigned long long *r); // E2b: 0xd7fa98 分配弃单
+static void za_hook_m_fwd(unsigned long long *r);       // E3: 0x255ae70 命令转发器
+static void za_hook_m_qdtor(unsigned long long *r);     // E3: 0x1703390 队列析构
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -4770,6 +4772,9 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd7f2d0,  ZA_MPROBE_STUB2,        ZA_MPROBE_SLOT + 0x80, za_hook_m_f2d0);
         za_install_main_probe(base, 0xd7f940,  ZA_MPROBE_STUB2 + 0x80, ZA_MPROBE_SLOT + 0x88, za_hook_m_reach940);
         za_install_main_probe(base, 0xd7fa98,  ZA_MPROBE_STUB2 + 0x100, ZA_MPROBE_SLOT + 0x90, za_hook_m_allocbail);
+        // E3：消费侧（命令转发器）+ 拆证据（队列析构）
+        za_install_main_probe(base, 0x255ae70, ZA_MPROBE_STUB2 + 0x180, ZA_MPROBE_SLOT + 0x98, za_hook_m_fwd);
+        za_install_main_probe(base, 0x1703390, ZA_MPROBE_STUB2 + 0x200, ZA_MPROBE_SLOT + 0xA0, za_hook_m_qdtor);
         // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
         //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
         //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
@@ -5090,6 +5095,8 @@ volatile unsigned long long za_n_ctor, za_n_push, za_n_brancha;
 volatile unsigned long long za_n_push_sw0;      // push 入口里开关字节==0 的次数
 // E2b 二分：0xd7f2d0 入口 → 0xd7f940（构造前）→ ctor/push / 0xd7fa98（分配弃单）
 volatile unsigned long long za_n_f2d0, za_n_reach940, za_n_allocbail;
+// E3：命令转发器 0x255ae70（消费侧证据）+ 队列析构 0x1703390（拆证据）
+volatile unsigned long long za_n_fwd, za_n_qdtor;
 
 // 停摆时做一次（仅一次）：在客机堆里搜主线程等的那个任务对象。
 //   找得到 ⇒ 它确实被挂进了某个队列（该队列的 worker 才是该被唤醒的人）；
@@ -5565,6 +5572,12 @@ void za_dump_progress_stall(void)
         ZLOGE("★ E2b 二分: f2d0入口=%llu 构造前=%llu 分配弃单=%llu",
               (unsigned long long)za_n_f2d0, (unsigned long long)za_n_reach940,
               (unsigned long long)za_n_allocbail);
+        // E3 消费侧：转发器=0 且队列析构>0 ⇒ 命令进了队列但消费者从未跑、队列被拆。
+        {
+            extern volatile unsigned long long za_n_fwd, za_n_qdtor;
+            ZLOGE("★ E3 消费侧: 命令转发器=%llu 队列析构=%llu",
+                  (unsigned long long)za_n_fwd, (unsigned long long)za_n_qdtor);
+        }
         // worker 真正在等的那个池对象：把 +0x2c0..+0x360 的关键字段全倒出来。
         //   前 4 个 64 位字就是「队列数组/数量/索引/停止标志」这几个；
         //   只要和入队对象的字段对不上，就说明两头用的不是同一个池。
@@ -5854,6 +5867,37 @@ static void za_hook_m_enq2(unsigned long long *r)
 
 static void za_hook_m_enq3(unsigned long long *r)
 {
+    // E3：第一次 push 时倒队列类的**真字段**。停摆快照那份会被地址复用污染
+    // （实测 push 时 vt=main+0x3a29f48，5 分钟后同地址已是 vt=main+0x3a3e140 的
+    // 别的对象）。这里读的才是这个队列类自己的布局。
+    {
+        static int nq;
+        if (nq++ == 0 && ZA_PTR_OK(r[0])) {
+            unsigned long long vt = 0, l0 = 0, l1 = 0;
+            unsigned long long a110 = 0, af0 = 0, a8 = 0;
+            unsigned char sw = 0;
+            memcpy(&vt, (const void *)(uintptr_t)r[0], 8);
+            memcpy(&l0, (const void *)(uintptr_t)(r[0] + 0xe0), 8);
+            memcpy(&l1, (const void *)(uintptr_t)(r[0] + 0xe8), 8);
+            memcpy(&sw, (const void *)(uintptr_t)(r[0] + 0x120), 1);
+            memcpy(&a110, (const void *)(uintptr_t)(r[0] + 0x110), 8);
+            memcpy(&af0, (const void *)(uintptr_t)(r[0] + 0xf0), 8);
+            memcpy(&a8, (const void *)(uintptr_t)(r[0] + 0xa8), 8);
+            ZLOGE("★ E3 push时队列真字段: q=%#llx vt=%#llx 锁头[+e0]=%#llx,%#llx "
+                  "开关[+120]=%u +110=%#llx +f0=%#llx +a8=%#llx 项=%#llx",
+                  r[0], vt, l0, l1, (unsigned)sw, a110, af0, a8, r[1]);
+            if (ZA_PTR_OK(r[1])) {
+                unsigned long long e8 = 0, e10 = 0;
+                unsigned short e18 = 0, e1a = 0;
+                memcpy(&e8,  (const void *)(uintptr_t)(r[1] + 8), 8);
+                memcpy(&e10, (const void *)(uintptr_t)(r[1] + 0x10), 8);
+                memcpy(&e18, (const void *)(uintptr_t)(r[1] + 0x18), 2);
+                memcpy(&e1a, (const void *)(uintptr_t)(r[1] + 0x1a), 2);
+                ZLOGE("★ E3 项字段: +8=%#llx +10=%#llx +18=%u +1a=%u",
+                      e8, e10, (unsigned)e18, (unsigned)e1a);
+            }
+        }
+    }
     za_enq_queue = r[0];
     __atomic_add_fetch(&za_enq_count, 1, __ATOMIC_RELAXED);
     static int n;
@@ -5961,6 +6005,44 @@ static void za_hook_m_allocbail(unsigned long long *r)
     ZLOGE("★ E2b 分配弃单 0xd7fa98！x22=%#llx lr=main+%#llx",
           r[16],
           za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+
+// ── E3：消费侧证据 ─────────────────────────────────────────────
+// 队列类 vt[+0x10]=0x255ae70 是「执行一条命令」的转发器（读命令对象 +8/+0x10/
+// +0x18/+0x1a，转发到 [目标+0x18]）。106 个命令推给了它所属的队列；如果这里
+// 从不触发 ⇒ 消费者线程/派发循环根本不存在，队列饿死。
+static void za_hook_m_fwd(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_fwd, 1, __ATOMIC_RELAXED);
+    static int n;
+    if (n++ >= 4) return;
+    unsigned long long vt = 0, p8 = 0, p10 = 0;
+    unsigned short w18 = 0, w1a = 0;
+    if (ZA_PTR_OK(r[0])) {
+        memcpy(&vt, (const void *)(uintptr_t)r[0], 8);
+        memcpy(&p8, (const void *)(uintptr_t)(r[0] + 8), 8);
+        memcpy(&p10, (const void *)(uintptr_t)(r[0] + 0x10), 8);
+        memcpy(&w18, (const void *)(uintptr_t)(r[0] + 0x18), 2);
+        memcpy(&w1a, (const void *)(uintptr_t)(r[0] + 0x1a), 2);
+    }
+    ZLOGI("★ E3 命令转发器 0x255ae70: 命令=%#llx vt=%#llx +8=%#llx +10=%#llx +18=%u +1a=%u lr=main+%#llx",
+          r[0], vt, p8, p10, (unsigned)w18, (unsigned)w1a,
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+
+// 队列析构（vt[0]/[8]）：它的存在 = 引擎主动拆掉这个队列类对象（+0x110/+0xf0
+// 成员销毁、+0xa8 缓冲释放）。若它在 push 后不久触发，说明「结构被拆」是引擎行为。
+static void za_hook_m_qdtor(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_qdtor, 1, __ATOMIC_RELAXED);
+    static int n;
+    if (n++ >= 4) return;
+    unsigned long long vt = 0;
+    if (ZA_PTR_OK(r[0])) memcpy(&vt, (const void *)(uintptr_t)r[0], 8);
+    ZLOGI("★ E3 队列析构 0x1703390: obj=%#llx vt=%#llx lr=main+%#llx tid=%ld",
+          r[0], vt,
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19],
+          (long)syscall(SYS_gettid));
 }
 
 // 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。

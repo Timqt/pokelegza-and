@@ -42,3 +42,7 @@ Thumbs.db
 temp/
 tmp/
 _*.txt
+
+# ── autoresearch 会话状态（不入库）──────────────────────────────
+.auto/
+autoresearch-dashboard.html
