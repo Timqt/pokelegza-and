@@ -158,6 +158,12 @@ static void za_hook_abort_entry(unsigned long long *r)
     static int n;
     za_probe_log("abort-entry", r);
     if (n++ >= 3) return;
+    // 先倒释放环：abort 现场里分配器对象 x21 常常已经不可读，
+    // 只有「最近谁 free 了什么」能解释它为什么没了。
+    {
+        extern void za_free_ring_dump(const char *why, int n);
+        za_free_ring_dump("abort 现场", 14);
+    }
     unsigned long long fp = r[18];
     for (int i = 0; i < 14 && fp; i++)
     {

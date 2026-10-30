@@ -3954,10 +3954,101 @@ static int za_hdr_get(void *p, za_hdr_t *out)
     out->base = h->base;
     return 1;
 }
+// ★ 2026-10-30：抓「等待期间对象被谁释放」。
+//   真机实测：主线程阻塞在某个 job 对象的条件变量上（state 还是 1），几分钟后
+//   再读那个对象已经**不可读** —— 等待者还睡着，对象已经被 free 了。
+//   停摆快照会把「还没完成」的对象登记进来；此后任何落在
+//   [addr-0x800, addr+0x800] 的 free 都记一条（释放者 lr + 线程），
+//   用来找出「谁在等待期间把对象销毁了」。
+#define ZA_WATCH_N 8
+static volatile unsigned long long za_watch_base[ZA_WATCH_N];
+static volatile int za_watch_used;
+static __thread int za_watch_busy;      // 日志里不能再 malloc（会递归进 free）
+
+void za_watch_free_register(unsigned long long a)
+{
+    if (!a) return;
+    int n = __atomic_load_n(&za_watch_used, __ATOMIC_RELAXED);
+    if (n > ZA_WATCH_N) n = ZA_WATCH_N;
+    for (int i = 0; i < n; i++)
+        if (za_watch_base[i] == a) return;          // 已登记
+    int k = __atomic_fetch_add(&za_watch_used, 1, __ATOMIC_RELAXED);
+    if (k < ZA_WATCH_N) za_watch_base[k] = a;
+}
+static int za_watch_hit(unsigned long long p)
+{
+    int n = __atomic_load_n(&za_watch_used, __ATOMIC_RELAXED);
+    if (n > ZA_WATCH_N) n = ZA_WATCH_N;
+    for (int i = 0; i < n; i++) {
+        unsigned long long b = za_watch_base[i];
+        if (!b) continue;
+        if (p + 0x800 >= b && p <= b + 0x800) return i + 1;
+    }
+    return 0;
+}
+static void za_watch_log_free(void *p, unsigned long lr0, int which)
+{
+    if (za_watch_busy) return;
+    za_watch_busy = 1;
+    char b[192];
+    int n = snprintf(b, sizeof b,
+                     "★ 监视对象被释放 #%d：p=%p 基准=%#llx 差=%+lld tid=%ld 释放者 lr=%#lx",
+                     which - 1, p, za_watch_base[which - 1],
+                     (long long)((unsigned long long)(uintptr_t)p - za_watch_base[which - 1]),
+                     (long)syscall(SYS_gettid), lr0);
+    if (n > 0) ZLOGE("%s", b);
+    za_watch_busy = 0;
+}
+
+// ★ 2026-10-30：释放环形缓冲。abort 现场里出现过「分配器对象 x21 已经不可读」
+//   —— 对象在还被引用时就被释放了。而 fs/vtable 那条释放路径直接调宿主 free，
+//   根本不进 za_guest_free_impl，所以光在导入表上打日志看不到它。
+//   这里把所有释放（两条路径都记）压进定长环，abort/停摆时倒出来对照地址。
+#define ZA_FR_N 256
+typedef struct { unsigned long long p, sz; unsigned long lr; long tid; } za_fr_t;
+static za_fr_t za_fr[ZA_FR_N];
+static volatile unsigned za_fr_pos;
+
+void za_free_ring_add(void *p, unsigned long long sz, unsigned long lr)
+{
+    unsigned i = __atomic_fetch_add(&za_fr_pos, 1, __ATOMIC_RELAXED);
+    za_fr_t *e = &za_fr[i % ZA_FR_N];
+    e->p = (unsigned long long)(uintptr_t)p;
+    e->sz = sz;
+    e->lr = lr;
+    e->tid = (long)syscall(SYS_gettid);
+}
+
+void za_free_ring_dump(const char *why, int n)
+{
+    unsigned pos = __atomic_load_n(&za_fr_pos, __ATOMIC_RELAXED);
+    unsigned have = pos < ZA_FR_N ? pos : ZA_FR_N;
+    if (n > (int)have) n = (int)have;
+    unsigned long long gb = (unsigned long long)(uintptr_t)za_guest_base;
+    unsigned long long sb = za_sdk_base;
+    ZLOGE("★ 释放环（最近 %d 次，新→旧）%s：", n, why ? why : "");
+    for (int i = 1; i <= n; i++) {
+        const za_fr_t *e = &za_fr[(pos - i) % ZA_FR_N];
+        if (gb && e->lr >= gb && e->lr < gb + ZA_IMAGE_SIZE)
+            ZLOGE("   p=%#llx sz=%llu lr=main+%#lx tid=%ld",
+                  e->p, e->sz, e->lr - gb, e->tid);
+        else if (sb && e->lr >= sb && e->lr < sb + za_sdk_size)
+            ZLOGE("   p=%#llx sz=%llu lr=sdk+%#lx tid=%ld",
+                  e->p, e->sz, e->lr - sb, e->tid);
+        else
+            ZLOGE("   p=%#llx sz=%llu lr=%#lx tid=%ld", e->p, e->sz, e->lr, e->tid);
+    }
+}
+
 static void za_guest_free_impl(void *p)
 {
     unsigned long lr0 = ZA_CALLER_LR();
     if (!p) return;
+    za_free_ring_add(p, 0, lr0);
+    {
+        int w = za_watch_hit((unsigned long long)(uintptr_t)p);
+        if (w) za_watch_log_free(p, lr0, w);
+    }
     if (!za_alloc_mode()) { za_musl_free(p); return; }
     za_hdr_t h;
     if (!za_hdr_get(p, &h)) { za_musl_free(p); return; }
@@ -4690,7 +4781,20 @@ static void za_fs_guard_free(void *p, const char *who)
 {
     size_t sz = 0;
     if (!p) return;
-    if (za_fs_set_take(p, &sz)) {
+    int owned = za_fs_set_take(p, &sz);
+    {
+        extern void za_free_ring_add(void *p, unsigned long long sz, unsigned long lr);
+        unsigned long lr0;
+#if defined(__aarch64__)
+        __asm__ __volatile__("mov %0, x30" : "=r"(lr0));
+#else
+        lr0 = 0;
+#endif
+        za_free_ring_add(p, (unsigned long long)sz, lr0);
+        int w = za_watch_hit((unsigned long long)(uintptr_t)p);
+        if (w) za_watch_log_free(p, lr0, w);
+    }
+    if (owned) {
         if (za_fq_mode() && sz >= 32768 && za_fq_n < ZA_FQN) {
             za_fq_ptr[za_fq_n] = p;
             za_fq_sz[za_fq_n] = sz;
@@ -5530,6 +5634,11 @@ void za_dump_job_states(void)
         else if (gb && lr >= gb) { w = "main+"; off = lr - gb; }
         ZLOGE("    obj=%#llx state=%#llx mutex(+118)=%#llx cv(+138)=%#llx 调用者=%s%#lx",
               o, st, m, cv, w, off);
+        // 还没完成 ⇒ 盯住它的释放（真机实测：等待者睡着时对象被 free 掉）
+        if (o && st != 5) {
+            extern void za_watch_free_register(unsigned long long a);
+            za_watch_free_register(o);
+        }
     }
 }
 
@@ -5616,6 +5725,12 @@ static void za_hook_m_enq3(unsigned long long *r)
     }
     ZLOGI("★ 真正入队 0x16ffeb0: x0=%#llx x1=%#llx x2=%#llx vt=%#llx 数量=%llu idx=%#llx lr=%#llx",
           r[0], r[1], r[2], vt, cnt, idx, r[19]);
+    // 入队目标事后被释放过（停摆时已不可读）⇒ 同样盯住它
+    {
+        extern void za_watch_free_register(unsigned long long a);
+        za_watch_free_register(r[0]);
+        za_watch_free_register(r[1]);
+    }
     // ★ 2026-10-30：停摆后这个队列对象在 /proc/self/maps 里已经**不可读**。
     //   到底是「入队当时就已是死对象」还是「之后才释放」，只能在入队点看一次。
     {
