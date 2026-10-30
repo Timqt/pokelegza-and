@@ -4784,12 +4784,9 @@ static void za_fs_guard_free(void *p, const char *who)
     int owned = za_fs_set_take(p, &sz);
     {
         extern void za_free_ring_add(void *p, unsigned long long sz, unsigned long lr);
-        unsigned long lr0;
-#if defined(__aarch64__)
-        __asm__ __volatile__("mov %0, x30" : "=r"(lr0));
-#else
-        lr0 = 0;
-#endif
+        // ⚠ 不能用内联 asm 读 x30：函数中途 x30 已被调用者约定的临时用途改掉，
+        //   实测记下来的是记录函数自己的地址（0x11cce8 = za_free_ring_add）。
+        unsigned long lr0 = (unsigned long)(uintptr_t)__builtin_return_address(0);
         za_free_ring_add(p, (unsigned long long)sz, lr0);
         int w = za_watch_hit((unsigned long long)(uintptr_t)p);
         if (w) za_watch_log_free(p, lr0, w);
@@ -5358,6 +5355,18 @@ void za_dump_progress_stall(void)
     za_unstick_main_job_spin();
     // 反射注册表成环（主线程 100% CPU 于 main+0xa8d484）：切断闭环那一跳。
     za_unstick_lru_cycle();
+    // 停摆现场也倒一次释放环：主线程在 main+0x5d7128 位图池找空槽自旋时，
+    // 只有「最近释放了什么」能解释槽位/链为什么变成这样。只倒前两轮。
+    {
+        // ⚠ 头两轮快照在启动 0.2 秒时就触发了，那时还没有任何释放；
+        //   取第 3/8 轮（真的停摆之后）才有内容。
+        static int fr;
+        fr++;
+        if (fr == 3 || fr == 8) {
+            extern void za_free_ring_dump(const char *why, int n);
+            za_free_ring_dump("停摆现场", 18);
+        }
+    }
     {
         // 实验开关：files/za-lqgrow —— 把塞满的消息队列扩容，破「队满→生产者全堵」。
         static int lg = -1;
