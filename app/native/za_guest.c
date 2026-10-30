@@ -4619,6 +4619,7 @@ static void za_hook_m_sub4(unsigned long long *r);
 static void za_hook_m_rb_enter(unsigned long long *r);     // E12: 0xd7fa3c
 static void za_hook_m_rb_fdb0(unsigned long long *r);      // E12: 0xd7fa64
 static void za_hook_m_rb_d81f60(unsigned long long *r);    // E12: 0xd81f60
+static void za_hook_m_find(unsigned long long *r);         // E14: 0x1706640
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -4832,6 +4833,8 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd7fa3c,  ZA_MPROBE_STUB2 + 0x700, ZA_MPROBE_SLOT + 0xF0, za_hook_m_rb_enter);
         za_install_main_probe(base, 0xd7fa64,  ZA_MPROBE_STUB2 + 0x780, ZA_MPROBE_SLOT + 0xF8, za_hook_m_rb_fdb0);
         za_install_main_probe(base, 0xd81f60,  ZA_MPROBE_STUB3,         ZA_MPROBE_SLOT + 0x100, za_hook_m_rb_d81f60);
+        // E14：P 的哈希 find（只读遍历，不改变 count）
+        za_install_main_probe(base, 0x1706640, ZA_MPROBE_STUB3 + 0x80,  ZA_MPROBE_SLOT + 0x108, za_hook_m_find);
         // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
         //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
         //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
@@ -5164,6 +5167,9 @@ volatile unsigned long long za_n_mover;
 volatile unsigned long long za_n_sub[5];
 // E12：B 里 refcount==-1 的回滚路径三针（进回滚 / d7fdb0 返回 / d81f60 入口）
 volatile unsigned long long za_n_rb[3];
+// E14：P 的哈希 find（0x1706640）调用次数——count 不变只证明没 remove，
+// find 不改变 count，必须单独数：0=真没人读，>0=有人查
+volatile unsigned long long za_n_find, za_n_find_p;
 // E3：命令转发器 0x255ae70（消费侧证据）+ 队列析构 0x1703390（拆证据）
 volatile unsigned long long za_n_fwd, za_n_qdtor;
 
@@ -5675,6 +5681,12 @@ void za_dump_progress_stall(void)
             ZLOGE("★ E12 回滚: 进回滚=%llu d7fdb0返回=%llu d81f60=%llu",
                   (unsigned long long)za_n_rb[0], (unsigned long long)za_n_rb[1],
                   (unsigned long long)za_n_rb[2]);
+        }
+        // E14：哈希 find 总次数 + 其中落在 P+0x70 的次数
+        {
+            extern volatile unsigned long long za_n_find, za_n_find_p;
+            ZLOGE("★ E14 哈希find: 总=%llu 查P的=%llu",
+                  (unsigned long long)za_n_find, (unsigned long long)za_n_find_p);
         }
         // worker 真正在等的那个池对象：把 +0x2c0..+0x360 的关键字段全倒出来。
         //   前 4 个 64 位字就是「队列数组/数量/索引/停止标志」这几个；
@@ -6302,6 +6314,23 @@ static void za_hook_m_rb_enter(unsigned long long *r) { za_rb_log(r, 0, "进回�
 static void za_hook_m_rb_fdb0(unsigned long long *r)  { za_rb_log(r, 1, "d7fdb0已返回@fa64"); }
 static void za_hook_m_rb_d81f60(unsigned long long *r) { za_rb_log(r, 2, "d81f60入口"); }
 
+// E14：哈希 find（0x1706640）入口。x0 = map 基址。
+// 如果 map == P+0x70 ⇒ 有人在查 P 的条目（「106 不降」不等于没人读）。
+static void za_hook_m_find(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_find, 1, __ATOMIC_RELAXED);
+    extern volatile unsigned long long za_enq_queue;
+    unsigned long long p = za_enq_queue;
+    if (p && r[0] == p + 0x70) {
+        __atomic_add_fetch(&za_n_find_p, 1, __ATOMIC_RELAXED);
+        static int n;
+        if (n++ < 6)
+            ZLOGE("★ E14 P的find被调用: map=%#llx(=P+0x70) 总计P查找=%llu lr=main+%#llx",
+                  r[0], (unsigned long long)za_n_find_p,
+                  za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+    }
+}
+
 static void za_hook_m_mover(unsigned long long *r)
 {
     __atomic_add_fetch(&za_n_mover, 1, __ATOMIC_RELAXED);
@@ -6395,6 +6424,27 @@ void za_dump_dispatch_state(void)
         za_fmt_addr(c, sizeof c, f10);
         za_fmt_addr(d, sizeof d, f50);
         ZLOGE("★ 调度器单例=%s vtable=%s [+0x10]=%s [+0x50]=%s", a, b, c, d);
+    }
+    // E15：单例字段全景——P（被 push 容器）和 D（派发器容器）是不是同一个
+    // 单例的两个字段？打印时把命中标出来（P/D 来自 enq3/picker 的实时记录）。
+    if (ZA_PTR_OK(g)) {
+        extern volatile unsigned long long za_enq_queue, za_picker_container;
+        for (unsigned long long off = 0; off < 0x200; off += 8) {
+            unsigned long long v = 0;
+            za_read_bytes((unsigned long)(g + off), &v, 8);
+            if (!v) continue;
+            const char *tag = "";
+            if (v == za_enq_queue) tag = " ← P(被push)";
+            else if (v == za_picker_container) tag = " ← D(派发器)";
+            else if (za_enq_queue && v == za_enq_queue + 0x70) tag = " ← P的map";
+            // v 指向堆对象时顺手读它的首字段（vtable/分配器），找同族对象
+            if (!tag[0] && ZA_PTR_OK(v)) {
+                unsigned long long vv = 0;
+                za_read_bytes((unsigned long)v, &vv, 8);
+                if (vv == 0x103a29f48ull) tag = " → 同为P类容器";
+            }
+            ZLOGE("   单例+%#llx = %#llx%s", off, v, tag);
+        }
     }
 }
 
