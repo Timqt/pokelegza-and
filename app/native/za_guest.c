@@ -3124,7 +3124,23 @@ void za_os_install_tls_descriptor(void)
     unsigned char *area_p = hdr + 0x1000;             // TLS 变量区 A
     st->area = area_p;
     // D+0x98 = (A-D)/8 ⇒ 客机 helper 的 `ldr x9,[D,#0x98]; add D,x9,lsl#3` = A
-    *(unsigned long long *)(hdr + 0x98) = (unsigned long long)((area_p - hdr) / 8);
+    //
+    // ★ 2026-10-31 E9：这个字段被引擎**同时**当两样用：
+    //   ① scratch 槽深度（RAII：进作用域 +1 / 退 -1，槽地址 = D + 深度*8，
+    //      值存 [槽+0x18]）——0xd7f2d0 / 0x194e3d0 两处同类习语；
+    //   ② 我们当年以为的「变量区偏移」。
+    //   若填 (A-D)/8，scratch 槽就**精确落在 A 上**，全引擎所有子系统共用
+    //   A+0x18 这一个槽互相覆盖（E9 实测：派发/整备两个子系统 12 秒内
+    //   在同一槽 0x74fef03018 互相踩）。
+    //   ⇒ A/B 开关 files/za-tlsdepth0：填 0，scratch 落回头页自有区
+    //   D+0x18..D+0x90（深度上限 16，正好塞进 0x98 之前）。
+    {
+        unsigned long long depth0 = (unsigned long long)((area_p - hdr) / 8);
+        if (access("/data/user/0/org.pokelegza.android.port/files/za-tlsdepth0",
+                   F_OK) == 0)
+            depth0 = 0;
+        *(unsigned long long *)(hdr + 0x98) = depth0;
+    }
     // 有些站点把「TPIDR & ~0x1FFF」当线程上下文对象用（ldr [ctx]; ldr [ctx+0x10]; blr）
     // ⇒ D[0] 放一个最小 vtable（槽 2/3 = 宿主 Allocate/Free）。
     {
@@ -4591,6 +4607,8 @@ static void za_hook_m_allocbail(unsigned long long *r); // E2b: 0xd7fa98 分配�
 static void za_hook_m_fwd(unsigned long long *r);       // E3: 0x255ae70 命令转发器
 static void za_hook_m_qdtor(unsigned long long *r);     // E3: 0x1703390 队列析构
 static void za_hook_m_picker(unsigned long long *r);    // E7: 0x194e850 派发侧选命令
+static void za_hook_m_stash_disp(unsigned long long *r);   // E9: 0xd7f30c 派发路径 stash
+static void za_hook_m_stash_intake(unsigned long long *r); // E9: 0x194e458 整备路径 stash
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -4641,8 +4659,18 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         //    所以 [P+0x98] 必须是 (V-P)/8 = 0x2000。之前这个写入丢了 ⇒
         //    helper 站点算出的「TLS 区」变成描述符页 P 本身（不是变量区 V），
         //    与 mrs 桩（返回 V）不一致，且 P 被当对象用时全是 0。
-        *(unsigned long long *)(base + ZA_TLS_DESC_OFF + 0x98) =
-            (unsigned long long)((ZA_TLS_VAR_OFF - ZA_TLS_DESC_OFF) / 8);
+        // ★ 2026-10-31 E9（同 per-thread 页）：这格同时被引擎当 scratch 深度
+        //   计数用（进 +1/退 -1，槽 = P + 深度*8，值存 [槽+0x18]）。填 (V-P)/8
+        //   会把 scratch 槽精确压到变量区头部，各子系统互相覆盖。
+        //   A/B：files/za-tlsdepth0 时填 0，scratch 回到头页 P+0x18 起的自有区。
+        {
+            unsigned long long depth0 =
+                (unsigned long long)((ZA_TLS_VAR_OFF - ZA_TLS_DESC_OFF) / 8);
+            if (access("/data/user/0/org.pokelegza.android.port/files/za-tlsdepth0",
+                       F_OK) == 0)
+                depth0 = 0;
+            *(unsigned long long *)(base + ZA_TLS_DESC_OFF + 0x98) = depth0;
+        }
         // ★ 有些站点把「TPIDR & ~0x1FFF」（改写后 = P）当**线程上下文对象**：
         //     mrs x8 ; and ; ... ; str x8,[obj+8]      ← 存的是这个指针
         //     之后 ldr x8,[ctx] ; ldr x8,[x8,#0x10] ; blr x8
@@ -4779,6 +4807,9 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0x1703390, ZA_MPROBE_STUB2 + 0x200, ZA_MPROBE_SLOT + 0xA0, za_hook_m_qdtor);
         // E7：派发侧选命令入口——x0=派发器查询的容器，与被 push 的容器对账
         za_install_main_probe(base, 0x194e850, ZA_MPROBE_STUB2 + 0x280, ZA_MPROBE_SLOT + 0xA8, za_hook_m_picker);
+        // E9：TLS scratch 覆盖证明——两处 stash 点（探针在 str 前触发，读槽旧值）
+        za_install_main_probe(base, 0xd7f30c,  ZA_MPROBE_STUB2 + 0x300, ZA_MPROBE_SLOT + 0xB0, za_hook_m_stash_disp);
+        za_install_main_probe(base, 0x194e458, ZA_MPROBE_STUB2 + 0x380, ZA_MPROBE_SLOT + 0xB8, za_hook_m_stash_intake);
         // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
         //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
         //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
@@ -5099,6 +5130,8 @@ volatile unsigned long long za_n_ctor, za_n_push, za_n_brancha;
 volatile unsigned long long za_n_push_sw0;      // push 入口里开关字节==0 的次数
 // E2b 二分：0xd7f2d0 入口 → 0xd7f940（构造前）→ ctor/push / 0xd7fa98（分配弃单）
 volatile unsigned long long za_n_f2d0, za_n_reach940, za_n_allocbail;
+// E9：TLS scratch 两处 stash 的累计次数（覆盖事件见日志明细）
+volatile unsigned long long za_n_stash_disp, za_n_stash_intake;
 // E3：命令转发器 0x255ae70（消费侧证据）+ 队列析构 0x1703390（拆证据）
 volatile unsigned long long za_n_fwd, za_n_qdtor;
 
@@ -5581,6 +5614,12 @@ void za_dump_progress_stall(void)
             extern volatile unsigned long long za_n_fwd, za_n_qdtor;
             ZLOGE("★ E3 消费侧: 命令转发器=%llu 队列析构=%llu",
                   (unsigned long long)za_n_fwd, (unsigned long long)za_n_qdtor);
+        }
+        // E9：TLS scratch 两次 stash 的累计次数（同槽覆盖次数见 E9 明细行）
+        {
+            extern volatile unsigned long long za_n_stash_disp, za_n_stash_intake;
+            ZLOGE("★ E9 TLS scratch: 派发stash=%llu 整备stash=%llu",
+                  (unsigned long long)za_n_stash_disp, (unsigned long long)za_n_stash_intake);
         }
         // worker 真正在等的那个池对象：把 +0x2c0..+0x360 的关键字段全倒出来。
         //   前 4 个 64 位字就是「队列数组/数量/索引/停止标志」这几个；
@@ -6087,6 +6126,38 @@ static void za_hook_m_qdtor(unsigned long long *r)
           r[0], vt,
           za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19],
           (long)syscall(SYS_gettid));
+}
+
+// ── E9-①：TLS scratch 覆盖证明 ──────────────────────────────────────
+// 两处 stash 都是 `str x21,[slot,#0x18]`，slot = ctx + [ctx+0x98]*8。
+// 我们令 [D+0x98]=0x2000 ⇒ slot 恒 = V+0x18。探针装在 str 之前：
+// 槽旧值非 0 = 有人已经在这个槽存过东西 ⇒ 现在这次会把它覆盖掉。
+// 派发路径存 [x0+8]（job 上下文），整备路径存分配器对象——
+// 同一个槽上的两次事件 = 互相覆盖的直接证据。
+static void za_tls_stash_check(unsigned long long *r, unsigned long long slot,
+                               const char *who, volatile unsigned long long *counter)
+{
+    __atomic_add_fetch(counter, 1, __ATOMIC_RELAXED);
+    if (!slot || !ZA_PTR_OK(slot)) return;
+    unsigned long long old = 0;
+    if (!za_read_bytes((unsigned long)slot, &old, 8) || old == 0) return;
+    static int n;
+    if (n++ >= 24) return;
+    ZLOGE("★ E9 TLS scratch 覆盖[%s]: 槽=%#llx 旧值=%#llx tid=%ld lr=main+%#llx",
+          who, slot, old, (long)syscall(SYS_gettid),
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+
+static void za_hook_m_stash_disp(unsigned long long *r)
+{
+    // 0xd7f30c: str x21,[x8,#0x18]
+    za_tls_stash_check(r, r[8] + 0x18, "派发", &za_n_stash_disp);
+}
+
+static void za_hook_m_stash_intake(unsigned long long *r)
+{
+    // 0x194e458: str x21,[x9,#0x18]
+    za_tls_stash_check(r, r[9] + 0x18, "整备", &za_n_stash_intake);
 }
 
 // E7：0x194e850（派发侧「按 lane 哈希桶选命令」）入口。

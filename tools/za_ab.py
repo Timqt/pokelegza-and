@@ -27,7 +27,7 @@ PKG = "org.pokelegza.android.port"
 DEV = os.environ.get("ZA_DEVICE", "SCXOHA8TCUN7RWJ7")
 ACT = PKG + "/android.app.NativeActivity"
 MARKS = ["takeover", "quarantine", "quar-free", "nop-fill", "null-dangle", "kill-thread",
-         "lqgrow", "fakewake", "no-lqgrow", "no-nullrecover"]
+         "lqgrow", "fakewake", "no-lqgrow", "no-nullrecover", "tlsdepth0"]
 LOG_DIR = ROOT / "work" / "device"
 # ⚠ 必须用**绝对路径**：run-as 的 sh -c 经过 adb 再转一层引号后，相对路径
 #   `files/za-x` 会创建失败而**不报错**（实测 22:0x 那几轮所谓「接管/隔离」
@@ -117,6 +117,10 @@ def main():
           % (count(r"★ E2b 进 0xd7f2d0"), count(r"★ E2b 到构造前"), count(r"★ E2b 分配弃单")))
     print("E3消费侧: %s" % last(r"★ E3 消费侧: .*"))
     print("E3明细: 转发器 %d | 队列析构 %d" % (count(r"★ E3 命令转发器"), count(r"★ E3 队列析构")))
+    print("E9 scratch: %s" % last(r"★ E9 TLS scratch: .*"))
+    print("E9明细: 覆盖事件 %d（派发 %d / 整备 %d）"
+          % (count(r"★ E9 TLS scratch 覆盖"),
+             count(r"覆盖\[派发\]"), count(r"覆盖\[整备\]")))
     if "quar-free" in active:
         sites = sorted(set(re.findall(r"\[quar-free\] 保留 \S+（(main\+\S+?)，", raw)))
         print("调用点隔离明细: %s" % (" ".join(sites) if sites else "(无)"))
