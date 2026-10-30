@@ -77,7 +77,7 @@ volatile unsigned int za_dangle_n;
 // E26：释放环本体提前到这里 —— 信号处理器里要把 za_fr_pos（释放序列号，
 // 等价时间戳）与悬空读地址一起记下，之后和环里条目对齐判定是不是
 // 「同一个释放-复用窗口」。
-#define ZA_FR_N 256
+#define ZA_FR_N 4096
 typedef struct { unsigned long long p, sz, vt; unsigned long lr; long tid; } za_fr_t;
 static za_fr_t za_fr[ZA_FR_N];
 static volatile unsigned za_fr_pos;
