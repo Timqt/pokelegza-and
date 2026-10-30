@@ -4136,6 +4136,18 @@ static unsigned long za_quar_free_lr_off(unsigned long lr)
     return 0;
 }
 
+// ★ E23：引擎 NVN wrapper 区（main+0x2500000..0x2560000）发起的释放
+//   「只记账不归还」——验证「wrapper 对象被提前释放 ⇒ 悬空读 ⇒ NVN 静默」。
+//   E22 实测静默点前该区连续悬空读宿主堆地址，随后垃圾 NVN 调用。
+static int za_nvnleak_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-nvnleak",
+                   F_OK) == 0;
+    return m;
+}
+
 static void za_guest_free_impl(void *p)
 {
     unsigned long lr0 = ZA_CALLER_LR();
@@ -4144,6 +4156,16 @@ static void za_guest_free_impl(void *p)
     {
         int w = za_watch_hit((unsigned long long)(uintptr_t)p);
         if (w) za_watch_log_free(p, lr0, w);
+    }
+    if (za_nvnleak_mode()) {
+        unsigned long gb = (unsigned long)za_guest_base;
+        if (gb && lr0 >= gb + 0x2500000ul && lr0 < gb + 0x2560000ul) {
+            static int n;
+            if (n++ < 8)
+                ZLOGE("★ E23 NVN wrapper 释放被扣留 p=%p lr=main+%#lx（累计 %d）",
+                      p, lr0 - gb, n);
+            return;                      // 不归还
+        }
     }
     if (za_quar_free_mode()) {
         unsigned long off = za_quar_free_lr_off(lr0);
