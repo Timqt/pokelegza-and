@@ -4694,6 +4694,8 @@ static void za_hook_m_task0(unsigned long long *r);     // 0x16b60d0（vtable+0�
 static void za_hook_m_task1(unsigned long long *r);     // 0x16b5bd8（vtable+0x28）
 static void za_hook_m_task2(unsigned long long *r);     // 0x16b6388（vtable+0x30）
 static void za_hook_m_task3(unsigned long long *r);     // 0x16b63fc（vtable+0x38）
+static void za_hook_m_suba(unsigned long long *r);      // E40: 0x175edd0 提交路径
+static void za_hook_m_subb(unsigned long long *r);      // E40: 0x175eeb8 放弃路径
 static void za_hook_m_push(unsigned long long *r);      // E2: 0x16ffd70
 static void za_hook_m_brancha(unsigned long long *r);   // E2: 0xa6a2e0
 static void za_hook_m_f2d0(unsigned long long *r);      // E2b: 0xd7f2d0 入口
@@ -4944,6 +4946,9 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0x16b5bd8, ZA_MPROBE_STUB3 + 0x480, ZA_MPROBE_SLOT + 0x140, za_hook_m_task1);
         za_install_main_probe(base, 0x16b6388, ZA_MPROBE_STUB3 + 0x500, ZA_MPROBE_SLOT + 0x148, za_hook_m_task2);
         za_install_main_probe(base, 0x16b63fc, ZA_MPROBE_STUB3 + 0x580, ZA_MPROBE_SLOT + 0x150, za_hook_m_task3);
+        // E40：End 之后的提交分叉
+        za_install_main_probe(base, 0x175edd0, ZA_MPROBE_STUB3 + 0x600, ZA_MPROBE_SLOT + 0x158, za_hook_m_suba);
+        za_install_main_probe(base, 0x175eeb8, ZA_MPROBE_STUB3 + 0x680, ZA_MPROBE_SLOT + 0x160, za_hook_m_subb);
         // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
         //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
         //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
@@ -4986,7 +4991,7 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         mprotect(base + ZA_MPROBE_STUB2, 0x1000, PROT_READ | PROT_EXEC);
         // E12 第三桩页
         __builtin___clear_cache((char *)base + ZA_MPROBE_STUB3, (char *)base + ZA_MPROBE_STUB3 + 0x800);
-        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB3 + 0x400, (char *)base + ZA_MPROBE_STUB3 + 0x600);
+        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB3 + 0x400, (char *)base + ZA_MPROBE_STUB3 + 0x700);
         mprotect(base + ZA_MPROBE_STUB3, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
               (unsigned)ZA_MPROBE_STUB, (unsigned)ZA_MPROBE_SLOT);
@@ -6358,6 +6363,28 @@ static void za_hook_m_task0(unsigned long long *r) { za_task_log(r, 0, "0x16b60d
 static void za_hook_m_task1(unsigned long long *r) { za_task_log(r, 1, "0x16b5bd8(vt+28)"); }
 static void za_hook_m_task2(unsigned long long *r) { za_task_log(r, 2, "0x16b6388(vt+30)"); }
 static void za_hook_m_task3(unsigned long long *r) { za_task_log(r, 3, "0x16b63fc(vt+38)"); }
+
+// ★ E40：EndRecording 之后引擎自己的「要不要提交」分叉。反汇编 0x1771664：
+//   End 返回后若 [x19] 字节 != 0 → tail-call 0x175eda0（真提交路径），
+//   否则直接返回 1（这一帧不提交）。而 0x175eda0 里 [x1] == 0 又走 0x175eeb8
+//   直接 return 0。两个点都埋针，看哪条被走到、旗标值是多少。
+static void za_hook_m_suba(unsigned long long *r)     // 0x175edd0 真提交
+{
+    static int n;
+    unsigned char flag = 0xFF;
+    if (ZA_PTR_OK(r[1])) za_read_bytes((unsigned long)ZA_PTR_MASK(r[1]), &flag, 1);
+    if (n++ >= 6) return;
+    ZLOGI("★ E40 提交路径 0x175edd0: x0=%#llx x1=%#llx flag=%#x lr=main+%#llx",
+          r[0], r[1], (unsigned)flag,
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+static void za_hook_m_subb(unsigned long long *r)     // 0x175eeb8 放弃
+{
+    static int n;
+    if (n++ >= 6) return;
+    ZLOGI("★ E40 放弃路径 0x175eeb8: x1=%#llx lr=main+%#llx", r[1],
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
 
 static void za_hook_m_push(unsigned long long *r)
 {

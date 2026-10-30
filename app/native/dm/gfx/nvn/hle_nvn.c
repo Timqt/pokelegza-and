@@ -36,6 +36,7 @@
 #include <mach/mach.h>
 #include <TargetConditionals.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 #include <sys/uio.h>
 #include <sys/stat.h>
 #if TARGET_OS_OSX
@@ -87,6 +88,10 @@ typedef struct { const char *name; void *fn; } nvn_impl;
 // Frame-pipeline counters: how far the first frame actually gets.
 volatile unsigned long nvn_n_begin, nvn_n_end, nvn_n_submit, nvn_n_draw, nvn_n_present;
 volatile unsigned long nvn_n_fence, nvn_n_syncwait, nvn_n_acquire, nvn_n_presentcall;
+// ★ E40：客机「真正跑帧循环」的那条线程。za_guest_tid 记的是 boot 线程，
+//   看门狗一直在采样它（日志报 tid=0），所以「主线程在等什么」全是假象。
+//   帧一定经过 Begin/EndRecording，就在这两个入口记下调用线程。
+extern volatile long za_guest_tid;
 static int g_log;
 
 // 安全探读客机内存：读不到就返回 0，**不会**因为悬空指针把宿主打死。
@@ -967,6 +972,7 @@ NVN(nvnCommandBufferBeginRecording, void, NVNcommandBuffer *c) {
     if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferBeginRecording 对象指针非法 %p", (void *)c); return; }
     cmd_t *o = CB(c);
     nvn_n_begin++;
+    za_guest_tid = (long)syscall(SYS_gettid);   // E40：帧线程
     if (nvn_n_begin == 1) nvn_log_first("nvnCommandBufferBeginRecording", lr0);
     if (o->recording) LOG("【红】BeginRecording 重入");
     o->recording = 1;
@@ -977,6 +983,7 @@ NVN(nvnCommandBufferEndRecording, NVNcommandHandle, NVNcommandBuffer *c) {
     if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferEndRecording 对象指针非法 %p", (void *)c); return 0; }
     cmd_t *o = CB(c);
     nvn_n_end++;
+    za_guest_tid = (long)syscall(SYS_gettid);   // E40：帧线程
     if (nvn_n_end == 1) {
         // 录制里到底有没有内容：字节数为 0 = 游戏只开了个空缓冲，Submit=0 就不奇怪了
         LOG("[nvn] ★ 首个命令缓冲：Begin→End 录了 %u 字节（cb=%p）",
