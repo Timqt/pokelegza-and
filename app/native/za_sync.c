@@ -283,7 +283,12 @@ void za_dump_ret_ring_for(long tid);
 #endif
 
 #define ZA_WAITERS_BIT 0x40000000u
-#define ZS_MAX 64                 // 同时等待的线程上限
+// ★ E38：64 太小。客机启动期会起 100+ 条线程，而槽位按 tid 永久占用、
+//   从不回收 ⇒ 第 65 条以后全部退回 `tid % ZS_MAX` 共用槽位，等待登记互相
+//   覆盖，解锁交接找不到人 —— 真机表现就是「锁字 0（空闲）却 10+ 线程睡死
+//   在 sdk+0x145930、NVN 0 次调用」。现在扩到 256，并在分配时回收已退出
+//   线程（tgkill(pid,tid,0) == ESRCH）的槽位。
+#define ZS_MAX 256                // 同时等待的线程上限
 #define ZS_SLICE_NS 5000000L      // 5ms 分片（等锁用）
 // 条件变量的「无限等待」分片：返回越频繁，SDK 重判条件的开销越大；
 // 太长又会拖慢丢唤醒的恢复。20ms 是旧实现验证过的值。
@@ -327,7 +332,23 @@ static zs_slot_t *zs_self(void)
                                         __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
             return &zs_slots[i];
     }
-    return &zs_slots[tid % ZS_MAX];   // 槽位用完：退回取模（可能互相干扰，但不会崩）
+    // 槽位用完：先回收「线程已经退出」的槽（E38）。不回收的话，启动期
+    // 退出过的线程会把槽位永久占住，后来者只能共用 → 丢唤醒。
+    for (int i = 0; i < ZS_MAX; i++) {
+        long t = __atomic_load_n(&zs_slots[i].tid, __ATOMIC_ACQUIRE);
+        if (t == 0 || t == tid) continue;
+        if (syscall(SYS_tgkill, getpid(), (int)t, 0) == 0) continue;  // 还活着
+        long expect = t;
+        if (__atomic_compare_exchange_n(&zs_slots[i].tid, &expect, 0, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+            expect = 0;
+            if (__atomic_compare_exchange_n(&zs_slots[i].tid, &expect, tid, 0,
+                                            __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+                return &zs_slots[i];
+            break;
+        }
+    }
+    return &zs_slots[tid % ZS_MAX];   // 仍然用完：退回取模（可能互相干扰，但不会崩）
 }
 
 static void zs_wake(zs_slot_t *w)
@@ -409,6 +430,39 @@ static int za_handoff0_mode(void)
     return m;
 }
 
+// ★ E36c：**按地址**的交接风暴闸。同一地址 200ms 内被交接太多次 = 乒乓
+//   （真机：0x455800058 上两个线程以 0xd/0xe 互转 145 秒）。命中后只对这个
+//   地址改成「释放写 0 + 唤醒」，其它地址仍按 tag 转交 —— 全局 handoff0 会
+//   在 24 纹理处把 SDK 互斥协议弄崩，所以只能在风暴地址上局部降级。
+#define ZA_STORM_N 8
+static struct { unsigned long long addr, t0; unsigned n; } za_storm_tab[ZA_STORM_N];
+
+static int za_storm_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-storm",
+                   F_OK) == 0;
+    return m;
+}
+
+static int za_storm_hit(unsigned long long addr)
+{
+    if (!za_storm_mode()) return 0;
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    unsigned long long now = (unsigned long long)ts.tv_sec * 1000000000ull + ts.tv_nsec;
+    int slot = (int)((addr >> 5) & (ZA_STORM_N - 1));
+    if (za_storm_tab[slot].addr != addr ||
+        now - za_storm_tab[slot].t0 > 200000000ull) {
+        za_storm_tab[slot].addr = addr;
+        za_storm_tab[slot].t0 = now;
+        za_storm_tab[slot].n = 0;
+    }
+    za_storm_tab[slot].n++;
+    return za_storm_tab[slot].n > 8;
+}
+
 // 解锁交接：把锁字写成第一个等待者的 tag；还有别人就保留等待者位。
 // 调用方必须持 zs_spin。
 static void zs_handoff_locked(unsigned long long addr, zs_slot_t *exclude)
@@ -434,7 +488,7 @@ static void zs_handoff_locked(unsigned long long addr, zs_slot_t *exclude)
     //   svc#28 乒乓而没有任何 svc#29 —— 双方都以为拿到了所有权，却谁都没有
     //   推进状态。真实内核被 Signal 唤醒时锁字是 0，醒来由用户态自己 CAS。
     //   旧式 #26/#27（kind=1）仍按 Horizon 的 tag 交接语义走。
-    if (za_handoff0_mode() && w->kind == 2) {
+    if (w->kind == 2 && (za_handoff0_mode() || za_storm_hit(addr))) {
         __atomic_store_n((unsigned int *)(uintptr_t)addr, 0u, __ATOMIC_RELEASE);
         zs_wake(w);
         return;
@@ -608,6 +662,20 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
     if (!addr || !key) return 0;
     w = zs_self();
     zs_lock();
+    // ★ E37：**原子复核等待条件**。Horizon 的 WaitProcessWideKeyAtomic 语义是
+    //   「*addr == expected 才睡，否则立即返回」。我们以前无条件登记睡眠：
+    //   真机实测 10+ 条线程睡在 sdk+0x145930，各自锁字已经是 **0（空闲）**，
+    //   而 NVN 最近 0 次调用 —— 解锁方在 svc 之前把字清 0 了，等待者却照样
+    //   挂上去，从此没人再叫醒它（丢唤醒）。这里在登记前复核一次，条件已变
+    //   就直接返回，让客机按它自己的算法重判/重抢。
+    {
+        unsigned int cur = __atomic_load_n((unsigned int *)(uintptr_t)addr,
+                                           __ATOMIC_ACQUIRE);
+        if ((cur & ~ZA_WAITERS_BIT) != tag) {
+            zs_unlock();
+            return 0;
+        }
+    }
     // ★ 顺序照参考版（d2r hle_thread.c 的 svc 0x1C）：
     //   ① 先把条件键置 1（SDK 的 Signal 在用户态先读它，为 0 就**根本不发** svc#29），
     //   ② 登记等待槽，③ 再放锁，④ 最后睡。
