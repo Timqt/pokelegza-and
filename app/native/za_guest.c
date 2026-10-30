@@ -4656,6 +4656,7 @@ static void za_hook_m_rb_fdb0(unsigned long long *r);      // E12: 0xd7fa64
 static void za_hook_m_rb_d81f60(unsigned long long *r);    // E12: 0xd81f60
 static void za_hook_m_find(unsigned long long *r);         // E14: 0x1706640
 static void za_hook_m_vt0(unsigned long long *r);          // E16
+static void za_hook_main_free(unsigned long long *r);      // E24: main 内部 musl free
 static void za_hook_m_vt1(unsigned long long *r);
 static void za_hook_m_vt2(unsigned long long *r);
 static void za_hook_m_vt3(unsigned long long *r);
@@ -6380,6 +6381,22 @@ static void za_hook_m_rb_d81f60(unsigned long long *r) { za_rb_log(r, 2, "d81f60
 
 // E14：哈希 find（0x1706640）入口。x0 = map 基址。
 // 如果 map == P+0x70 ⇒ 有人在查 P 的条目（「106 不降」不等于没人读）。
+// ── E24：main 内部 musl free 探针 ──────────────────────────────
+// 引擎内部释放（不走导入表）此前完全不可见（E23 扣留 0 次）。装到 main 的
+// free 符号上之后，所有客机释放都进释放环 —— abort/停摆现场即可看到
+// 「NVN 对象是谁放掉的」。
+static void za_hook_main_free(unsigned long long *r)
+{
+    unsigned long lr0 = (unsigned long)r[19];
+    za_free_ring_add((void *)(uintptr_t)r[0], 0, lr0);
+    static int n;
+    if (n++ < 6)
+        ZLOGI("★ E24 内部 free: p=%#llx lr=main+%#llx tid=%ld",
+              r[0],
+              za_guest_base ? lr0 - (unsigned long)(uintptr_t)za_guest_base : lr0,
+              (long)syscall(SYS_gettid));
+}
+
 // ── E16：P 类 vtable 剩余槽位 + 同族函数 ───────────────────────
 // 槽位表（main+0x3a29f48）：[0]=0x1703390 析构、[8]=0x17034c0 调整器、
 // [0x10]=0x255ae70 转发器（已知 19 次）、[0x18]=0x255aec0、[0x20]=0x255aef0
@@ -6711,6 +6728,45 @@ int za_guest_mod_init(unsigned char *base, const unsigned char *exp_bin, size_t 
     za_guest_main_base = base;
     ZLOGI("main 导出符号 %u 个（基址 %p）", za_main_mod.export_count, (void *)base);
     za_log_cpp_alloc_syms();
+    // ★ E24：给 main 自己的 musl free 装探针 —— 引擎内部释放（不经导入表）
+    //   一直抓不到（E23：NVN wrapper 区释放扣留 0 次），释放环只覆盖两条路。
+    //   装成功后所有客机 free（含内部）都会进释放环，abort/停摆现场能直接看到
+    //   「谁放掉了 NVN 对象」。
+    {
+        void *fn = za_mod_lookup(&za_main_mod, "free");
+        unsigned long off = 0;
+        if (fn && (unsigned char *)fn >= base)
+            off = (unsigned long)((unsigned char *)fn - base);
+        // free 的首指令常是 `cbz x0,.`（PC 相对，探针不能重放）⇒ 在头 16 字节内
+        // 找第一条可安全重放的指令再装（真机：0xa5a170=cbz，+4=stp x29,x30 可装）。
+        if (off && off < ZA_TEXT_SIZE) {
+            unsigned int pick = 0;
+            for (unsigned int k = 0; k < 4; k++) {
+                unsigned int w = *(const unsigned int *)(base + off + k * 4u);
+                int pcrel = 0;
+                if ((w & 0x9F000000u) == 0x90000000u) pcrel = 1;   // ADR/ADRP
+                if ((w & 0x7C000000u) == 0x14000000u) pcrel = 1;   // B/BL
+                if ((w & 0x7E000000u) == 0x34000000u) pcrel = 1;   // CBZ/CBNZ
+                if ((w & 0x7E000000u) == 0x36000000u) pcrel = 1;   // TBZ/TBNZ
+                if ((w & 0x3B000000u) == 0x18000000u) pcrel = 1;   // LDR literal
+                if (!pcrel) { pick = k; break; }
+            }
+            if (pick || 1) {
+                unsigned long at = off + (unsigned long)pick * 4u;
+                mprotect(base + ZA_MPROBE_STUB3, 0x1000, PROT_READ | PROT_WRITE);
+                za_install_main_probe(base, (unsigned int)at,
+                                      ZA_MPROBE_STUB3 + 0x300, ZA_MPROBE_SLOT + 0x130,
+                                      za_hook_main_free);
+                __builtin___clear_cache((char *)base + ZA_MPROBE_STUB3,
+                                        (char *)base + ZA_MPROBE_STUB3 + 0x800);
+                mprotect(base + ZA_MPROBE_STUB3, 0x1000, PROT_READ | PROT_EXEC);
+                ZLOGI("E24 main free 探针已装: fn=%p off=main+%#lx（跳过 %u 条 PC 相对指令）",
+                      fn, at, pick);
+            }
+        } else {
+            ZLOGI("E24 main free 探针未装: fn=%p off=%#lx（不在 text 内）", fn, off);
+        }
+    }
     return 0;
 }
 // ════════════════════════════════════════════════════════════════
