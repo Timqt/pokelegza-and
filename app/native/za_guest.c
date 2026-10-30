@@ -86,6 +86,9 @@ volatile unsigned za_dangle_frpos[8];
 // 悬空读时被解引用的对象（x0）——用来判定「是哪个 NVN 对象、读的哪个字段」
 volatile unsigned long long za_dangle_obj[8];
 volatile unsigned long long za_dangle_pc[8];
+// E31：故障的 si_code —— 1=SEGV_MAPERR（地址未映射，典型 munmap 释放后）
+//        2=SEGV_ACCERR（已映射但无权限，典型 PROT_NONE 守卫页）
+volatile int za_dangle_si[8];
 volatile int za_stage_m5;                 /* M5 之后才允许「别名句柄」CMIF 应答 */
 volatile unsigned long za_sdk_base = 0;
 volatile unsigned long za_sdk_size = 0;
@@ -1454,6 +1457,7 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                                             (unsigned long long)ucx->uc_mcontext.regs[0];
                                         za_dangle_pc[dn] =
                                             (unsigned long long)(pcv2 - (in_main2 ? gb0 : za_sdk_base));
+                                        za_dangle_si[dn] = info ? (int)info->si_code : 0;
                                         __atomic_store_n(&za_dangle_n, dn + 1,
                                                          __ATOMIC_RELAXED);
                                     }
@@ -5064,6 +5068,20 @@ void za_fs_free_host(void *p)
 //   Free    (x0=obj, x1=ptr,  x2=size, x3=align)
 // 游戏里的 vector/resize 走 helper 0x24f20 → `ldr x8,[obj]; ldr x8,[x8,#0x10]; blr x8`，
 // 不经过 fs 的那两个跳板，所以必须直接填 vtable。
+// ★ E32：files/za-vtguest 打开后，fs vtable 的分配改走**客机自有区**
+//   （za_mem_guest_alloc）。原因（E31 实测）：这条路的 posix_memalign 块落在
+//   Scudo 大块区，Scudo 释放后把页转成 PROT_NONE（si_code=2 SEGV_ACCERR），
+//   而引擎仍持有指针 ⇒ 读到保护页 → 置 0 → 垃圾 NVN 调用 → 帧循环静默。
+//   客机自有区由我们管理，不会 mprotect/munmap，消除「半释放窗口」。
+static int za_vtguest_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-vtguest",
+                   F_OK) == 0;
+    return m;
+}
+
 void *za_fs_vt_alloc(void *obj, unsigned long size, unsigned long align)
 {
     unsigned long lr0 = ZA_CALLER_LR();
@@ -5073,6 +5091,10 @@ void *za_fs_vt_alloc(void *obj, unsigned long size, unsigned long align)
     if ((align & (align - 1)) != 0) align = 16;      // 非 2 的幂：退回 16
     // 接管模式下走同一套自带头部堆（接管模式本身有问题，默认不用）
     if (za_alloc_mode()) p = za_guest_aligned_impl((size_t)align, size ? (size_t)size : 1);
+    else if (za_vtguest_mode()) {
+        p = za_mem_guest_alloc(size ? (size_t)size : 1, (size_t)align);
+        if (!p) return NULL;
+    }
     else if (posix_memalign(&p, (size_t)align, size ? (size_t)size : 1) != 0) return NULL;
     if (p) {
         za_fs_set_add(p, size ? (size_t)size : 1);
@@ -5756,7 +5778,11 @@ void za_dump_progress_stall(void)
                 // E27：被解引用的对象 + 它的前 4 个字段（判断类别/字段偏移）
                 {
                     unsigned long long obj = za_dangle_obj[i];
-                    ZLOGE("   E27 对象=%#llx pc=main+%#llx", obj, za_dangle_pc[i]);
+                    ZLOGE("   E27 对象=%#llx pc=main+%#llx si_code=%d(%s)", obj,
+                          za_dangle_pc[i], za_dangle_si[i],
+                          za_dangle_si[i] == 1 ? "SEGV_MAPERR 未映射"
+                          : za_dangle_si[i] == 2 ? "SEGV_ACCERR PROT_NONE/无权限"
+                          : "其它");
                     if (obj >= 0x10000) {
                         unsigned long long f[4] = {0, 0, 0, 0};
                         if (za_read_bytes((unsigned long)obj, f, sizeof f)) {
