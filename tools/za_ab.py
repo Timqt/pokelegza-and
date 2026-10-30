@@ -27,7 +27,7 @@ PKG = "org.pokelegza.android.port"
 DEV = os.environ.get("ZA_DEVICE", "SCXOHA8TCUN7RWJ7")
 ACT = PKG + "/android.app.NativeActivity"
 MARKS = ["takeover", "quarantine", "quar-free", "nop-fill", "null-dangle", "kill-thread",
-         "lqgrow", "fakewake", "no-lqgrow", "no-nullrecover", "tlsdepth0"]
+         "lqgrow", "fakewake", "no-lqgrow", "no-nullrecover", "tlsdepth0", "handoff28"]
 LOG_DIR = ROOT / "work" / "device"
 # ⚠ 必须用**绝对路径**：run-as 的 sh -c 经过 adb 再转一层引号后，相对路径
 #   `files/za-x` 会创建失败而**不报错**（实测 22:0x 那几轮所谓「接管/隔离」

@@ -371,11 +371,37 @@ static zs_slot_t *zs_pick(int kind, unsigned long long what)
     return best;
 }
 
+// ★ 2026-10-31 E18：Horizon 内核的「锁等待队列」是按**地址**共享的——
+//   svc#26(ArbitrateLock) 与 svc#28(WaitProcessWideKeyAtomic，SDK 19 的新式
+//   互斥锁慢路径) 都把等待者挂在**同一个锁地址**上，svc#27(ArbitrateUnlock)
+//   交接时把锁交给该地址上**第一个等待者**，不论它是哪条 svc 登记的。
+//   我们的实现把 kind=1/kind=2 分开匹配，于是新式互斥锁（#28 登记 kind=2）
+//   在解锁方走慢路径 #27 时永远交接不到人 ⇒ 16 条线程睡死在 sdk+0x145930。
+//   files/za-handoff28 打开后：按地址跨 kind 交接。
+static int za_handoff28_enabled(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-handoff28",
+                   F_OK) == 0;
+    return m;
+}
+
 // 解锁交接：把锁字写成第一个等待者的 tag；还有别人就保留等待者位。
 // 调用方必须持 zs_spin。
-static void zs_handoff_locked(unsigned long long addr)
+static void zs_handoff_locked(unsigned long long addr, zs_slot_t *exclude)
 {
-    zs_slot_t *w = zs_pick(1, addr);
+    int xk = za_handoff28_enabled();
+    zs_slot_t *w = NULL;
+    for (int i = 0; i < ZS_MAX; i++) {
+        zs_slot_t *t = &zs_slots[i];
+        if (t == exclude) continue;                    // 自己不算「交接目标」
+        if (__atomic_load_n(&t->tid, __ATOMIC_RELAXED) == 0) continue;
+        int match = (t->kind == 1 && t->addr == addr);
+        if (xk && t->kind == 2 && t->addr == addr) match = 1;
+        if (!match) continue;
+        if (!w || t->wseq < w->wseq) w = t;
+    }
     if (!w) {
         __atomic_store_n((unsigned int *)(uintptr_t)addr, 0u, __ATOMIC_RELEASE);
         return;
@@ -383,9 +409,11 @@ static void zs_handoff_locked(unsigned long long addr)
     int more = 0;
     for (int i = 0; i < ZS_MAX; i++) {
         zs_slot_t *t = &zs_slots[i];
-        if (t == w) continue;
+        if (t == w || t == exclude) continue;
         if (__atomic_load_n(&t->tid, __ATOMIC_RELAXED) == 0) continue;
-        if (t->kind == 1 && t->addr == addr) { more = 1; break; }
+        int match = (t->kind == 1 && t->addr == addr);
+        if (xk && t->kind == 2 && t->addr == addr) match = 1;
+        if (match) { more = 1; break; }
     }
     __atomic_store_n((unsigned int *)(uintptr_t)addr,
                      w->tag | (more ? ZA_WAITERS_BIT : 0u), __ATOMIC_RELEASE);
@@ -534,7 +562,7 @@ unsigned long za_sync_arbitrate_unlock(unsigned long long addr)
 {
     if (!addr) return 0;
     zs_lock();
-    zs_handoff_locked(addr);
+    zs_handoff_locked(addr, NULL);
     zs_unlock();
     return 0;
 }
@@ -561,7 +589,18 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
     w->tag = tag;
     w->wseq = ++zs_wseq;
     __atomic_store_n(&w->granted, 0, __ATOMIC_RELEASE);
-    zs_handoff_locked(addr);
+    // ★ E18：只有「锁字就是我的 tag」（旧式：我持有并主动让出）才在本次等待里
+    //   释放锁。新式互斥锁（SDK 19 的 0x1458e8）的等待者**不持有锁**，
+    //   锁字是别人的 tag；之前无条件 handoff 会把持有者的锁字清成 0，
+    //   持有者随后解锁时锁字已不符 → 走 #27 慢路径 → 交接不到 → 睡死。
+    if (za_handoff28_enabled()) {
+        unsigned int cur = __atomic_load_n((unsigned int *)(uintptr_t)addr,
+                                           __ATOMIC_ACQUIRE);
+        if ((cur & ~ZA_WAITERS_BIT) == tag)
+            zs_handoff_locked(addr, w);
+    } else {
+        zs_handoff_locked(addr, w);
+    }
     zs_unlock();
     {
         long long deadline = 0;
