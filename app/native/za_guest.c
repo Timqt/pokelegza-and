@@ -71,6 +71,9 @@
 
 // 客机全局状态（其它 .c 通过 extern 访问）
 unsigned char *za_guest_base = NULL;
+// E22：悬空读地址记录（信号处理器只裸写；归属由看门狗线程事后查 maps）。
+volatile unsigned long long za_dangle_addr[8];
+volatile unsigned int za_dangle_n;
 volatile int za_stage_m5;                 /* M5 之后才允许「别名句柄」CMIF 应答 */
 volatile unsigned long za_sdk_base = 0;
 volatile unsigned long za_sdk_size = 0;
@@ -1425,6 +1428,16 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                             }
                             ucx->uc_mcontext.pc = pcv2 + 4;
                             if (cnt[slot] <= 3) {
+                                // E22：只裸记地址（信号上下文不能扫 maps）
+                                {
+                                    unsigned int dn = __atomic_load_n(&za_dangle_n,
+                                                                      __ATOMIC_RELAXED);
+                                    if (dn < 8) {
+                                        za_dangle_addr[dn] = saddr;
+                                        __atomic_store_n(&za_dangle_n, dn + 1,
+                                                         __ATOMIC_RELAXED);
+                                    }
+                                }
                                 char b[176];
                                 char *q = b;
                                 q = za_put_str(q, "ZaGuest: ★ 悬空读取→置0 pc=+");
@@ -5692,6 +5705,17 @@ void za_dump_progress_stall(void)
             ZLOGE("★ E12 回滚: 进回滚=%llu d7fdb0返回=%llu d81f60=%llu",
                   (unsigned long long)za_n_rb[0], (unsigned long long)za_n_rb[1],
                   (unsigned long long)za_n_rb[2]);
+        }
+        // E22：悬空读地址的所属区域（看门狗线程里查 maps，安全）
+        {
+            unsigned int dn = __atomic_load_n(&za_dangle_n, __ATOMIC_RELAXED);
+            if (dn > 8) dn = 8;
+            for (unsigned int i = 0; i < dn; i++) {
+                char m[220];
+                unsigned long long a = za_dangle_addr[i];
+                za_maps_near(a, m, sizeof m);
+                ZLOGE("★ E22 悬空读#%u addr=%#llx 归属：%s", i, a, m);
+            }
         }
         // E14：哈希 find 总次数 + 其中落在 P+0x70 的次数
         {
