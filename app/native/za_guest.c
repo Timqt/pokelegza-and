@@ -83,6 +83,9 @@ static za_fr_t za_fr[ZA_FR_N];
 static volatile unsigned za_fr_pos;
 // 悬空读发生时的释放序列号（0 = 未记录）
 volatile unsigned za_dangle_frpos[8];
+// 悬空读时被解引用的对象（x0）——用来判定「是哪个 NVN 对象、读的哪个字段」
+volatile unsigned long long za_dangle_obj[8];
+volatile unsigned long long za_dangle_pc[8];
 volatile int za_stage_m5;                 /* M5 之后才允许「别名句柄」CMIF 应答 */
 volatile unsigned long za_sdk_base = 0;
 volatile unsigned long za_sdk_size = 0;
@@ -1446,6 +1449,11 @@ static void za_fatal_handler(int sig, siginfo_t *info, void *ctx)
                                         // E26：同时记释放序列号（=时间戳）
                                         za_dangle_frpos[dn] =
                                             __atomic_load_n(&za_fr_pos, __ATOMIC_RELAXED);
+                                        // E27：被解引用的对象与 pc（判定对象类别/字段）
+                                        za_dangle_obj[dn] =
+                                            (unsigned long long)ucx->uc_mcontext.regs[0];
+                                        za_dangle_pc[dn] =
+                                            (unsigned long long)(pcv2 - (in_main2 ? gb0 : za_sdk_base));
                                         __atomic_store_n(&za_dangle_n, dn + 1,
                                                          __ATOMIC_RELAXED);
                                     }
@@ -5745,6 +5753,26 @@ void za_dump_progress_stall(void)
                 unsigned long long a = za_dangle_addr[i];
                 za_maps_near(a, m, sizeof m);
                 ZLOGE("★ E22 悬空读#%u addr=%#llx 归属：%s", i, a, m);
+                // E27：被解引用的对象 + 它的前 4 个字段（判断类别/字段偏移）
+                {
+                    unsigned long long obj = za_dangle_obj[i];
+                    ZLOGE("   E27 对象=%#llx pc=main+%#llx", obj, za_dangle_pc[i]);
+                    if (obj >= 0x10000) {
+                        unsigned long long f[4] = {0, 0, 0, 0};
+                        if (za_read_bytes((unsigned long)obj, f, sizeof f)) {
+                            char tag[5] = {0};
+                            memcpy(tag, (const char *)f, 4);
+                            ZLOGE("   E27 [obj+0]=%#llx [obj+8]=%#llx [obj+0x10]=%#llx 魔数=\"%s\"",
+                                  f[0], f[1], f[2], tag);
+                            unsigned long long at28 = 0;
+                            if (za_read_bytes((unsigned long)(obj + 0x28), &at28, 8))
+                                ZLOGE("   E27 实际 [obj+0x28]=%#llx（读它 +0x20 得 %#llx 即悬空处）",
+                                      at28, (at28 + 0x20) & ~0ull);
+                        } else {
+                            ZLOGE("   E27 对象自身不可读");
+                        }
+                    }
+                }
                 // E26：与释放环对齐——同页最近一次释放及其序列号
                 {
                     unsigned pos = za_dangle_frpos[i];
