@@ -4586,6 +4586,7 @@ static void za_load_host_libs(void)
 #define ZA_MPROBE_STUB  0x6048000u
 #define ZA_MPROBE_SLOT  0x6049000u
 #define ZA_MPROBE_STUB2 0x604A000u   // E2b 第二桩页（bss 区，装上后补 RX）
+#define ZA_MPROBE_STUB3 0x604B000u   // E12 第三桩页
 static void za_hook_m_poolinit(unsigned long long *r);
 static void za_dump_mpsc_lanes(unsigned long long q, const char *when);   // E6
 static void za_hook_m_poolloop(unsigned long long *r);
@@ -4609,6 +4610,15 @@ static void za_hook_m_qdtor(unsigned long long *r);     // E3: 0x1703390 队列�
 static void za_hook_m_picker(unsigned long long *r);    // E7: 0x194e850 派发侧选命令
 static void za_hook_m_stash_disp(unsigned long long *r);   // E9: 0xd7f30c 派发路径 stash
 static void za_hook_m_stash_intake(unsigned long long *r); // E9: 0x194e458 整备路径 stash
+static void za_hook_m_mover(unsigned long long *r);        // E10: 0x194e3d0 搬运族入口
+static void za_hook_m_sub0(unsigned long long *r);         // E11
+static void za_hook_m_sub1(unsigned long long *r);
+static void za_hook_m_sub2(unsigned long long *r);
+static void za_hook_m_sub3(unsigned long long *r);
+static void za_hook_m_sub4(unsigned long long *r);
+static void za_hook_m_rb_enter(unsigned long long *r);     // E12: 0xd7fa3c
+static void za_hook_m_rb_fdb0(unsigned long long *r);      // E12: 0xd7fa64
+static void za_hook_m_rb_d81f60(unsigned long long *r);    // E12: 0xd81f60
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -4810,6 +4820,18 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         // E9：TLS scratch 覆盖证明——两处 stash 点（探针在 str 前触发，读槽旧值）
         za_install_main_probe(base, 0xd7f30c,  ZA_MPROBE_STUB2 + 0x300, ZA_MPROBE_SLOT + 0xB0, za_hook_m_stash_disp);
         za_install_main_probe(base, 0x194e458, ZA_MPROBE_STUB2 + 0x380, ZA_MPROBE_SLOT + 0xB8, za_hook_m_stash_intake);
+        // E10：搬运族入口——x0 与 P（被 push）/ D（派发器）三方对账
+        za_install_main_probe(base, 0x194e3d0, ZA_MPROBE_STUB2 + 0x400, ZA_MPROBE_SLOT + 0xC0, za_hook_m_mover);
+        // E11：dispatch 的其余五个子调用（谁该把 P 里的活领走/推进状态机）
+        za_install_main_probe(base, 0xd7cd10,  ZA_MPROBE_STUB2 + 0x480, ZA_MPROBE_SLOT + 0xC8, za_hook_m_sub0);
+        za_install_main_probe(base, 0xd7e820,  ZA_MPROBE_STUB2 + 0x500, ZA_MPROBE_SLOT + 0xD0, za_hook_m_sub1);
+        za_install_main_probe(base, 0xd7eb10,  ZA_MPROBE_STUB2 + 0x580, ZA_MPROBE_SLOT + 0xD8, za_hook_m_sub2);
+        za_install_main_probe(base, 0x1700c40, ZA_MPROBE_STUB2 + 0x600, ZA_MPROBE_SLOT + 0xE0, za_hook_m_sub3);
+        za_install_main_probe(base, 0xd7f040,  ZA_MPROBE_STUB2 + 0x680, ZA_MPROBE_SLOT + 0xE8, za_hook_m_sub4);
+        // E12：B 的回滚路径（refcount==-1 → 销毁+清理）三针
+        za_install_main_probe(base, 0xd7fa3c,  ZA_MPROBE_STUB2 + 0x700, ZA_MPROBE_SLOT + 0xF0, za_hook_m_rb_enter);
+        za_install_main_probe(base, 0xd7fa64,  ZA_MPROBE_STUB2 + 0x780, ZA_MPROBE_SLOT + 0xF8, za_hook_m_rb_fdb0);
+        za_install_main_probe(base, 0xd81f60,  ZA_MPROBE_STUB3,         ZA_MPROBE_SLOT + 0x100, za_hook_m_rb_d81f60);
         // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
         //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
         //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
@@ -4850,6 +4872,9 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         // E2b 第二桩页：同法清缓存 + RX（0x6049000 槽页保持 RW）
         __builtin___clear_cache((char *)base + ZA_MPROBE_STUB2, (char *)base + ZA_MPROBE_STUB2 + 0x800);
         mprotect(base + ZA_MPROBE_STUB2, 0x1000, PROT_READ | PROT_EXEC);
+        // E12 第三桩页
+        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB3, (char *)base + ZA_MPROBE_STUB3 + 0x800);
+        mprotect(base + ZA_MPROBE_STUB3, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
               (unsigned)ZA_MPROBE_STUB, (unsigned)ZA_MPROBE_SLOT);
     }
@@ -5132,6 +5157,13 @@ volatile unsigned long long za_n_push_sw0;      // push 入口里开关字节==0
 volatile unsigned long long za_n_f2d0, za_n_reach940, za_n_allocbail;
 // E9：TLS scratch 两处 stash 的累计次数（覆盖事件见日志明细）
 volatile unsigned long long za_n_stash_disp, za_n_stash_intake;
+// E10：三方容器对账——P（被 push，za_enq_queue）/ D（派发器 picker）/ 搬运族入口
+volatile unsigned long long za_picker_container;
+volatile unsigned long long za_n_mover;
+// E11：dispatch(0xd7bdb8) 的五个子调用（除首个子调用 0xd7be10 已由 B 路径覆盖）
+volatile unsigned long long za_n_sub[5];
+// E12：B 里 refcount==-1 的回滚路径三针（进回滚 / d7fdb0 返回 / d81f60 入口）
+volatile unsigned long long za_n_rb[3];
 // E3：命令转发器 0x255ae70（消费侧证据）+ 队列析构 0x1703390（拆证据）
 volatile unsigned long long za_n_fwd, za_n_qdtor;
 
@@ -5620,6 +5652,29 @@ void za_dump_progress_stall(void)
             extern volatile unsigned long long za_n_stash_disp, za_n_stash_intake;
             ZLOGE("★ E9 TLS scratch: 派发stash=%llu 整备stash=%llu",
                   (unsigned long long)za_n_stash_disp, (unsigned long long)za_n_stash_intake);
+        }
+        // E10：搬运族次数 + 三方容器快照（P/D/搬运）
+        {
+            extern volatile unsigned long long za_n_mover, za_picker_container, za_enq_queue;
+            ZLOGE("★ E10 三方容器: 搬运族=%llu P=%#llx D=%#llx",
+                  (unsigned long long)za_n_mover,
+                  (unsigned long long)za_enq_queue,
+                  (unsigned long long)za_picker_container);
+        }
+        // E11：dispatch 五个子调用的执行次数
+        {
+            extern volatile unsigned long long za_n_sub[5];
+            ZLOGE("★ E11 dispatch子调用: cd10=%llu e820=%llu eb10=%llu 00c40=%llu f040=%llu",
+                  (unsigned long long)za_n_sub[0], (unsigned long long)za_n_sub[1],
+                  (unsigned long long)za_n_sub[2], (unsigned long long)za_n_sub[3],
+                  (unsigned long long)za_n_sub[4]);
+        }
+        // E12：B 回滚路径三针（进回滚 / d7fdb0 返回 / d81f60 入口）
+        {
+            extern volatile unsigned long long za_n_rb[3];
+            ZLOGE("★ E12 回滚: 进回滚=%llu d7fdb0返回=%llu d81f60=%llu",
+                  (unsigned long long)za_n_rb[0], (unsigned long long)za_n_rb[1],
+                  (unsigned long long)za_n_rb[2]);
         }
         // worker 真正在等的那个池对象：把 +0x2c0..+0x360 的关键字段全倒出来。
         //   前 4 个 64 位字就是「队列数组/数量/索引/停止标志」这几个；
@@ -6166,6 +6221,7 @@ static void za_hook_m_stash_intake(unsigned long long *r)
 // 一个派发器从不读的容器（推错队列的精确形态）。
 static void za_hook_m_picker(unsigned long long *r)
 {
+    za_picker_container = r[0];                    // E10：记住 D
     static int n;
     if (n++ >= 8) return;
     unsigned char lane = 0xFF;
@@ -6179,6 +6235,64 @@ static void za_hook_m_picker(unsigned long long *r)
           r[0], za_enq_queue,
           r[0] == za_enq_queue ? "同一个" : "★不同★",
           (unsigned)lane, vt,
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+
+// E10：搬运族入口 0x194e3d0（含环槽拷贝 0x1955724 的两个调用点）。
+// 三方对账：P（被 push 的容器 za_enq_queue）、D（派发器 picker 看到的容器）、
+// 这里收到的 x0。x0==D ⇒ 搬运只在 D 内部；x0==P ⇒ 搬运读的是 P（桥存在）；
+// 都不是 ⇒ 第三容器。
+// ── E11：dispatch 的五个子调用 ──────────────────────────────────
+// 0xd7bdb8 的调用序列：0xd7be10(→B，已覆盖) → 0xd7cd10 → 0xd7e820 →
+// 0xd7eb10 → 0x1700c40 → 0xd7f040 → 尾跳 A。P 里的 106 个活要有人领走，
+// 候选就在这五个里。谁 0 次 = 没跑；谁跑了但 P 没动 = 不是它。
+static void za_sub_log(unsigned long long *r, int idx, const char *name)
+{
+    __atomic_add_fetch(&za_n_sub[idx], 1, __ATOMIC_RELAXED);
+    static int n[5];
+    if (n[idx]++ >= 3) return;
+    ZLOGI("★ E11 子调用 %s: x0=%#llx x1=%#llx lr=main+%#llx",
+          name, r[0], r[1],
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+static void za_hook_m_sub0(unsigned long long *r) { za_sub_log(r, 0, "0xd7cd10"); }
+static void za_hook_m_sub1(unsigned long long *r) { za_sub_log(r, 1, "0xd7e820"); }
+static void za_hook_m_sub2(unsigned long long *r) { za_sub_log(r, 2, "0xd7eb10"); }
+static void za_hook_m_sub3(unsigned long long *r) { za_sub_log(r, 3, "0x1700c40"); }
+static void za_hook_m_sub4(unsigned long long *r) { za_sub_log(r, 4, "0xd7f040"); }
+
+// ── E12：B 的回滚路径三针 ───────────────────────────────────────
+// B(0xd7f560) 构造完 job 后若引用计数读到 -1（0xffffffff）就跳 0xd7fa38：
+// 销毁 job → bl 0xd7fdb0 → bl 0xd81f60 → ret。E11 显示五个子调用全 0 ⇒
+// B 没返回。三针定位：进回滚(fa3c) / d7fdb0 返回后(fa64) / d81f60 入口。
+static void za_rb_log(unsigned long long *r, int idx, const char *name)
+{
+    __atomic_add_fetch(&za_n_rb[idx], 1, __ATOMIC_RELAXED);
+    static int n[3];
+    if (n[idx]++ >= 3) return;
+    // 桩只保存 x0-x17 与 lr（x21 等不可见），命中本身即判据
+    ZLOGE("★ E12 回滚 %s: 命中 lr=main+%#llx x0=%#llx",
+          name, za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19], r[0]);
+}
+static void za_hook_m_rb_enter(unsigned long long *r) { za_rb_log(r, 0, "进回滚@fa3c"); }
+static void za_hook_m_rb_fdb0(unsigned long long *r)  { za_rb_log(r, 1, "d7fdb0已返回@fa64"); }
+static void za_hook_m_rb_d81f60(unsigned long long *r) { za_rb_log(r, 2, "d81f60入口"); }
+
+static void za_hook_m_mover(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_mover, 1, __ATOMIC_RELAXED);
+    static int n;
+    if (n++ >= 8) return;
+    extern volatile unsigned long long za_enq_queue;
+    unsigned char lane = 0xFF;
+    unsigned long long f0 = 0;
+    if (ZA_PTR_OK(r[1])) za_read_bytes((unsigned long)(r[1] + 0x28), &lane, 1);
+    if (ZA_PTR_OK(r[0])) za_read_bytes((unsigned long)r[0], &f0, 8);
+    ZLOGE("★ E10 搬运族 0x194e3d0: 容器=%#llx（P=%#llx %s / D=%#llx %s）[x0]=%#llx lane=%u lr=main+%#llx",
+          r[0],
+          za_enq_queue, r[0] == za_enq_queue ? "=P" : "≠P",
+          za_picker_container, r[0] == za_picker_container ? "=D" : "≠D",
+          f0, (unsigned)lane,
           za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
 }
 

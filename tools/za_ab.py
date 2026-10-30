@@ -121,6 +121,10 @@ def main():
     print("E9明细: 覆盖事件 %d（派发 %d / 整备 %d）"
           % (count(r"★ E9 TLS scratch 覆盖"),
              count(r"覆盖\[派发\]"), count(r"覆盖\[整备\]")))
+    print("E10三方: %s" % last(r"★ E10 三方容器: .*"))
+    print("E10明细: %s" % last(r"★ E10 搬运族 0x194e3d0: .*"))
+    print("E11子调用: %s" % last(r"★ E11 dispatch子调用: .*"))
+    print("E12回滚: %s" % last(r"★ E12 回滚: .*"))
     if "quar-free" in active:
         sites = sorted(set(re.findall(r"\[quar-free\] 保留 \S+（(main\+\S+?)，", raw)))
         print("调用点隔离明细: %s" % (" ".join(sites) if sites else "(无)"))
