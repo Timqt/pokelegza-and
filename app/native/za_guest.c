@@ -7465,3 +7465,56 @@ int za_guest_run_sdk_init(void)
 {
     return za_sdk_run_init(&za_sdk_mod);
 }
+// ════════════════════════════════════════════════════════════════
+//  E30：宿主侧 free 拦截（同一 .so 内定义 free 符号 = 本模块的 free 绑定到它）
+//
+//  为什么需要：E26/E28 已证明悬空对象**不经过任何客机释放路径**（导入 free、
+//  fs guard、main 内部 musl free 都在释放环里，4096 条仍零命中）；dm 的唯一
+//  宿主 free 与 BNSH 无关 ⇒ 释放者只剩「本模块（含 dm）对宿主堆的 free」。
+//  在同一个 .so 里定义 free，本模块所有 free 引用（dm 也在本 .so 内）都绑到
+//  这里：先记释放环（含调用者返回地址），再透传给真正的 libc free。
+//  开关 files/za-hostfreetrack（关掉时零开销地透传）。
+// ════════════════════════════════════════════════════════════════
+static void (*za_real_free)(void *);
+static int za_hostfree_mark = -1;
+static int za_hostfree_on(void)
+{
+    if (za_hostfree_mark < 0)
+        za_hostfree_mark = access("/data/user/0/org.pokelegza.android.port/files/za-hostfreetrack",
+                                  F_OK) == 0;
+    return za_hostfree_mark;
+}
+void free(void *p)
+{
+    if (!za_real_free) {
+        // ⚠ 解析失败会自递归 ⇒ 只用 NOLOAD 打开的 libc 句柄，且绝不 dlsym 本模块
+        void *h = dlopen("libc.so", RTLD_NOW | RTLD_NOLOAD);
+        if (h) {
+            void *fp = dlsym(h, "free");
+            if (fp && fp != (void *)(uintptr_t)&free) za_real_free = (void (*)(void *))fp;
+        }
+        if (!za_real_free) {
+            // 退路：libdl 也拿不到就交给 libc 的 __libc_free（bionic 有该符号）
+            void *h2 = dlopen("libc.so", RTLD_NOW);
+            if (h2) {
+                void *fp = dlsym(h2, "free");
+                if (fp && fp != (void *)(uintptr_t)&free) za_real_free = (void (*)(void *))fp;
+            }
+        }
+        if (!za_real_free) return;   // 极端情况：放弃释放（泄漏也比递归崩好）
+    }
+    if (p && za_hostfree_on()) {
+        // ⚠ 日志本身会 malloc/free ⇒ 递归进这里；用线程局部忙标志挡一层
+        static __thread int busy;
+        za_free_ring_add(p, 0, (unsigned long)__builtin_return_address(0));
+        if (!busy) {
+            static int n;
+            busy = 1;
+            if (n++ < 6)
+                ZLOGI("★ E30 宿主 free: p=%p lr=%p tid=%ld",
+                      p, __builtin_return_address(0), (long)syscall(SYS_gettid));
+            busy = 0;
+        }
+    }
+    za_real_free(p);
+}
