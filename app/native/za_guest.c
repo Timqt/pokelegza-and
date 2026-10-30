@@ -3142,19 +3142,27 @@ void za_os_install_tls_descriptor(void)
     //   实测撞车：0x12/0x1a/0x4d 各出现两次，甚至有一条算出 0x5f。
     //   id 撞车 ⇒ 「这把锁是不是我持有的」判定错 ⇒ 锁永远解不开、全体停等。
     //   办法：把整块布局在 1MB 窗口内平移，强制 id 等于本线程的唯一槽号。
+    //   ★ E36 修：原来是**全局自增计数器**，跑满 126 条线程就回绕，于是新线程
+    //     又拿到老 id —— 真机日志里能直接看到活线程成对撞车（3/3、5/5、7/7…）。
+    //     现在按「本线程在 za_tls_states 里的槽号」映射成固定 id：
+    //     64 个槽 → 64 个互不相同的 id，且永远不等于 0x5f 哨兵。
+    za_tls_state_t *st = za_tls_cur();
     {
-        static volatile unsigned za_tls_slot;
-        unsigned slot = __atomic_fetch_add(&za_tls_slot, 1, __ATOMIC_RELAXED);
-        slot = slot % 0x7eu;                 // 1..=0x7e
-        slot += 1;
-        if (slot >= 0x5fu) slot += 1;        // 跳过 0x5f（'_' 哨兵）→ 最大 0x7f
+        static const unsigned char idtab[ZA_TLS_SLOTS] = {
+            0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
+            0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20,
+            0x21,0x22,0x23,0x24,0x25,0x26,0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e,0x2f,0x30,
+            0x31,0x32,0x33,0x34,0x35,0x36,0x37,0x38,0x39,0x3a,0x3b,0x3c,0x3d,0x3e,0x3f,0x40
+        };
+        unsigned idx = (unsigned)(st - za_tls_states);
+        if (idx >= ZA_TLS_SLOTS) idx = 0;
+        unsigned slot = idtab[idx];
         unsigned long id0 = ((unsigned long)(uintptr_t)t >> 13) & 0x7fu;
         unsigned long delta = ((slot - id0) & 0x7fu) * 0x2000ul;
         t = (void *)((char *)t + delta);
-        ZLOGI("客机 TLS id 分配: tid=%ld slot=%#x（(A>>13)&0x7f 将等于该值）",
-              (long)syscall(SYS_gettid), slot);
+        ZLOGI("客机 TLS id 分配: tid=%ld 槽=%u id=%#x（(A>>13)&0x7f）",
+              (long)syscall(SYS_gettid), idx, slot + 1);
     }
-    za_tls_state_t *st = za_tls_cur();
     st->tp16 = (unsigned long)b16;      // 仅诊断：不要拿它去读写内存
     st->tp = b;
     unsigned char *hdr = (unsigned char *)t;          // 头页 D
@@ -4681,6 +4689,11 @@ static void za_hook_m_dequeue(unsigned long long *r);static void za_hook_m_enq2(
 static void za_hook_m_enq3(unsigned long long *r);
 static void za_hook_m_jobenqueue(unsigned long long *r);
 static void za_hook_m_jobctor(unsigned long long *r);   // E2: 0x17395d0
+// E35：任务描述类（vtable img+0x3a29278）的四个实入口
+static void za_hook_m_task0(unsigned long long *r);     // 0x16b60d0（vtable+0）
+static void za_hook_m_task1(unsigned long long *r);     // 0x16b5bd8（vtable+0x28）
+static void za_hook_m_task2(unsigned long long *r);     // 0x16b6388（vtable+0x30）
+static void za_hook_m_task3(unsigned long long *r);     // 0x16b63fc（vtable+0x38）
 static void za_hook_m_push(unsigned long long *r);      // E2: 0x16ffd70
 static void za_hook_m_brancha(unsigned long long *r);   // E2: 0xa6a2e0
 static void za_hook_m_f2d0(unsigned long long *r);      // E2b: 0xd7f2d0 入口
@@ -4926,6 +4939,11 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0x255af80, ZA_MPROBE_STUB3 + 0x180, ZA_MPROBE_SLOT + 0x118, za_hook_m_vt1);
         za_install_main_probe(base, 0x255af04, ZA_MPROBE_STUB3 + 0x200, ZA_MPROBE_SLOT + 0x120, za_hook_m_vt2);
         za_install_main_probe(base, 0x16ffb40, ZA_MPROBE_STUB3 + 0x280, ZA_MPROBE_SLOT + 0x128, za_hook_m_vt3);
+        // E35：任务类的四个实入口——判定 106 个任务到底被执行过没有
+        za_install_main_probe(base, 0x16b60d0, ZA_MPROBE_STUB3 + 0x400, ZA_MPROBE_SLOT + 0x138, za_hook_m_task0);
+        za_install_main_probe(base, 0x16b5bd8, ZA_MPROBE_STUB3 + 0x480, ZA_MPROBE_SLOT + 0x140, za_hook_m_task1);
+        za_install_main_probe(base, 0x16b6388, ZA_MPROBE_STUB3 + 0x500, ZA_MPROBE_SLOT + 0x148, za_hook_m_task2);
+        za_install_main_probe(base, 0x16b63fc, ZA_MPROBE_STUB3 + 0x580, ZA_MPROBE_SLOT + 0x150, za_hook_m_task3);
         // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
         //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
         //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
@@ -4968,6 +4986,7 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         mprotect(base + ZA_MPROBE_STUB2, 0x1000, PROT_READ | PROT_EXEC);
         // E12 第三桩页
         __builtin___clear_cache((char *)base + ZA_MPROBE_STUB3, (char *)base + ZA_MPROBE_STUB3 + 0x800);
+        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB3 + 0x400, (char *)base + ZA_MPROBE_STUB3 + 0x600);
         mprotect(base + ZA_MPROBE_STUB3, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
               (unsigned)ZA_MPROBE_STUB, (unsigned)ZA_MPROBE_SLOT);
@@ -6295,6 +6314,11 @@ static void za_hook_m_enq3(unsigned long long *r)
 //   0x16ffd70: x0=队列 x1=项 x2=链节点；ldrb w8,[x0,#0x120]; cbz w8,0x16ffe10
 //   0xa6a2e0 : x0/x1=参数、x8 存进 x20（三个有效入参）
 //   0x17395d0: x0/x1/x2=构造参数，adrp x8,0x3cc4000 取全局
+// ★ E35：任务对象与它 +0x30 指向的任务描述。构造器反汇编：
+//     ldr x8,[x1]; str x8,[x25,#0x30];  （x1 = 描述，带引用计数 +0x28）
+//   描述体首字是它的 vtable；只要任务被执行，一定会对这张表里某个槽 blr。
+//   探针在构造器**入口**触发，对象字段还没写，所以只 dump 描述体。
+//   注意：客机指针带 TBI tag，读之前必须过 ZA_PTR_MASK。
 static void za_hook_m_jobctor(unsigned long long *r)
 {
     __atomic_add_fetch(&za_n_ctor, 1, __ATOMIC_RELAXED);
@@ -6303,7 +6327,37 @@ static void za_hook_m_jobctor(unsigned long long *r)
     ZLOGI("★ E2 job构造 0x17395d0: x0=%#llx x1=%#llx x2=%#llx lr=main+%#llx",
           r[0], r[1], r[2],
           za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+    if (n <= 6 && ZA_PTR_OK(r[1])) {
+        unsigned long long g[4] = {0, 0, 0, 0};
+        za_read_bytes((unsigned long)ZA_PTR_MASK(r[1]), g, sizeof g);
+        unsigned long long vt = g[0];
+        ZLOGI("★ E35 描述=%#llx [0]=%#llx（img+%#llx）[8]=%#llx [10]=%#llx [18]=%#llx",
+              (unsigned long long)ZA_PTR_MASK(r[1]), vt,
+              vt >= 0x100000000ull ? vt - 0x100000000ull : vt, g[1], g[2], g[3]);
+        if (vt >= 0x100000000ull && ZA_PTR_OK(vt)) {
+            unsigned long long t[4] = {0, 0, 0, 0};
+            za_read_bytes((unsigned long)ZA_PTR_MASK(vt), t, sizeof t);
+            ZLOGI("★ E35 描述vtable[0..3]=%#llx %#llx %#llx %#llx",
+                  t[0], t[1], t[2], t[3]);
+        }
+    }
 }
+
+// E35：任务描述类的四个实入口。计数先打前 5 次、之后每 30 次一行，
+// 106 个任务若真的被执行过，这里一定看得到 30/60/90 的计数。
+static volatile unsigned za_n_task[4];
+static void za_task_log(unsigned long long *r, int i, const char *nm)
+{
+    unsigned c = __atomic_add_fetch(&za_n_task[i], 1, __ATOMIC_RELAXED);
+    if (c > 5 && (c % 30)) return;
+    ZLOGI("★ E35 任务入口 %s 第 %u 次: x0=%#llx x1=%#llx lr=main+%#llx",
+          nm, c, r[0], r[1],
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+static void za_hook_m_task0(unsigned long long *r) { za_task_log(r, 0, "0x16b60d0(vt+0)"); }
+static void za_hook_m_task1(unsigned long long *r) { za_task_log(r, 1, "0x16b5bd8(vt+28)"); }
+static void za_hook_m_task2(unsigned long long *r) { za_task_log(r, 2, "0x16b6388(vt+30)"); }
+static void za_hook_m_task3(unsigned long long *r) { za_task_log(r, 3, "0x16b63fc(vt+38)"); }
 
 static void za_hook_m_push(unsigned long long *r)
 {
@@ -6882,6 +6936,8 @@ int za_guest_mod_init(unsigned char *base, const unsigned char *exp_bin, size_t 
                                       za_hook_main_free);
                 __builtin___clear_cache((char *)base + ZA_MPROBE_STUB3,
                                         (char *)base + ZA_MPROBE_STUB3 + 0x800);
+                __builtin___clear_cache((char *)base + ZA_MPROBE_STUB3 + 0x300,
+                                        (char *)base + ZA_MPROBE_STUB3 + 0x600);
                 mprotect(base + ZA_MPROBE_STUB3, 0x1000, PROT_READ | PROT_EXEC);
                 ZLOGI("E24 main free 探针已装: fn=%p off=main+%#lx（跳过 %u 条 PC 相对指令）",
                       fn, at, pick);

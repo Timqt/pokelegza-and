@@ -387,6 +387,28 @@ static int za_handoff28_enabled(void)
     return m;
 }
 
+// ★ E36：交接的**否决**位。真机实测：两个线程在同一个 key 上分别等 0xd / 0xe，
+//   交接会把锁字在两者 tag 之间来回写，145 秒里 svc#28 连发、而该 key 上再没有
+//   任何 svc#29 信号 ⇒ 互相转交的乒乓活锁。打开这个标记后 wait_key 不再交接，
+//   等待者按原语义睡到真正的 Signal。旧式 ArbitrateLock（svc#26/27）不受影响。
+static int za_nohandoff28(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-nohandoff",
+                   F_OK) == 0;
+    return m;
+}
+
+static int za_handoff0_mode(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-handoff0",
+                   F_OK) == 0;
+    return m;
+}
+
 // 解锁交接：把锁字写成第一个等待者的 tag；还有别人就保留等待者位。
 // 调用方必须持 zs_spin。
 static void zs_handoff_locked(unsigned long long addr, zs_slot_t *exclude)
@@ -404,6 +426,17 @@ static void zs_handoff_locked(unsigned long long addr, zs_slot_t *exclude)
     }
     if (!w) {
         __atomic_store_n((unsigned int *)(uintptr_t)addr, 0u, __ATOMIC_RELEASE);
+        return;
+    }
+    // ★ E36b：files/za-handoff0 打开后，对 **#28 等待者（kind=2）** 只做
+    //   「释放 + 唤醒」，不把锁字写成对方的 tag、也不置 granted。
+    //   理由：真机实测两个线程在同一 key 上以 0xd/0xe 互相交接，145 秒全在
+    //   svc#28 乒乓而没有任何 svc#29 —— 双方都以为拿到了所有权，却谁都没有
+    //   推进状态。真实内核被 Signal 唤醒时锁字是 0，醒来由用户态自己 CAS。
+    //   旧式 #26/#27（kind=1）仍按 Horizon 的 tag 交接语义走。
+    if (za_handoff0_mode() && w->kind == 2) {
+        __atomic_store_n((unsigned int *)(uintptr_t)addr, 0u, __ATOMIC_RELEASE);
+        zs_wake(w);
         return;
     }
     int more = 0;
@@ -593,7 +626,9 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
     //   释放锁。新式互斥锁（SDK 19 的 0x1458e8）的等待者**不持有锁**，
     //   锁字是别人的 tag；之前无条件 handoff 会把持有者的锁字清成 0，
     //   持有者随后解锁时锁字已不符 → 走 #27 慢路径 → 交接不到 → 睡死。
-    if (za_handoff28_enabled()) {
+    if (za_nohandoff28()) {
+        /* E36：不交接，按原语义睡到真正的 Signal */
+    } else if (za_handoff28_enabled()) {
         unsigned int cur = __atomic_load_n((unsigned int *)(uintptr_t)addr,
                                            __ATOMIC_ACQUIRE);
         if ((cur & ~ZA_WAITERS_BIT) == tag)
