@@ -7463,6 +7463,26 @@ static void *za_sampler_watchdog(void *arg)
                 if (pk && (no_progress % 2000) == 40)
                     ZLOGE("   已对 %u 个条件变量等待者做伪唤醒（累计 %d 次）", pk,
                           no_progress / 40);
+                // ★ E41：满队列扩容原本只挂在 NVN tick 循环里。可是加载后期 NVN
+                //   一次都不调 ⇒ tick 停了 ⇒ 队列塞满时没人扩容，主线程永久堵在
+                //   SendLightMessageQueue 的 q+0x20 等待字上（真机栈：
+                //   19d064c→d83144→d821d4→d7f878→d7be90→d7bdcc）。
+                //   这里（停摆看门狗，不依赖 NVN 进度）也补一次。
+                {
+                    extern int za_sync_grow_full_lq(void);
+                    static int lg_off = -1;
+                    if (lg_off < 0)
+                        lg_off = access("/data/user/0/org.pokelegza.android.port/files/za-no-lqgrow",
+                                        F_OK) == 0;
+                    if (!lg_off) {
+                        int lg = za_sync_grow_full_lq();
+                        if (lg) {
+                            static int lg_n;
+                            if (lg_n++ < 16)
+                                ZLOGE("★ 停摆看门狗：扩容 %d 个满队列（累计 %d）", lg, lg_n);
+                        }
+                    }
+                }
             }
             // ★ 2026-10-27：阈值 2000 → 12000。客人有**合法的长 memset**
             //   （sdk+0x56e450 就是 memset 的内层循环，初始化几百 MB 内存池时
