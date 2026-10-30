@@ -108,6 +108,13 @@ def main():
           % (count(r"新→旧）abort 现场"), count(r"新→旧）停摆现场"),
              count(r"abort fp\["), count(r"102d3dc"), count(r"停在同一 PC")))
     print("E1监视: %s" % last(r"监视对象被释放 #\d+：p=\S+ 释放者 lr=\S+"))
+    # E2 派发链：停摆快照里的总计数 + 前几次事件的明细计数（各限 8 条）
+    print("E2派发链: %s" % last(r"★ E2 派发链: .*"))
+    print("E2明细: job构造 %d | push入口 %d | 另一分支 %d"
+          % (count(r"★ E2 job构造"), count(r"★ E2 push入口"), count(r"★ E2 另一分支")))
+    print("E2b二分: %s" % last(r"★ E2b 二分: .*"))
+    print("E2b明细: 进f2d0 %d | 构造前 %d | 分配弃单 %d"
+          % (count(r"★ E2b 进 0xd7f2d0"), count(r"★ E2b 到构造前"), count(r"★ E2b 分配弃单")))
     if "quar-free" in active:
         sites = sorted(set(re.findall(r"\[quar-free\] 保留 \S+（(main\+\S+?)，", raw)))
         print("调用点隔离明细: %s" % (" ".join(sites) if sites else "(无)"))

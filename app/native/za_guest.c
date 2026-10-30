@@ -4569,6 +4569,7 @@ static void za_load_host_libs(void)
 // main 模块探针（定义在后面）
 #define ZA_MPROBE_STUB  0x6048000u
 #define ZA_MPROBE_SLOT  0x6049000u
+#define ZA_MPROBE_STUB2 0x604A000u   // E2b 第二桩页（bss 区，装上后补 RX）
 static void za_hook_m_poolinit(unsigned long long *r);
 static void za_hook_m_poolloop(unsigned long long *r);
 static void za_hook_m_w2(unsigned long long *r);
@@ -4580,6 +4581,12 @@ static void za_hook_m_jobpost(unsigned long long *r);
 static void za_hook_m_dequeue(unsigned long long *r);static void za_hook_m_enq2(unsigned long long *r);
 static void za_hook_m_enq3(unsigned long long *r);
 static void za_hook_m_jobenqueue(unsigned long long *r);
+static void za_hook_m_jobctor(unsigned long long *r);   // E2: 0x17395d0
+static void za_hook_m_push(unsigned long long *r);      // E2: 0x16ffd70
+static void za_hook_m_brancha(unsigned long long *r);   // E2: 0xa6a2e0
+static void za_hook_m_f2d0(unsigned long long *r);      // E2b: 0xd7f2d0 入口
+static void za_hook_m_reach940(unsigned long long *r);  // E2b: 0xd7f940 构造前
+static void za_hook_m_allocbail(unsigned long long *r); // E2b: 0xd7fa98 分配弃单
 static void za_hook_m_openfile(unsigned long long *r);
 static void za_install_main_probe(unsigned char *base, unsigned int func_off,
                                   unsigned int stub_off, unsigned int hook_off,
@@ -4755,6 +4762,14 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         za_install_main_probe(base, 0xd848fc, ZA_MPROBE_STUB + 0x480, ZA_MPROBE_SLOT + 0x48, za_hook_m_jobenqueue);
         za_install_main_probe(base, 0xd82644, ZA_MPROBE_STUB + 0x500, ZA_MPROBE_SLOT + 0x50, za_hook_m_enq2);
         za_install_main_probe(base, 0x16ffeb0, ZA_MPROBE_STUB + 0x580, ZA_MPROBE_SLOT + 0x58, za_hook_m_enq3);
+        // E2 派发链中间三环（桩区 0x600/0x680/0x780 空闲；0x700 是「返回0」桩）
+        za_install_main_probe(base, 0x17395d0, ZA_MPROBE_STUB + 0x600, ZA_MPROBE_SLOT + 0x60, za_hook_m_jobctor);
+        za_install_main_probe(base, 0x16ffd70, ZA_MPROBE_STUB + 0x680, ZA_MPROBE_SLOT + 0x68, za_hook_m_push);
+        za_install_main_probe(base, 0xa6a2e0,  ZA_MPROBE_STUB + 0x780, ZA_MPROBE_SLOT + 0x78, za_hook_m_brancha);
+        // E2b 二分：桩页 2（0x604A000，bss 区现成 RW，下面补 mprotect RX）
+        za_install_main_probe(base, 0xd7f2d0,  ZA_MPROBE_STUB2,        ZA_MPROBE_SLOT + 0x80, za_hook_m_f2d0);
+        za_install_main_probe(base, 0xd7f940,  ZA_MPROBE_STUB2 + 0x80, ZA_MPROBE_SLOT + 0x88, za_hook_m_reach940);
+        za_install_main_probe(base, 0xd7fa98,  ZA_MPROBE_STUB2 + 0x100, ZA_MPROBE_SLOT + 0x90, za_hook_m_allocbail);
         // ⚠ 试过在 main+0x102d180 / 0x102d3c8 / 0x102d020 装分配器探针，已全部撤掉：
         //   这三个点都在「对象+8 取分配器 → blr [vt+0x10]」的失败路径上，x21 可能是
         //   空/野值，桩里重放的 `ldr x8,[x21]` 会异常；而桩地址 0x6048xxx 落在
@@ -4792,6 +4807,9 @@ int za_guest_map(const unsigned char *text, const unsigned char *rodata,
         }
         __builtin___clear_cache((char *)base + ZA_MPROBE_STUB, (char *)base + ZA_MPROBE_STUB + 0x800);
         mprotect(base + ZA_MPROBE_STUB, 0x1000, PROT_READ | PROT_EXEC);
+        // E2b 第二桩页：同法清缓存 + RX（0x6049000 槽页保持 RW）
+        __builtin___clear_cache((char *)base + ZA_MPROBE_STUB2, (char *)base + ZA_MPROBE_STUB2 + 0x800);
+        mprotect(base + ZA_MPROBE_STUB2, 0x1000, PROT_READ | PROT_EXEC);
         ZLOGI("main 入口探针已装：0x1653cc0 / 0x1653d00（桩 %#x，槽 %#x）",
               (unsigned)ZA_MPROBE_STUB, (unsigned)ZA_MPROBE_SLOT);
     }
@@ -5064,6 +5082,14 @@ volatile unsigned long long za_enq_queue;
 volatile unsigned long long za_enq_count;
 volatile unsigned long long za_worker_obj;
 volatile unsigned long long za_worker_polls;
+// ── E2 派发链中间环节计数（2026-10-30）──────────────────────────────
+// 已知两端矛盾：job-dispatch(0xd270d8) 早期停摆发过 1 次、真 push(0x16ffeb0)
+// 0 次 —— 中间三环谁断了？构造(0x17395d0) / push 入口(0x16ffd70，[x0+0x120]
+// 是字节开关：0 → cbz 走 0x16ffe10 内部分支) / 另一条路(0xa6a2e0)。
+volatile unsigned long long za_n_ctor, za_n_push, za_n_brancha;
+volatile unsigned long long za_n_push_sw0;      // push 入口里开关字节==0 的次数
+// E2b 二分：0xd7f2d0 入口 → 0xd7f940（构造前）→ ctor/push / 0xd7fa98（分配弃单）
+volatile unsigned long long za_n_f2d0, za_n_reach940, za_n_allocbail;
 
 // 停摆时做一次（仅一次）：在客机堆里搜主线程等的那个任务对象。
 //   找得到 ⇒ 它确实被挂进了某个队列（该队列的 worker 才是该被唤醒的人）；
@@ -5522,10 +5548,23 @@ void za_dump_progress_stall(void)
     {
         extern volatile unsigned long long za_enq_queue, za_enq_count;
         extern volatile unsigned long long za_worker_obj, za_worker_polls;
+        extern volatile unsigned long long za_n_ctor, za_n_push, za_n_brancha, za_n_push_sw0;
+        extern volatile unsigned long long za_n_f2d0, za_n_reach940, za_n_allocbail;
         unsigned long long q = za_enq_queue;
         unsigned long long w = za_worker_obj;
         ZLOGE("★ 任务队列 %#llx（累计入队 %llu 次）；worker 轮询对象 %#llx（轮询 %llu 次）：",
               q, (unsigned long long)za_enq_count, w, (unsigned long long)za_worker_polls);
+        // E2 派发链：构造 → push 入口（开关字=0 的次数单列）→ 另一分支 → 真 push。
+        // 哪一环是 0，断点就在它和上一环之间。
+        ZLOGE("★ E2 派发链: 构造=%llu push入口=%llu(开关0:%llu) 另一分支=%llu 真push=%llu",
+              (unsigned long long)za_n_ctor, (unsigned long long)za_n_push,
+              (unsigned long long)za_n_push_sw0, (unsigned long long)za_n_brancha,
+              (unsigned long long)za_enq_count);
+        // E2b 二分：0xd7f2d0 入口 → 0xd7f940 → ctor/push / 0xd7fa98 弃单。
+        // 入口>0 且 940=0 ⇒ 提前出口；940>0 且 ctor=0 ⇒ 分配器虚调用弃单/崩。
+        ZLOGE("★ E2b 二分: f2d0入口=%llu 构造前=%llu 分配弃单=%llu",
+              (unsigned long long)za_n_f2d0, (unsigned long long)za_n_reach940,
+              (unsigned long long)za_n_allocbail);
         // worker 真正在等的那个池对象：把 +0x2c0..+0x360 的关键字段全倒出来。
         //   前 4 个 64 位字就是「队列数组/数量/索引/停止标志」这几个；
         //   只要和入队对象的字段对不上，就说明两头用的不是同一个池。
@@ -5840,6 +5879,88 @@ static void za_hook_m_enq3(unsigned long long *r)
         za_maps_near(r[0], m, sizeof m);
         ZLOGI("★ 入队目标归属：%s", m);
     }
+}
+
+// ── E2：派发链中间三环（2026-10-30）─────────────────────────────────
+// 链路：job-dispatch(0xd270d8，虚提交) → job 构造 0x17395d0 → push 入口
+// 0x16ffd70（[x0+0x120] 字节开关：0 → cbz 走 0x16ffe10）→ … → 真 push
+// 0x16ffeb0 / 另一条路 0xa6a2e0。早期停摆 dispatch=1、真 push=0，断点必在
+// 中间。反汇编（text.bin 静态核对过首指令都非 PC 相对）：
+//   0x16ffd70: x0=队列 x1=项 x2=链节点；ldrb w8,[x0,#0x120]; cbz w8,0x16ffe10
+//   0xa6a2e0 : x0/x1=参数、x8 存进 x20（三个有效入参）
+//   0x17395d0: x0/x1/x2=构造参数，adrp x8,0x3cc4000 取全局
+static void za_hook_m_jobctor(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_ctor, 1, __ATOMIC_RELAXED);
+    static int n;
+    if (n++ >= 8) return;
+    ZLOGI("★ E2 job构造 0x17395d0: x0=%#llx x1=%#llx x2=%#llx lr=main+%#llx",
+          r[0], r[1], r[2],
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+
+static void za_hook_m_push(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_push, 1, __ATOMIC_RELAXED);
+    unsigned char sw = 0;
+    unsigned long long vt = 0;
+    if (ZA_PTR_OK(r[0])) {
+        memcpy(&sw, (const void *)(uintptr_t)(r[0] + 0x120), 1);
+        memcpy(&vt, (const void *)(uintptr_t)r[0], 8);
+    }
+    if (sw == 0) __atomic_add_fetch(&za_n_push_sw0, 1, __ATOMIC_RELAXED);
+    // push 目标队列也可能「等的人还在就被拆」——一并盯住
+    {
+        extern void za_watch_free_register(unsigned long long a);
+        if (ZA_PTR_OK(r[0])) za_watch_free_register(r[0]);
+    }
+    static int n;
+    if (n++ >= 8) return;
+    ZLOGI("★ E2 push入口 0x16ffd70: 队列=%#llx vt=%#llx 项=%#llx 开关[+0x120]=%u lr=main+%#llx",
+          r[0], vt, r[1], (unsigned)sw,
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+
+static void za_hook_m_brancha(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_brancha, 1, __ATOMIC_RELAXED);
+    static int n;
+    if (n++ >= 8) return;
+    ZLOGI("★ E2 另一分支 0xa6a2e0: x0=%#llx x1=%#llx x8=%#llx lr=main+%#llx",
+          r[0], r[1], r[8],
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+
+// ── E2b：0xd7f2d0 函数（dispatch 尾跳，含构造+push 调用点）内部二分 ──
+// 已知：ctor=0、push=0、alloc弃单=0（未崩）。函数要么没进、要么提前出口。
+// 三探针：入口 0xd7f2d0 / 构造前 0xd7f940 / 分配弃单 0xd7fa98（会 udf #0）。
+static void za_hook_m_f2d0(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_f2d0, 1, __ATOMIC_RELAXED);
+    static int n;
+    if (n++ >= 8) return;
+    ZLOGI("★ E2b 进 0xd7f2d0: x0=%#llx x1=%#llx lr=main+%#llx",
+          r[0], r[1],
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+
+static void za_hook_m_reach940(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_reach940, 1, __ATOMIC_RELAXED);
+    static int n;
+    if (n++ >= 8) return;
+    ZLOGI("★ E2b 到构造前 0xd7f940: x20=%#llx lr=main+%#llx",
+          r[16],  // 桩只存 x0-x8；x20 不在内，用占位（实际值在调用方栈上）
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
+}
+
+static void za_hook_m_allocbail(unsigned long long *r)
+{
+    __atomic_add_fetch(&za_n_allocbail, 1, __ATOMIC_RELAXED);
+    // 弃单之后是 udf #0 硬崩，这条日志通常是此生最后一条
+    ZLOGE("★ E2b 分配弃单 0xd7fa98！x22=%#llx lr=main+%#llx",
+          r[16],
+          za_guest_base ? r[19] - (unsigned long long)(uintptr_t)za_guest_base : r[19]);
 }
 
 // 真正的提交点（main+0xd848fc）：`ldr x8,[x22] ; ldr x8,[x8,#0x50] ; blr x8`。
