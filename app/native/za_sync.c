@@ -421,8 +421,16 @@ static int za_nohandoff28(void)
     return m;
 }
 
-static int za_handoff0_mode(void)
+static int za_rel0_mode(void)
 {
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-rel0",
+                   F_OK) == 0;
+    return m;
+}
+
+static int za_handoff0_mode(void){
     static int m = -1;
     if (m < 0)
         m = access("/data/user/0/org.pokelegza.android.port/files/za-handoff0",
@@ -676,6 +684,13 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
             return 0;
         }
     }
+    // ★ E39b：把「有等待者」位标进锁字。SDK 的解锁（sdk+0x145ffc）是：
+    //     if (word == mytag) { word = 0; return; }        // 快路径，**不发信号**
+    //     else → 慢路径 svc#27 → 交接
+    //   我们的 #28 等待者以前从不置这一位 ⇒ 解锁方永远走快路径清 0，
+    //   等待者就永远睡死（真机：10+ 线程、锁字 0、NVN 0 次调用）。
+    __atomic_fetch_or((unsigned int *)(uintptr_t)addr, ZA_WAITERS_BIT,
+                      __ATOMIC_RELEASE);
     // ★ 顺序照参考版（d2r hle_thread.c 的 svc 0x1C）：
     //   ① 先把条件键置 1（SDK 的 Signal 在用户态先读它，为 0 就**根本不发** svc#29），
     //   ② 登记等待槽，③ 再放锁，④ 最后睡。
@@ -694,7 +709,17 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
     //   释放锁。新式互斥锁（SDK 19 的 0x1458e8）的等待者**不持有锁**，
     //   锁字是别人的 tag；之前无条件 handoff 会把持有者的锁字清成 0，
     //   持有者随后解锁时锁字已不符 → 走 #27 慢路径 → 交接不到 → 睡死。
-    if (za_nohandoff28()) {
+    if (za_rel0_mode()) {
+        // ★ E39：SDK 的互斥等待（sdk+0x1458e8）在「字就是我」时把 **自己的
+        //   句柄** 当 expected 调 #28 —— 这是「持锁等条件变量」：正确动作是
+        //   原子释放（字写 0）然后睡，醒来由调用方重新 CAS 抢锁。
+        //   把锁转交给另一个等待者会让对方以为条件满足，两边每轮都白跑
+        //   （实测 0xd/0xe 互转 1177 次）。这里只释放、不转交、不唤醒。
+        unsigned int cur = __atomic_load_n((unsigned int *)(uintptr_t)addr,
+                                           __ATOMIC_ACQUIRE);
+        if ((cur & ~ZA_WAITERS_BIT) == tag)
+            __atomic_store_n((unsigned int *)(uintptr_t)addr, 0u, __ATOMIC_RELEASE);
+    } else if (za_nohandoff28()) {
         /* E36：不交接，按原语义睡到真正的 Signal */
     } else if (za_handoff28_enabled()) {
         unsigned int cur = __atomic_load_n((unsigned int *)(uintptr_t)addr,
