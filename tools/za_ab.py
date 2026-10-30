@@ -125,6 +125,8 @@ def main():
     print("E10明细: %s" % last(r"★ E10 搬运族 0x194e3d0: .*"))
     print("E11子调用: %s" % last(r"★ E11 dispatch子调用: .*"))
     print("E12回滚: %s" % last(r"★ E12 回滚: .*"))
+    print("E13计数: %s" % last(r"★ E13 停摆时P哈希: .*"))
+    print("E13时间线: %s" % "; ".join(re.findall(r"★ E13 P哈希计数: [^\n]*", raw)[-4:]))
     if "quar-free" in active:
         sites = sorted(set(re.findall(r"\[quar-free\] 保留 \S+（(main\+\S+?)，", raw)))
         print("调用点隔离明细: %s" % (" ".join(sites) if sites else "(无)"))

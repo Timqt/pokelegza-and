@@ -5705,6 +5705,20 @@ void za_dump_progress_stall(void)
                 if (vt2 == 0x103a29f48ull)   // push 时记录的这个类才按 lane 布局倒
                     za_dump_mpsc_lanes(q, "停摆时");
             }
+            // E13：P 哈希条目计数（停摆时）。等于累计入队数 ⇒ 只进不出。
+            // 地址被复用（vt 不符）就跳过，避免假数据。
+            {
+                unsigned long long vt2 = 0, cnt = 0, lf = 0;
+                za_read_bytes((unsigned long)q, &vt2, 8);
+                if (vt2 == 0x103a29f48ull) {
+                    za_read_bytes((unsigned long)(q + 0x98), &cnt, 8);
+                    za_read_bytes((unsigned long)(q + 0xA0), &lf, 8);
+                    ZLOGE("★ E13 停摆时P哈希: 条目=%llu 装载因子=%#llx（累计入队 %llu）",
+                          cnt, lf, (unsigned long long)za_enq_count);
+                } else {
+                    ZLOGE("★ E13 停摆时P哈希: 地址已复用（vt=%#llx），计数不可读", vt2);
+                }
+            }
         }
         // 「谁认识这个池对象」：扫全线程栈找出持有它的线程。
         //   只被 worker 认识 ⇒ 生产方从来没拿到过这个池（问题在池的分发侧）；
@@ -6034,6 +6048,16 @@ static void za_hook_m_enq3(unsigned long long *r)
             }
             // E6：push 时刻的 lane 全景（与停摆时对照 ⇒ 判「构造缺口」还是「事后改坏」）
             za_dump_mpsc_lanes(r[0], "push时");
+        }
+        // E13：P 的哈希条目计数时间线（map=P+0x70，count=[map+0x28]=P+0x98）。
+        // 计数在 push 过程中应单调涨；停摆时若仍等于总 push 数 ⇒ 从未有人取过。
+        if (ZA_PTR_OK(r[0])) {
+            unsigned long long cnt = 0, lf = 0;
+            za_read_bytes((unsigned long)(r[0] + 0x98), &cnt, 8);
+            za_read_bytes((unsigned long)(r[0] + 0xA0), &lf, 8);
+            unsigned long long n = __atomic_load_n(&za_enq_count, __ATOMIC_RELAXED);
+            if (n == 1 || (n % 25) == 0)
+                ZLOGE("★ E13 P哈希计数: push#%llu 条目=%llu 装载因子=%#llx", n, cnt, lf);
         }
     }
     za_enq_queue = r[0];
