@@ -4005,7 +4005,9 @@ static void za_watch_log_free(void *p, unsigned long lr0, int which)
 //   根本不进 za_guest_free_impl，所以光在导入表上打日志看不到它。
 //   这里把所有释放（两条路径都记）压进定长环，abort/停摆时倒出来对照地址。
 #define ZA_FR_N 256
-typedef struct { unsigned long long p, sz; unsigned long lr; long tid; } za_fr_t;
+// vt = 块首 8 字节（C++ 对象的 vtable）。有了它才能回答「被释放的是哪一类对象」，
+// 也才能在 abort 现场的 x21/x19 与释放记录之间对上号。
+typedef struct { unsigned long long p, sz, vt; unsigned long lr; long tid; } za_fr_t;
 static za_fr_t za_fr[ZA_FR_N];
 static volatile unsigned za_fr_pos;
 
@@ -4017,6 +4019,14 @@ void za_free_ring_add(void *p, unsigned long long sz, unsigned long lr)
     e->sz = sz;
     e->lr = lr;
     e->tid = (long)syscall(SYS_gettid);
+    e->vt = 0;
+    // 只读对齐的、看起来是客机堆/映像内的地址；读坏了最多丢一条记录，
+    // 但把 free 路径搞崩就不值得了，所以先做形态过滤。
+    if (p) {
+        unsigned long long a = (unsigned long long)(uintptr_t)p;
+        if (!(a & 7) && a >= 0x10000ull && a < 0x0001000000000000ull)
+            e->vt = *(volatile unsigned long long *)(uintptr_t)p;
+    }
 }
 
 void za_free_ring_dump(const char *why, int n)
@@ -4029,15 +4039,38 @@ void za_free_ring_dump(const char *why, int n)
     ZLOGE("★ 释放环（最近 %d 次，新→旧）%s：", n, why ? why : "");
     for (int i = 1; i <= n; i++) {
         const za_fr_t *e = &za_fr[(pos - i) % ZA_FR_N];
-        if (gb && e->lr >= gb && e->lr < gb + ZA_IMAGE_SIZE)
-            ZLOGE("   p=%#llx sz=%llu lr=main+%#lx tid=%ld",
-                  e->p, e->sz, e->lr - gb, e->tid);
-        else if (sb && e->lr >= sb && e->lr < sb + za_sdk_size)
-            ZLOGE("   p=%#llx sz=%llu lr=sdk+%#lx tid=%ld",
-                  e->p, e->sz, e->lr - sb, e->tid);
+        const char *lrs;
+        unsigned long loff = e->lr;
+        if (gb && e->lr >= gb && e->lr < gb + ZA_IMAGE_SIZE) { lrs = "main+"; loff = e->lr - gb; }
+        else if (sb && e->lr >= sb && e->lr < sb + za_sdk_size) { lrs = "sdk+"; loff = e->lr - sb; }
+        else { lrs = ""; }
+        // vt 也换算成 main+偏移 —— 同一个 vtable 的地址重复出现，就能认类别
+        if (gb && e->vt >= gb && e->vt < gb + ZA_IMAGE_SIZE)
+            ZLOGE("   p=%#llx sz=%llu vt=main+%#llx lr=%s%#lx tid=%ld",
+                  e->p, e->sz, e->vt - gb, lrs, loff, e->tid);
         else
-            ZLOGE("   p=%#llx sz=%llu lr=%#lx tid=%ld", e->p, e->sz, e->lr, e->tid);
+            ZLOGE("   p=%#llx sz=%llu vt=%#llx lr=%s%#lx tid=%ld",
+                  e->p, e->sz, e->vt, lrs, loff, e->tid);
     }
+}
+
+// 在释放环里找某个地址（abort 现场的 x21/x19 是否刚被谁释放过）。
+// 返回 0 = 没找到；非 0 = 找到（age = 距现在多少次释放之前）。
+int za_free_ring_find(unsigned long long p, unsigned long *lr, long *tid, unsigned *age)
+{
+    if (!p) return 0;
+    unsigned pos = __atomic_load_n(&za_fr_pos, __ATOMIC_RELAXED);
+    unsigned have = pos < ZA_FR_N ? pos : ZA_FR_N;
+    for (unsigned i = 0; i < have; i++) {
+        const za_fr_t *e = &za_fr[(pos - 1 - i) % ZA_FR_N];
+        if (e->p == p) {
+            if (lr) *lr = e->lr;
+            if (tid) *tid = e->tid;
+            if (age) *age = i;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 static void za_guest_free_impl(void *p)

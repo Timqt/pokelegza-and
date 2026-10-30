@@ -977,6 +977,16 @@ void za_sync_dump(void)
     {
         ZLOGI("    tid=%ld kind=%d granted=%d lock=%#llx(word=%#x) key=%#llx tag=%#x pc=%#llx",
               tid[i], kind[i], granted[i], addr[i], word[i], key[i], tag[i], gpc[i]);
+        // ★ 2026-10-30：等待的锁/条件变量本身是不是**已经被释放**？
+        //   真机已多次看到「等待者睡着、对象被 free」⇒ 这里直接对照释放环。
+        {
+            extern int za_free_ring_find(unsigned long long p, unsigned long *lr,
+                                         long *tid, unsigned *age);
+            unsigned long flr = 0; long ftid = 0; unsigned fage = 0;
+            if (addr[i] && za_free_ring_find(addr[i], &flr, &ftid, &fage))
+                ZLOGE("      ↳ ★ 这个等待地址在 %u 次释放前被 %#lx（tid=%ld）释放过",
+                      fage, flr, ftid);
+        }
         if (kind[i] != 2 || i < 6) za_dump_ret_ring_for(tid[i]);   // 它最后几条 svc
         // 客机侧调用链：x30 + 沿 x29 链逐帧回溯（无 fp 时才退回扫栈）
         if (kind[i] != 2 && i < 8 && (gfp[i] || gsp[i]))

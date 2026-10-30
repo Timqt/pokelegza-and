@@ -194,6 +194,31 @@ static void za_hook_abort_entry(unsigned long long *r)
                   i, ra, got > 0 ? regs[0] : 0, got > 1 ? regs[1] : 0,
                   got > 2 ? regs[2] : 0, got > 3 ? regs[3] : 0,
                   got > 4 ? regs[4] : 0, got > 5 ? regs[5] : 0);
+        // ★ 2026-10-30：这条 abort 的「凶手」很可能就躺在释放环里。
+        //   main+0x102cf70 的帧（ret=main+0xf8aa3c）保存寄存器布局：
+        //   fp+0x20=x22(每线程对象)、fp+0x28=x21(分配器)、fp+0x38=x19(在构造对象)。
+        //   把这三个地址拿去环里查，命中就说明「它被谁、多少次之前释放过」。
+        if (za_guest_base && ra == (unsigned long long)(uintptr_t)za_guest_base + 0xf8aa3cull) {
+            unsigned long long cand[3] = {0, 0, 0};
+            za_safe_rd(fp + 0x20, &cand[0], 8);   // x22
+            za_safe_rd(fp + 0x28, &cand[1], 8);   // x21
+            za_safe_rd(fp + 0x38, &cand[2], 8);   // x19
+            const char *nm[3] = { "x22(每线程)", "x21(分配器)", "x19(对象)" };
+            for (int c = 0; c < 3; c++) {
+                unsigned long flr = 0; long ftid = 0; unsigned fage = 0;
+                extern int za_free_ring_find(unsigned long long p, unsigned long *lr,
+                                             long *tid, unsigned *age);
+                if (cand[c] && za_free_ring_find(cand[c], &flr, &ftid, &fage)) {
+                    unsigned long long gb2 = (unsigned long long)(uintptr_t)za_guest_base;
+                    if (flr >= gb2 && flr < gb2 + ZA_IMAGE_SIZE)
+                        ZLOGE("   ★ %s=%#llx 在 %u 次释放前被 main+%#llx 释放（tid=%ld）",
+                              nm[c], cand[c], fage, flr - gb2, ftid);
+                    else
+                        ZLOGE("   ★ %s=%#llx 在 %u 次释放前被 %#lx 释放（tid=%ld）",
+                              nm[c], cand[c], fage, flr, ftid);
+                }
+            }
+        }
         if (nfp <= fp) break;
         fp = nfp;
     }
