@@ -454,6 +454,22 @@ static int za_storm_mode(void)
     return m;
 }
 
+// ★ E44：严格对齐参考实现（d2r-mobile 的 dm/host/hle_thread.c，安卓已出画面）。
+//   三条差异：
+//     ① lock_handoff 只认 kind=1（ArbitrateLock 等待者），不做跨 kind 转交；
+//     ② #28 无条件「置键=1 + 交接 + 睡」，不做事前复核；
+//     ③ 不往锁字里写 WAITERS_BIT。
+//   我们的 handoff28/E37/E39b 都是自己加的补丁，可能互相掩盖问题。
+//   打开这个标记后三条全部按参考走，用于一次性判定。
+static int za_refsync(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-refsync",
+                   F_OK) == 0;
+    return m;
+}
+
 static int za_storm_hit(unsigned long long addr)
 {
     if (!za_storm_mode()) return 0;
@@ -475,7 +491,7 @@ static int za_storm_hit(unsigned long long addr)
 // 调用方必须持 zs_spin。
 static void zs_handoff_locked(unsigned long long addr, zs_slot_t *exclude)
 {
-    int xk = za_handoff28_enabled();
+    int xk = za_handoff28_enabled() && !za_refsync();
     zs_slot_t *w = NULL;
     for (int i = 0; i < ZS_MAX; i++) {
         zs_slot_t *t = &zs_slots[i];
@@ -679,7 +695,7 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
     {
         unsigned int cur = __atomic_load_n((unsigned int *)(uintptr_t)addr,
                                            __ATOMIC_ACQUIRE);
-        if ((cur & ~ZA_WAITERS_BIT) != tag) {
+        if (!za_refsync() && (cur & ~ZA_WAITERS_BIT) != tag) {
             zs_unlock();
             return 0;
         }
@@ -689,8 +705,9 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
     //     else → 慢路径 svc#27 → 交接
     //   我们的 #28 等待者以前从不置这一位 ⇒ 解锁方永远走快路径清 0，
     //   等待者就永远睡死（真机：10+ 线程、锁字 0、NVN 0 次调用）。
-    __atomic_fetch_or((unsigned int *)(uintptr_t)addr, ZA_WAITERS_BIT,
-                      __ATOMIC_RELEASE);
+    if (!za_refsync())
+        __atomic_fetch_or((unsigned int *)(uintptr_t)addr, ZA_WAITERS_BIT,
+                          __ATOMIC_RELEASE);
     // ★ 顺序照参考版（d2r hle_thread.c 的 svc 0x1C）：
     //   ① 先把条件键置 1（SDK 的 Signal 在用户态先读它，为 0 就**根本不发** svc#29），
     //   ② 登记等待槽，③ 再放锁，④ 最后睡。
@@ -709,7 +726,10 @@ unsigned long za_sync_wait_key(unsigned long long addr, unsigned long long key, 
     //   释放锁。新式互斥锁（SDK 19 的 0x1458e8）的等待者**不持有锁**，
     //   锁字是别人的 tag；之前无条件 handoff 会把持有者的锁字清成 0，
     //   持有者随后解锁时锁字已不符 → 走 #27 慢路径 → 交接不到 → 睡死。
-    if (za_rel0_mode()) {
+    if (za_refsync()) {
+        // E44：参考实现就是无条件交接（不判断锁字是不是自己的 tag）
+        zs_handoff_locked(addr, w);
+    } else if (za_rel0_mode()) {
         // ★ E39：SDK 的互斥等待（sdk+0x1458e8）在「字就是我」时把 **自己的
         //   句柄** 当 expected 调 #28 —— 这是「持锁等条件变量」：正确动作是
         //   原子释放（字写 0）然后睡，醒来由调用方重新 CAS 抢锁。
