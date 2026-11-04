@@ -324,8 +324,17 @@ memory pool 0x734b4be000 +0x1000: zero-copy (zero-copy 771.2 MB, copied 0.0 MB)
 | submit+present | 53–82 ms | 3.1–4.5 ms |
 | GPU 渲染 | 4–6.7 ms | 20–21 ms（此时 GPU 才是大头） |
 
+**进游戏了**：用触屏假手柄（左摇杆 + A/+）走完 语言 → 外观 → 取名 →
+CONFIRM → Ready!，进入了开场场景：
+
+- `work/tmp/za_start3.png`：列车车厢内部（3D 场景、灯光、金属件），30 FPS；
+- `work/tmp/za_start4.png`：字幕 **“Your train has arrived in Lumiose City!”**
+  —— 即 nx2android profile 里说的洛市车站；
+- 场景内：帧工作 p50 19.4 / p90 21.0 ms，GPU 25.5 ms，submit+present 7.9 ms；
+  纯文字帧（字幕淡入）时帧工作 3.0 ms，自适应帧率报到 60 fps。
+
 截图：`work/tmp/za_fix_screen.png`（语言选择）、`work/tmp/za_fix_screen3.png`
-（外观选择，9 个 3D 头像）。日志：`work/tmp/plza_zc2.txt`。
+（外观选择，9 个 3D 头像）。日志：`work/tmp/plza_zc2.txt`、`plza_zc7.txt`。
 
 ### 9.4 现在的瓶颈
 
