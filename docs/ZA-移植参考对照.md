@@ -194,12 +194,23 @@ if (type == 2) {
 
 | 优先级 | 动作 | 依赖 | 风险 |
 |---|---|---|---|
-| P0 | 修 `SignalToAddress` type 2（`val-2`） | 无 | 低 |
-| P0 | 补 `nvnCommandBufferFenceSync` + 三个状态 getter | 无 | 低 |
-| P1 | 内存报告值 A/B（64 GB → 4.25 GB 量级） | 真机 | 中（可能影响加载） |
+| P0 ✅ | 修 `SignalToAddress` type 2（`val-2`） | 无 | 低 |
+| P0 ✅ | 补 `nvnCommandBufferFenceSync` + 三个状态 getter | 无 | 低 |
+| P1 ✅(待测) | 内存报告值 A/B（`za-mem-small`：alias 4.25GB / heap 4GB / ASLR 5GB） | 真机 | 中（可能影响加载） |
 | P1 | 查 `crypto::GenerateCryptographicallyRandomBytes` / `GetAudioOutBufferCount` 实现是否完整 | 无 | 低 |
 | P2 | 渲染侧：`render_target_array_index`、`c0[0x644]`、image atomics | 能出帧后 | 中 |
 | P2 | 自旋锁 acquire 语义全模块检查（`ldxr`→`ldaxr`） | 有「同一 job 跑两次」现象时 | 中 |
+
+已完成的实现位置：
+
+- `app/native/za_sync.c` `za_sync_signal_addr`：type 2 / count ≤ 0 → `val-2`。
+- `app/native/dm/gfx/nvn/hle_nvn.c`：`nvnCommandBufferFenceSync`、
+  `nvnColorStateGetBlendEnable`、`nvnPolygonStateGetCullFace`、
+  `nvnDepthStencilStateGetDepthTestEnable`（名字已在 `names.txt` / `nvn_slots.tsv`，
+  `NVN()` 宏自动登记进 `swnvn` 派发表，构建产物已确认导出）。
+- `app/native/za_mem.c` `za_mem_small_view()`：标记文件 `files/za-mem-small`
+  把 **回报值** 切成 5GB 量级布局（GetInfo 3/5/13 与 QueryMemory 声明上界）；
+  实际布局不变，用于 A/B 判定「游戏以为自己有 64GB」是否是撞墙原因。
 
 ---
 

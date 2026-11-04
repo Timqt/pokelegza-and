@@ -260,10 +260,31 @@ static const za_map_t *za_mem_find_mapping(unsigned long long addr)
         if (addr >= g_maps[i].lo && addr < g_maps[i].hi) return &g_maps[i];
     return NULL;
 }
+
+// ★ 2026-11-04（E45 A/B）：files/za-mem-small 打开后，把**报给客机的**地址空间
+//   缩到参考工程给 Z-A 的 5GB 量级（nxnative 的 game.tsv：
+//   reserve 5GB / alias 4.25GB / stack 256MB / app_pool 3.2GB）。
+//   对方记录：QueryMemory 报超过 4GB 会让游戏走 big-memory path
+//   （堆按「可分配 − 4.27GB」算，而不是 − 2.76GB）。
+//   我们**实际布局不动**（仍能服务更大的请求），只改回报值 —— 用来判定
+//   「游戏以为自己有 64GB」是不是它后来撞墙的原因。
+static int za_mem_small_view(void)
+{
+    static int m = -1;
+    if (m < 0)
+        m = access("/data/user/0/org.pokelegza.android.port/files/za-mem-small",
+                   F_OK) == 0;
+    return m;
+}
+#define ZA_SMALL_ALIAS 0x110000000ull   // 4.25GB
+#define ZA_SMALL_HEAP  0x100000000ull   // 4GB（落在 4.25GB alias 窗里）
+#define ZA_SMALL_ASLR  0x140000000ull   // 5GB
+
 // GetInfo 的取值。id 见文件头的枚举。
 unsigned long long za_mem_getinfo(long id)
 {
     if (!g_as) za_mem_init();
+    int small = za_mem_small_view();
     switch (id)
     {
     case 0:  return 7;                                   // CoreMask：4 核可用
@@ -272,9 +293,9 @@ unsigned long long za_mem_getinfo(long id)
                                                          //   引擎做 prio & mask 后会把线程优先级
                                                          //   全压成无效值，影响线程池登记）
     case 2:  return (unsigned long long)(uintptr_t)g_alias;   // AliasAddr
-    case 3:  return ZA_MEM_ALIAS_CAP;                    // AliasSize
+    case 3:  return small ? ZA_SMALL_ALIAS : ZA_MEM_ALIAS_CAP;   // AliasSize
     case 4:  return (unsigned long long)(uintptr_t)g_heap;    // HeapAddr
-    case 5:  return ZA_MEM_HEAP_CAP;                     // HeapSize
+    case 5:  return small ? ZA_SMALL_HEAP : ZA_MEM_HEAP_CAP;     // HeapSize
     case 6:  return ZA_MEM_APP_POOL;                     // TotalMem
     case 7:  return g_heap_cur;                          // UsedMem
     case 8:  return 0;                                   // DebuggerAttached
@@ -282,7 +303,7 @@ unsigned long long za_mem_getinfo(long id)
     case 10: return 0;                                   // IdleTick
     case 11: return za_mem_random64();                   // RandomEntropy
     case 12: return (unsigned long long)(uintptr_t)g_as;      // AslrAddr
-    case 13: return ZA_MEM_ASLR_DECL;                         // AslrSize（声明值，见文件头注释）
+    case 13: return small ? ZA_SMALL_ASLR : ZA_MEM_ASLR_DECL;  // AslrSize（声明值，见文件头注释）
     case 14: return (unsigned long long)(uintptr_t)g_stack;   // StackAddr
     case 15: return ZA_MEM_STACK_CAP;                    // StackSize
     case 16: return 0x2000000;                           // SysResTotal
@@ -561,13 +582,16 @@ unsigned long long za_mem_query_memory(unsigned long long addr, unsigned long lo
         perm = 3;
     }
     else if (g_as && addr >= (unsigned long long)(uintptr_t)g_as &&
-             addr < (unsigned long long)(uintptr_t)g_as + ZA_MEM_ASLR_DECL)
+             addr < (unsigned long long)(uintptr_t)g_as +
+                    (za_mem_small_view() ? ZA_SMALL_ASLR : ZA_MEM_ASLR_DECL))
     {
-        // 空闲：报到「相邻映射/堆边界」为止。上界用**声明区**（64GB）而不是
-        // 实际预留（16GB）—— 客机分配器要在四块区域之外放下 12GB 的系统资源，
+        // 空闲：报到「相邻映射/堆边界」为止。上界用**声明区**（默认 64GB）而不是
+        // 实际预留 —— 客机分配器要在四块区域之外放下 12GB 的系统资源，
         // 超出实际预留的部分 svc#44 会现场 mmap。
+        // za-mem-small 打开时声明区按参考工程的 5GB 报（见 za_mem_small_view）。
+        unsigned long long decl = za_mem_small_view() ? ZA_SMALL_ASLR : ZA_MEM_ASLR_DECL;
         unsigned long long lo = (unsigned long long)(uintptr_t)g_as;
-        unsigned long long hi = (unsigned long long)(uintptr_t)g_as + ZA_MEM_ASLR_DECL;
+        unsigned long long hi = (unsigned long long)(uintptr_t)g_as + decl;
         if (addr >= (unsigned long long)(uintptr_t)g_heap)
             lo = (unsigned long long)(uintptr_t)g_heap + g_heap_cur;
         else if (hi > (unsigned long long)(uintptr_t)g_heap)

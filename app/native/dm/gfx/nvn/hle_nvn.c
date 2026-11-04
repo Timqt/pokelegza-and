@@ -766,6 +766,21 @@ NVN(nvnSyncFinalize, void, NVNsync *s) { ((sync_t *)s)->magic = 0; }
 // Fence = "all commands previously submitted to the queue have completed": record the fence value of the most recent submit
 NVN(nvnQueueFenceSync, void, NVNqueue *q, NVNsync *s, NVNsyncCondition c, int f) {
     if (!nvn_obj_ok(q, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnQueueFenceSync 对象指针非法 %p", (void *)q); return; } nvn_n_fence++; (void)q; (void)c; (void)f; ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = x_fence(); }
+// ★ 2026-11-04（Z-A / Trinity）：游戏**每帧在命令缓冲里** fence 一个同步对象，
+//   然后 nvnSyncWait 等它。以前这是「未实现」红桩：同步对象永远没有 fenced 值
+//   ⇒ 每次 SyncWait 立刻超时（参考工程 nxnative 记录的就是这个症状）。
+//   这里按与 nvnQueueFenceSync 相同的方式标记：围栏值取「记录时已提交的最大值」。
+//   我们的回放只有一条队列、严格有序，含该命令缓冲的提交必然在其后，
+//   所以这个近似最多让等待**偏早返回**，不会卡死；等能出帧后再改成
+//   「提交时标记」的精确版本。
+NVN(nvnCommandBufferFenceSync, void, NVNcommandBuffer *c, NVNsync *s, NVNsyncCondition cond, int flag) {
+    if (!nvn_obj_ok(c, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferFenceSync 命令缓冲非法 %p", (void *)c); return; }
+    if (!nvn_obj_ok(s, 8)) { static int _n; if (_n++ < 4) LOG("【红】nvnCommandBufferFenceSync 同步对象非法 %p", (void *)s); return; }
+    nvn_n_fence++;
+    (void)cond; (void)flag;
+    ((sync_t *)s)->fenced = 1;
+    ((sync_t *)s)->fence = x_fence();
+}
 // 没围栏过的同步对象按真机行为等到超时；已围栏的只在 GPU 真正完成到该栅栏值后放行
 // 诊断：游戏每帧在 SyncWait / 读事件上等了多久、等的是落后最新提交几次的栅栏（每 300 帧一行）
 // A sync object that was never fenced waits until the timeout, as on the device; a fenced one is released only once the GPU has really completed up to that fence value
@@ -1223,6 +1238,14 @@ NVN(nvnColorStateSetBlendEnable, void, NVNcolorState *s, int i, uint32_t en) {
     color_st *o = ST(color_st, s); if (i < 0 || i > 7) return;
     o->blend_en = B(en) ? (o->blend_en | 1u << i) : (o->blend_en & ~(1u << i));
 }
+// ★ 2026-11-04（Z-A / Trinity）：游戏**靠读回状态对象**来建管线。这几个 getter
+//   以前落到「未实现」红桩，桩返回 x0（对象地址）⇒ blend enable / depth test
+//   全被判成「开」，纹理构建器的宽度被判成地址。读的必须是 setter 写的那份
+//   打包结构（同一份内存，见 nvn_obj.h 的 FITS 断言）。
+NVN(nvnColorStateGetBlendEnable, NVNboolean, const NVNcolorState *s, int i) {
+    if (!nvn_obj_ok(s, 4) || i < 0 || i > 7) return 0;
+    return (NVNboolean)((ST(color_st, s)->blend_en >> i) & 1u);
+}
 NVN(nvnChannelMaskStateSetDefaults, void, NVNchannelMaskState *s) { ST(chmask_st, s)->mask = 0xffffffffu; }
 NVN(nvnChannelMaskStateSetChannelMask, void, NVNchannelMaskState *s, int i, uint32_t r, uint32_t g, uint32_t b, uint32_t a) {
     if (i < 0 || i > 7) return;
@@ -1237,6 +1260,11 @@ NVN(nvnMultisampleStateSetSampleLocationsEnable, void, NVNmultisampleState *s, u
 NVN(nvnMultisampleStateSetSampleLocations, void, NVNmultisampleState *s, int start, int n, const float *v) { (void)s; (void)start; (void)n; (void)v; }
 NVN(nvnPolygonStateSetDefaults, void, NVNpolygonState *s) { *ST(poly_st, s) = (poly_st){NVN_FACE_NONE, NVN_FRONT_FACE_CCW, NVN_POLYGON_MODE_FILL, 0}; }
 NVN(nvnPolygonStateSetCullFace, void, NVNpolygonState *s, NVNface f) { ST(poly_st, s)->cull = f; }
+// ★ 2026-11-04：同上，Trinity 读回剔除面。
+NVN(nvnPolygonStateGetCullFace, NVNface, const NVNpolygonState *s) {
+    if (!nvn_obj_ok(s, 4)) return NVN_FACE_NONE;
+    return (NVNface)ST(poly_st, s)->cull;
+}
 NVN(nvnPolygonStateSetFrontFace, void, NVNpolygonState *s, NVNfrontFace f) { ST(poly_st, s)->front = f; }
 NVN(nvnPolygonStateSetPolygonMode, void, NVNpolygonState *s, NVNpolygonMode m) { ST(poly_st, s)->mode = m; }
 NVN(nvnPolygonStateSetPolygonOffsetEnables, void, NVNpolygonState *s, int e) { ST(poly_st, s)->offset_en = e; }
@@ -1245,6 +1273,11 @@ NVN(nvnDepthStencilStateSetDefaults, void, NVNdepthStencilState *s) {
                             NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP, NVN_STENCIL_OP_KEEP};
 }
 NVN(nvnDepthStencilStateSetDepthTestEnable, void, NVNdepthStencilState *s, uint32_t e) { ST(ds_st, s)->dt = B(e) != 0; }
+// ★ 2026-11-04：同上，Trinity 读回深度测试开关。
+NVN(nvnDepthStencilStateGetDepthTestEnable, NVNboolean, const NVNdepthStencilState *s) {
+    if (!nvn_obj_ok(s, 8)) return 0;
+    return (NVNboolean)ST(ds_st, s)->dt;
+}
 NVN(nvnDepthStencilStateSetDepthWriteEnable, void, NVNdepthStencilState *s, uint32_t e) { ST(ds_st, s)->dw = B(e) != 0; }
 NVN(nvnDepthStencilStateSetDepthFunc, void, NVNdepthStencilState *s, NVNdepthFunc f) { ST(ds_st, s)->df = f; }
 NVN(nvnDepthStencilStateSetStencilTestEnable, void, NVNdepthStencilState *s, uint32_t e) { ST(ds_st, s)->st = B(e) != 0; }
