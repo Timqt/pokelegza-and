@@ -12,6 +12,8 @@
 1. **Mali 能出画面**：语言选择、外观选择（9 个 3D 角色头像）渲染完全正确，
    触屏手柄可用。nx2android README 里"Mali 不能跑"的说法，在这台设备上**被证伪**。
 2. **性能不可用**：最佳配置 **3 FPS**（语言/外观菜单），离可玩差一个数量级。
+   > **2026-11-04 晚更新**：根因已找到并修复（AHB native handle 的 fd 选错，见 §9）。
+   > 同一菜单现在 **30 FPS**，帧工作 p50 16.9ms，`SyncWait` 不再是大头。
 3. **瓶颈不是游戏、不是翻译、不是 GPU 渲染、不是 present 模式**：
    每帧 `SyncWait` 真实等待 **330–380ms** 才看到栅栏完成，而 GPU 渲染通道只有
    **6.7ms**。剩余成本尚未归因。
@@ -248,3 +250,93 @@ DM_DIRTY_PASSIVE=500
    成功即消除 771MB×2 的拷贝，预期直接从 3 FPS 跳到 10+。
 2. **cherry-pick PR #95** 的按范围回读，作为零拷贝修不好时的退路。
 3. **可选：PanVK** —— 用 `--vulkan-driver` 加载，验证厂商驱动是否是另一个瓶颈。
+4. ~~以上~~ → **已完成**，见 §9。
+
+---
+
+## 9. 零拷贝已修复（2026-11-04 深夜）：MTK gralloc 的 fd 布局
+
+### 9.1 根因：`fds[0]` 不是 dma-buf
+
+`pool_zero_copy()` 把 `AHardwareBuffer_sendHandleToUnixSocket` 收到的
+**第一个 fd** 当成缓冲区去 `mmap`。在这台 MT6991 上，gralloc 的 native handle
+带 **3 个 fd**：
+
+| fd | 权限 | `st_size` | mmap 结果 |
+|---|---|---|---|
+| `fd[0]` | `O_RDONLY` | **0** | RO → `ENODEV`；RW → **`EACCES`** |
+| `fd[1]` | `O_RDWR` | **== 池大小** | ✅ 就是 dma-buf |
+| `fd[2]` | `O_RDWR` | 6480 | 元数据 |
+
+所以每个池都在 `mmap` 这一步失败（日志 `temp mmap ... errno 13`），
+全部退回"整池双向 memcpy"——即 §8.1 的 771 MB × 2。
+
+验证工具：[`tools/ahb_probe.c`](../tools/ahb_probe.c)（NDK 编出 arm64 二进制，
+`adb push` 到 `/data/local/tmp` 以 shell 身份跑）。它同时回答了另一条路：
+
+```
+151 device extensions; external-memory ones:
+  VK_KHR_external_memory / VK_KHR_external_memory_fd / VK_EXT_external_memory_dma_buf
+  VK_ANDROID_external_memory_android_hardware_buffer / VK_EXT_external_memory_acquire_unmodified
+```
+
+⇒ **没有 `VK_EXT_external_memory_host`**，宿主机指针导入不可用；dma-buf 是 Mali 上
+唯一的零拷贝通道。探针还验证了整条机制：
+
+```
+MAP_FIXED test over guest 0x73b48b7000 (16 MB), nfd=3
+  buffer fd = [1] (of 3)
+  wrote through the mapping; lock rc=0 first=0x5a last=0x77
+```
+
+即：fd[1] `MAP_FIXED` 覆盖 guest 地址成功，写入后 `AHardwareBuffer_lock`
+读到同样的字节 → 同一块物理内存，零拷贝成立。
+
+### 9.2 修复
+
+```c
+// nxnative/dm/android/gfx_vk_core.c
+static int ahb_buf_fd(const int *fds, int n, uint64_t size) {
+    for (int i = 0; i < n; i++) { struct stat st;
+        if (!fstat(fds[i], &st) && (uint64_t)st.st_size == size) return fds[i]; }
+    return n > 1 ? fds[1] : n == 1 ? fds[0] : -1;   // 按大小认不出来时的退路
+}
+```
+
+`pool_zero_copy()` 与 `vk_pool_remap_ro()`（脏页保护拆分后的重映射）都改用它。
+Adreno 上只有一个 fd 且大小相符，行为不变。
+
+### 9.3 结果
+
+```
+zero-copy: pool 0x742b715000 245 MB imported
+memory pool 0x742b715000 +0xf500000: zero-copy (zero-copy 245.0 MB, copied 0.0 MB)
+...
+memory pool 0x734b4be000 +0x1000: zero-copy (zero-copy 771.2 MB, copied 0.0 MB)
+```
+
+| 指标 | 修复前 | 修复后 |
+|---|---|---|
+| 零拷贝池 | 0 MB / 771 MB | **771.2 MB / 771.2 MB** |
+| 语言选择页 FPS | 2–3 | **30**（窗口帧率上限 30） |
+| 帧工作 p50 / p90 | 343 ms | **16.9 / 17.7 ms** |
+| 整帧 | ~343 ms | 33 ms |
+| submit+present | 53–82 ms | 3.1–4.5 ms |
+| GPU 渲染 | 4–6.7 ms | 20–21 ms（此时 GPU 才是大头） |
+
+截图：`work/tmp/za_fix_screen.png`（语言选择）、`work/tmp/za_fix_screen3.png`
+（外观选择，9 个 3D 头像）。日志：`work/tmp/plza_zc2.txt`。
+
+### 9.4 现在的瓶颈
+
+- 菜单里 GPU 渲染 20–21 ms ⇒ 这台机器在该场景的 GPU 上限约 48 FPS；
+- 游戏自身 `WindowSetPresentInterval=1`，窗口帧率报 **30 fps**，与 nx2android 在
+  Adreno 830 上的 30 FPS 一致；
+- `SyncWait` 已从 373 ms/帧 降到不在前列（`CommandBufferFenceSync`/`SyncWait`
+  每帧仍各 1–2 次，属正常语义）。
+
+### 9.5 补丁
+
+我们对 nx2android 的全部本地改动（含本次 fd 修复与诊断日志、脏页 passive、
+present 模式、porter 的 Oodle 流式落盘）导出为
+[`patches/nx2android/local-patches-2026-11-04.patch`](../patches/nx2android/local-patches-2026-11-04.patch)。
