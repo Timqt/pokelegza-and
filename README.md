@@ -3,6 +3,61 @@
 > 目标：复用 `D:\feiniukexinhome\Code\d2r-and` 那套「Switch 原生 ARM64 代码 + 自己实现 Vulkan 后端」的移植方法，
 > 把《宝可梦传说 Z‑A》（Pokémon Legends: Z‑A）搬到安卓设备上。
 
+## 最新进展（2026-11-05）：Mali 平板跑进游戏开场，30 FPS
+
+两条路线的现状：
+
+| 路线 | 状态 |
+|---|---|
+| **本仓库自己的移植**（`app/`，NSO 原样跑 + Horizon HLE + NVN→Vulkan） | 客机已能执行，帧管线推进到 3/8（Submit 未达）——卡在「某条 submit 的任务对象从未入队」 |
+| **nx2android 路线**（参照工程，本地补丁） | **已能在 Mali‑G925 上出画面并进开场：菜单 30 FPS**（修复前 2–3 FPS），并走到字幕 “Your train has arrived in Lumiose City!” |
+
+### Mali 上从 3 FPS 到 30 FPS：问题与解法
+
+**现象**：Z‑A 在 Mali‑G925（MT6991）平板上菜单只有 2–3 FPS。逐段计时显示每帧
+`SyncWait` 真实等待 330–380 ms，而 GPU 渲染只要 6.7 ms——「栅栏完成延迟」占了
+一整帧。深挖发现：NVN 内存池共 771 MB **全部**走了 copied 路径，每个提交要把
+整池 `memcpy` 进 shadow、完成后再整池拷回，双向约 300–400 ms，与计时完全对上。
+
+**定位**：给 `pool_zero_copy()` 的每一步失败点加日志后看到 `temp mmap … errno 13`；
+再写独立探针 [`tools/ahb_probe.c`](tools/ahb_probe.c)（NDK 编 aarch64，推到设备上跑）确认：
+
+- MTK 的 gralloc 给 `AHardwareBuffer` 的 native handle 是 **3 个 fd**：
+  `fd[0]` 是 size 0 的只读元数据（mmap 必失败），`fd[1]` 才是 dma-buf
+  （`st_size == 缓冲区大小`），Qualcomm 通常只有 1 个 fd；
+- 原代码恒取 `fds[0]`，于是在 Mali 上**每个池都** mmap 失败、退回整池拷贝；
+- Mali **没有** `VK_EXT_external_memory_host`，dma-buf 是唯一零拷贝通道；
+- 用 `fd[1]` `MAP_FIXED` 覆盖 guest 地址后，CPU 写经 `AHardwareBuffer_lock`
+  读回同样字节 ⇒ 零拷贝机制本身在这台机器完全可用。
+
+**修法**（已导出 [`patches/nx2android/local-patches-2026-11-04.patch`](patches/nx2android/local-patches-2026-11-04.patch)）：
+
+```c
+// 按 fstat 的大小认出真正的 dma-buf fd，而不是拿 fds[0] 碰运气
+static int ahb_buf_fd(const int *fds, int n, uint64_t size) {
+    for (int i = 0; i < n; i++) { struct stat st;
+        if (!fstat(fds[i], &st) && (uint64_t)st.st_size == size) return fds[i]; }
+    return n > 1 ? fds[1] : n == 1 ? fds[0] : -1;
+}
+```
+
+`pool_zero_copy()` 与 `vk_pool_remap_ro()`（脏页保护拆分后的重映射）都改用它。
+
+**结果**：
+
+| | 修复前 | 修复后 |
+|---|---|---|
+| 零拷贝池 | 0 / 771 MB | **771.2 / 771.2 MB** |
+| 菜单 FPS | 2–3 | **30**（游戏自身 `WindowSetPresentInterval` 上限） |
+| 帧工作 p50 | 343 ms | **16.9 ms** |
+| submit+present | 53–82 ms | 3–4.5 ms |
+| GPU 渲染 | 4–6.7 ms | 20–25 ms（**现在的瓶颈**，≈48 FPS 上限） |
+
+完整实验记录（含逐段计时、被排除的假设、进开场的截图）见
+[`docs/ZA-Mali-实测报告.md`](docs/ZA-Mali-实测报告.md)（§8 根因、§9 修复）。
+
+---
+
 ## 一句话结论（2026-10-24 实测已闭环）
 
 **可行性成立；着色器链路整条跑通，且刚刚修掉了一个会让 2 万个着色器「阶段全错」的致命坑。**
@@ -101,6 +156,32 @@ app/
 python app/tools/build.py --install
 ```
 
+
+## 自备文件与公开性
+
+**本仓库不含、也绝不入库**：游戏本体/更新包、NSO/NCA/RomFS 等任何游戏转储、
+prod.keys/title.keys 等任何密钥、从转储生成的构建输入。前者由 `.gitignore` 挡住
+（`*.nsp/*.xci/*.nca/work/…`），后者是 `tools/*.py` 从**你自己的**游戏转储生成的
+头文件，本地保留、不入库：
+
+| 生成文件（不入库） | 生成脚本 | 内容 |
+|---|---|---|
+| `app/native/za_tls_mrs_blob.h` / `za_tls_mrs.h` | `tools/patch_tls_mrs.py` | main 里 10,193 处 `mrs TPIDR_EL0` 的改写桩 |
+| `app/native/za_tls_patch.h` | `tools/patch_tls_helpers.py` | TLS helper 的 `adrp` 改写表 |
+| `app/native/za_tlsro_patch.h` | `tools/patch_tls_ro.py` | SDK 123 处 `mrs TPIDRRO_EL0` 改写表 |
+| `app/native/za_svc_patch.h` | `tools/patch_svc.py` | SDK `svc` 包装入口 → 宿主门 |
+| `app/native/za_romfs_embed.h` | （从 romfs 的 `trinity_config.trowc` 生成） | 客机会读的默认配置 |
+
+新克隆按「怎么用」一节自备转储、跑对应脚本即可构建。运行期查表
+`shader_map.tsv` 等只含哈希/元数据，没有游戏字节。
+
+地址/符号类的生成文件（`za_guest_info.h`、`za_relocs.h`、`za_imports.h`、
+`za_stub.h`、`za_thunk_got.h`、`za_nvn_names.h`）只是布局事实（偏移、大小、符号名），
+不含游戏代码或资产，随仓库分发。
+
+> 仓库里对 nx2android（`https://github.com/shirai91/nx2android`，无 LICENSE 文件）
+> 的引用均为兼容性记录；`patches/nx2android/` 是我们自己对它的本地改动，
+> 供复现实验用。
 
 ---
 
