@@ -24,9 +24,18 @@ app/keys/
 *.pem
 *.p12
 
-# ── 生成的头文件：体积大但**要入库**（它们是可重建的表，却决定行为一致性）
-#    za_tls_mrs_blob.h 2.1MB / za_tls_mrs.h 433KB 保留
-#    依据：项目不是 git 仓库时，丢失这些等于丢失 10,193 条改写表
+# ── 转储派生的构建输入：不入库（从你自己的游戏转储用 tools/*.py 重建，见 README「自备文件」）──
+app/native/za_tls_mrs_blob.h
+app/native/za_tls_mrs.h
+app/native/za_tls_patch.h
+app/native/za_tlsro_patch.h
+app/native/za_romfs_embed.h
+app/native/za_svc_patch.h
+
+# ── 构建产物 / 字节码缓存（不入库）──────────────────────────────
+**/bin/
+**/obj/
+__pycache__/
 
 # ── 编辑器 / 系统 ───────────────────────────────────────────────
 .vs/
