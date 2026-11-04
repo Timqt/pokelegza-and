@@ -157,6 +157,24 @@ python app/tools/build.py --install
 ```
 
 
+## 借鉴与参考
+
+许可细节与全文见 [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md)。
+
+| 项目 | 许可 | 我们借鉴了什么 | 落在哪 |
+|---|---|---|---|
+| [d2r-mobile](https://github.com/jhaizhou-ops/d2r-mobile) | MIT | **`app/native/dm/` 的源头**：NVN→Vulkan 命令回放、HLE 线程/同步模型、命令缓冲语义；「Switch 原生代码 + 自研 GPU 后端」的整套方法也来自同谱系的前作 d2r-and | `app/native/dm/`（按 Z‑A/Mali 大改） |
+| [nxnative](https://github.com/seedds/nxnative) | MIT | Z‑A 的 bring-up 记录（内存布局、`SignalToAddress` type2 的 `−2`、`nvnCommandBufferFenceSync`、Trinity 读回状态等）——我们照它核对并修了 P0 一批 | 行为核对与 `app/native/za_*.c` |
+| [nx2android](https://github.com/shirai91/nx2android) | 无 LICENSE | 同路线的成品安卓 porter：Z‑A profile、设备端 Oodle、着色器分包；Mali 上 3→30 FPS 的零拷贝修复就是对它的 `gfx_vk_core.c` 做的（补丁见 [`patches/nx2android/`](patches/nx2android/)） | 对照实验与 Release 的 APK |
+| [Ryujinx](https://github.com/Ryujinx/Ryujinx) | MIT | **Maxwell SASS → SPIR-V** 的现成翻译器（`Ryujinx.Graphics.Shader`）：42,896 个着色器全量翻成 SPIR-V 并在 Mali 上通过验收 | `tools/bnsh_xlate`、`tools/bnsh_dump`（运行时链接，DLL 不随仓库分发） |
+| RAD oo2core | 商业（随游戏分发） | `.trpak` 的 Oodle 解压（必须 2.9.x） | `tools/oodle.py`（用户自备） |
+
+「Switch 原生 ARM64 客机 + Horizon HLE + 自研 GPU 后端」这条路线本身来自
+d2r 系（我们 2025 年的暗黑破坏神 II 安卓移植实践）；本工程是把它第一次完整
+用于宝可梦传说 Z‑A。
+
+---
+
 ## 自备文件与公开性
 
 **本仓库不含、也绝不入库**：游戏本体/更新包、NSO/NCA/RomFS 等任何游戏转储、
