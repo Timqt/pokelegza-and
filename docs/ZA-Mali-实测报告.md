@@ -197,3 +197,54 @@ DM_SHARED_FONT_EXT=/sdcard/Android/data/org.nx2a.plza/files/nintendo_ext.ttf
 DM_VK_MT_REPLAY=1
 DM_DIRTY_PASSIVE=500
 ```
+
+---
+
+## 8. 后续调研（2026-11-04 晚）：找到了 375ms 的真正来源
+
+### 8.1 根因：771MB 的"复制池"每个提交都要双向 memcpy
+
+运行时日志：
+
+```
+[dm] [vk] [RED] memory pool 0x742b715000 +0xf500000 could not be zero-copy (-1):
+            a GPU copy is refreshed before each submission (slow)
+[dm] [vk] memory pool ...: copied (zero-copy 0.0 MB, copied 771.1 MB)
+```
+
+- Z-A 的内存池在 Mali 上**全部走了 copied 路径**（零拷贝 AHB 导入失败，返回 -1），
+  累计 **771 MB**；
+- 每次提交：开头 `vk_pools_sync` 把整池拷进 shadow，完成线程在更新 `g_done`
+  **之前**再 `pools_copy_back` 把整池拷回 guest 内存；
+- 771 MB 双向拷贝 ≈ 300–400 ms —— 与时间线里的 **GPU tail 375.3 ms** 完全对上。
+
+⇒ 之前测到的"栅栏完成延迟"其实是**完成线程里的整池 memcpy**，不是 GPU、不是驱动。
+这也解释了为什么 present 模式、交换链图像数、脏页开关都无效。
+
+### 8.2 上游已有同方向的修复
+
+- nx2android **PR #95** `perf(vk): preserve copied-pool writes and narrow tracked readback`
+  （open，未合并）：正文明确写 "scanning device-mapped memory and repeatedly copying
+  whole baselines is expensive on **Mali**"，改动包括按范围回读、缓存分配等。
+  与我们的实测完全一致，可直接借鉴/挑选。
+- **PR #37 / PR #33 / issue #52**：无 timeline、无 BC、无 dynamic rendering 的
+  驱动降级路径——我们这台 Mali 都支持，不是问题。
+
+### 8.3 d2r 方案的可借鉴之处
+
+- `d2r-and` 的图形后端是 **Metal**（`dm/gfx/metal/mtl_backend.m`），
+  Apple 统一内存 ⇒ 根本不存在"零拷贝失败"这一层；
+- 它的 Android 分支自带 **Turnip 驱动**（`assets/turnip/vulkan.purple.so`，
+  另有 Qualcomm 840 / v25.3.0 / v26.0.0 几个版本），即**换掉厂商驱动**；
+- 这套思路在 Mali 上的对应物是 Mesa 的 **PanVK**（开源 Mali Vulkan 驱动）。
+  nx2android 的 porter 本身支持 `--vulkan-driver FILE`，所以能不能用 PanVK
+  取决于它是否支持 Immortalis-G925（CSF，需实测，官方文档未确认）。
+- 同步/栅栏代码两边一致（都是 `mtl_wait`），没有额外技巧可借。
+
+### 8.4 下一步（按性价比）
+
+1. **修零拷贝**（最高优先）：给 `pool_zero_copy` 的每个失败点加日志
+   （AHB 分配 / sendHandle / mmap / MAP_FIXED / Vulkan 导入），确认 Mali 上卡在哪一步。
+   成功即消除 771MB×2 的拷贝，预期直接从 3 FPS 跳到 10+。
+2. **cherry-pick PR #95** 的按范围回读，作为零拷贝修不好时的退路。
+3. **可选：PanVK** —— 用 `--vulkan-driver` 加载，验证厂商驱动是否是另一个瓶颈。
