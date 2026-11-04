@@ -1,0 +1,199 @@
+# Z-A 在 Mali 上的实测报告（nx2android 移植）
+
+日期：2026-11-04
+设备：25079RPDCC（Mali-G925-Immortalis MC12，Android 16，屏幕 3008×1880 @120Hz）
+游戏： Pokémon Legends: Z-A **base 1.0.0**（main 7222e13e…，SDK df7a3960…）
+工具： nx2android（与 nxnative 同源），从源码构建 + 本地补丁
+
+---
+
+## 0. 结论摘要
+
+1. **Mali 能出画面**：语言选择、外观选择（9 个 3D 角色头像）渲染完全正确，
+   触屏手柄可用。nx2android README 里"Mali 不能跑"的说法，在这台设备上**被证伪**。
+2. **性能不可用**：最佳配置 **3 FPS**（语言/外观菜单），离可玩差一个数量级。
+3. **瓶颈不是游戏、不是翻译、不是 GPU 渲染、不是 present 模式**：
+   每帧 `SyncWait` 真实等待 **330–380ms** 才看到栅栏完成，而 GPU 渲染通道只有
+   **6.7ms**。剩余成本尚未归因。
+4. 继续推进需要 **GPU 级剖面工具**（Arm Streamline / AGI）或 **Adreno 设备对照**，
+   盲做 A/B 的收益已经耗尽。
+
+---
+
+## 1. 移植是怎么起来的
+
+### 1.1 工具链
+
+| 项 | 值 |
+|---|---|
+| nx2android 源码 | `git clone https://github.com/shirai91/nx2android`（主分支，已含 Z-A profile） |
+| 工具目录 | `NX2A_HOME=D:/feiniukexinhome/Code/nx2a-home`（NDK + .NET 放 D 盘，C 盘只剩 23GB） |
+| NDK | r27c（porter 强制版本，`porter tools --download` 下载 745MB） |
+| .NET | SDK 10.0.403（着色器翻译用，287MB） |
+| prod.keys | `D:/feiniukexinhome/Code/d2r-and/switch key/prod.keys` |
+| 游戏目录 | `D:/feiniukexinhome/Code/za-port/za.nsp`（4.03GB，硬链接失败后改为复制） |
+| 产物 | `za-port/PokMonLegendsZA.apk`（1.9MB）+ `PokMonLegendsZA-data/`（5.1GB） |
+
+### 1.2 打包/安装命令
+
+```bash
+export NX2A_HOME=D:/feiniukexinhome/Code/nx2a-home
+python -m porter port   D:/feiniukexinhome/Code/za-port --mt-replay --progress lines
+python -m porter install D:/feiniukexinhome/Code/za-port/PokMonLegendsZA-data \
+       --device SCXOHA8TCUN7RWJ7
+```
+
+首次 `adb install` 会弹 **「USB安装提示」**，必须在平板上手动点允许
+（MIUI 限制，`INSTALL_FAILED_USER_RESTRICTED`）。
+
+porter 的两条红色警告（已知、非本次实验引入）：
+
+```
+[RED] v0 is not a version game profile 0100F43008C44000 registers (v393216 2.0.2)
+[RED] main build 7222e13e… is not the tested b1f12fd9… and has none of its 1 registered patches
+```
+
+⇒ 我们打的是 **v0 + 派生 profile**，缺 2.0.2 的帧步进桩和 StandardAllocator 补丁。
+**下面所有性能数字都只代表 v0，不代表 2.0.2。**
+
+---
+
+## 2. 我们对 nx2android 做的本地补丁
+
+以下补丁都只为实验，未提交上游。
+
+### 2.1 porter：Oodle 解码结果的流式落盘（必须）
+
+`porter/pipeline.py` `device_oodle()`：原实现把设备解码回来的
+`job.bin.out`（本作 **5.0GB**）整个 `read_bytes()`，再按 label 拼成 bytes，
+32GB 内存的 PC 直接 `MemoryError`。
+
+改为：边读 `job.out` 边把每个 label 的条目写进临时文件，最后按顺序拼 `.dec`。
+
+### 2.2 nvn_dirty.c：脏页跟踪的两个实验开关
+
+- `DM_NO_DIRTY=1`：`nvn_dirty_protect` 直接返回，完全不设只读
+  （诊断用；纹理不重传，画面会黑）。
+- `DM_DIRTY_PASSIVE=N`（默认 20000）：每个内存池累计缺页超过 N 次后，
+  对该 range **放弃保护**，且脏判断恒为真（每次使用重传，内容仍正确）。
+  代价是把缺页成本换成上传带宽。
+
+### 2.3 gfx_vk_present.c：present 模式 / 交换链图像数
+
+- `DM_VK_PRESENT=fifo|mailbox|immediate`
+- `DM_VK_IMAGES=N`（只增不减，受 `maxImageCount` 限制）
+
+---
+
+## 3. 实测数据
+
+### 3.1 帧率（内置 FPS 显示 + SurfaceFlinger 双重确认）
+
+| 配置 | FPS | 整帧 p50 | NVN submit+present | GPU 渲染通道 |
+|---|---|---|---|---|
+| 基线（FIFO，无 P1） | **2** | 343 ms | 79 ms | 4.0 ms |
+| P1 passive=500 + `--mt-replay` | **3** | 252 ms | 53–73 ms | 4–6 ms |
+| 同上 + MAILBOX + 6 图像 | 2 | ~380 ms | 75–82 ms | 6.7 ms |
+| `DM_NO_DIRTY=1`（诊断） | 4 | ~250 ms | — | — |
+| P1 关闭（passive=0） | 2 | — | — | — |
+
+备注：
+- `DM_NO_DIRTY=1` 虽然 4 FPS，但**画面全黑**（纹理不重传），不可用；
+- MAILBOX / 6 图像**没有任何改善**，present 链路可以排除；
+- 关闭 P1 反而更慢（2 FPS），说明"重传带宽"不是主因。
+
+### 3.2 异步回放时间线（`DM_NVN_ASYNC=1`）
+
+```
+[timeline] per frame: game gap 0.4 ms, queue delay 0.2, replay 80.5, GPU tail 375.3; 2.0 jobs
+```
+
+| 段 | 时间 | 含义 |
+|---|---|---|
+| game gap | **0.4 ms** | 游戏逻辑本身几乎不花时间 |
+| queue delay | **0.2 ms** | 入队到回放开始 |
+| replay | **80.5 ms** | 命令翻译 |
+| GPU tail | **375.3 ms** | 回放结束 → 栅栏完成 |
+
+GPU 渲染通道 p50 **6.7 ms**（timestamp 查询）。
+
+### 3.3 SyncWait 调用级追踪（`DM_NVN_SEQ=6`）
+
+```
+fence  0x734a02cba0
+syncwait ... kind 1 timeout=inf waited 378.64 ms -> 1
+syncwait ... kind 1 timeout=inf waited 336.14 ms -> 1
+syncwait ... kind 1 timeout=inf waited 329.73 ms -> 1
+```
+
+⇒ **不是超时被吞**（`-> 1` = 条件满足），是栅栏真的 ~330–380ms 后才完成。
+
+### 3.4 翻译层耗时前 5（近 300 帧累计）
+
+```
+SyncWait             111,867 ms   （≈373 ms/帧）
+WindowAcquireTexture  24,241 ms   （≈ 81 ms/帧）
+QueueSubmitCommands      127 ms
+CommandBufferAddCommandMemory 112 ms
+```
+
+### 3.5 其它现场数据
+
+- 写保护缺页累计 **40,269,956** 次（2 FPS 时约 8.7 万次/帧）；
+- 命令内存借用 1024 次（后期会话只有 1 次，属噪声）；
+- 进程 RSS 2.5GB，CPU 约 111%（单核）；
+- 设备日志确认：`Mali-G925-Immortalis MC12, Vulkan 1.3, driver 0xc401000;
+  timeline semaphores yes, BC no (decoded on the CPU), ASTC yes, geometry shaders yes`。
+
+---
+
+## 4. 已排除 / 已确认
+
+| 假设 | 实验 | 结论 |
+|---|---|---|
+| BC 纹理不可用 | CPU 解压兜底（bcdec） | ✅ 工作正常，画面正确 |
+| present 模式/图像数 | MAILBOX + 6 图像 | ❌ 无影响 |
+| 脏页缺页是主因 | DM_NO_DIRTY / passive=0 | ❌ 只占约 1/4，且不能关 |
+| 重传带宽 | passive=0 vs 500 | ❌ 关掉更慢 |
+| 游戏逻辑慢 | 时间线 game gap | ❌ 0.4ms |
+| GPU 渲染慢 | timestamp | ❌ 6.7ms |
+| 命令翻译慢 | replay 80ms | ❌ 只占 ~20% |
+
+## 5. 剩余假设（未验证）
+
+1. **GPU 上还有渲染通道之外的活**：拷贝、纹理上传、barrier、清屏等不计入
+   pass timestamp。需要给每个提交打 GPU 级时间戳才能确认。
+2. **Mali 驱动的提交延迟**：`vkQueueSubmit` 返回后 GPU 迟迟不启动/不置位栅栏。
+   验证方式只有两种：
+   - Arm Streamline / AGI 抓 GPU 时间线；
+   - 换 Adreno 设备（nx2android 的 Z-A profile 在 Adreno 830 上已验证 30 FPS）。
+
+## 6. 建议的下一步
+
+1. **Adreno 对照**（最省事、信息量最大）：同一份 APK/数据装到 Adreno 设备，
+   跑同样的位置。若 30 FPS ⇒ 问题在 Mali 驱动交互；若也慢 ⇒ 是 v0/派生 profile。
+2. **拿 2.0.2 更新包**再打一次（profile 真正调试过的版本）。
+3. 有 GPU 剖面工具时，按提交打时间戳，定位 GPU tail 的 375ms。
+
+---
+
+## 7. 产物与复现
+
+| 文件 | 说明 |
+|---|---|
+| `D:/feiniukexinhome/Code/nx2android` | 上游源码 + 本文补丁 |
+| `D:/feiniukexinhome/Code/za-port/PokMonLegendsZA.apk` | 移植 APK（1.9MB） |
+| `D:/feiniukexinhome/Code/za-port/PokMonLegendsZA-data/` | 数据包（5.1GB） |
+| `work/tmp/za_port_screen3.png` | 外观选择页截图（3D 头像正常） |
+| `work/tmp/za_port_fps.png` | 2 FPS 内置显示 |
+| `work/tmp/plza_async2.txt` | 时间线日志（GPU tail 375ms） |
+| `work/tmp/plza_seq.txt` | SyncWait 追踪日志 |
+
+平板上的最佳配置（已恢复）：
+
+```
+DM_LANG=en-US
+DM_SHARED_FONT_EXT=/sdcard/Android/data/org.nx2a.plza/files/nintendo_ext.ttf
+DM_VK_MT_REPLAY=1
+DM_DIRTY_PASSIVE=500
+```

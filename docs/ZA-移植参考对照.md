@@ -45,6 +45,12 @@ RenderEngine: renderer : Mali-G925-Immortalis MC12
 
 ⇒ 走 nx2android 这条路必须先换 Adreno 设备。
 
+> **实测补充（2026-11-04）**：这条限制比 README 说的宽——nx2android 自带的
+> `!V.has_bc` 分支会用 vendored bcdec 在 CPU 上解压，实测在 Mali-G925 上
+> **画面完全正确**（语言选择、外观选择、3D 角色头像）。真正的限制是**性能**：
+> 菜单里只有 2–3 FPS，瓶颈落在每帧 `SyncWait` 等栅栏 330–380ms（GPU 渲染仅 6.7ms）。
+> 详见 [ZA-Mali-实测报告.md](ZA-Mali-实测报告.md)。
+
 ---
 
 ## 2. Z-A 的客观事实（来自 nxnative 的同游戏页与 profile）
