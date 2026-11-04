@@ -24,7 +24,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 PKG = "org.pokelegza.android.port"
-DEV = os.environ.get("ZA_DEVICE", "SCXOHA8TCUN7RWJ7")
+DEV = os.environ.get("ZA_DEVICE", "")
 ACT = PKG + "/android.app.NativeActivity"
 MARKS = ["takeover", "quarantine", "quar-free", "nop-fill", "null-dangle", "kill-thread",
          "lqgrow", "fakewake", "no-lqgrow", "no-nullrecover", "tlsdepth0", "handoff28",

@@ -9,7 +9,7 @@
     python app/tools/smoke_test.py                # 装 + 跑 + 检查 + 存档
     python app/tools/smoke_test.py --no-install   # 不重装（用已装的）
     python app/tools/smoke_test.py --seconds 30   # 跑多久
-    python app/tools/smoke_test.py --serial SCXOHA8TCUN7RWJ7
+    python app/tools/smoke_test.py --serial <你的设备序列号>
 
 产物:
     work/smoke/report-<时间戳>.md    本轮的人读报告

@@ -42,7 +42,7 @@
 export NX2A_HOME=D:/feiniukexinhome/Code/nx2a-home
 python -m porter port   D:/feiniukexinhome/Code/za-port --mt-replay --progress lines
 python -m porter install D:/feiniukexinhome/Code/za-port/PokMonLegendsZA-data \
-       --device SCXOHA8TCUN7RWJ7
+       --device $ZA_DEVICE
 ```
 
 首次 `adb install` 会弹 **「USB安装提示」**，必须在平板上手动点允许
