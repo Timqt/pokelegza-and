@@ -1437,7 +1437,12 @@ unsigned long za_sync_signal_addr(unsigned long long addr, int type, int val, in
     if (type != 0) {
         int nv = val + 1;
         if (type == 2) {
-            if (count <= 0) nv = nw > 0 ? val - 1 : val + 1;
+            // ★ 2026-11-04 参考 nxnative/docs/reference/threads.md（mesosphere
+            //   KAddressArbiter，Ryujinx/yuzu 一致）：type 2 且 count ≤ 0 且**有等待者**时，
+            //   新值是 value − 2，不是 − 1。我们原来写 −1（少减一个），
+            //   在「按等待数改值」的握手里会让等待方看到错误的状态。
+            //   count > 0 的分支对方文档没有给出结论，先保持原样，待查 mesosphere 源码。
+            if (count <= 0) nv = nw > 0 ? val - 2 : val + 1;
             else nv = nw == 0 ? val + 1 : (nw <= count ? val - 1 : val);
         }
         {
