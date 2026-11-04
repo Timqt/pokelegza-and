@@ -3482,6 +3482,25 @@ static unsigned long long za_get_system_tick_frequency(void) { return 19200000ul
 // 宿主符号表：客机导入的 nn::* 由我们实现的这些顶替（表在解析链的第一位）。
 // hid 初始化桩：返回 Result=0（u32 在 w0，不能用 void 函数 —— w0 会是野值）。
 static unsigned int za_hid_init_ok(void) { return 0; }
+
+// ★ 2026-11-04（Z-A / Trinity）：nn::crypto::GenerateCryptographicallyRandomBytes
+//   是 Z-A 进 nnMain 后的**第一个调用**；SDK 自己的实现要走 csrng 服务的 IPC，
+//   我们没有这个服务（导入表里有名字、没有 HLE）。参考工程 nxnative 的做法是
+//   由宿主直接填字节（同一个 getentropy 熵源）。这里照做：失败时退化为
+//   一个固定填充，保证不会返回未初始化内存。
+static void za_crypto_random(void *dst, size_t n)
+{
+    unsigned char *p = (unsigned char *)dst;
+    if (!p || !n) return;
+    size_t done = 0;
+    while (done < n) {
+        long got = syscall(SYS_getrandom, p + done, n - done, 0);
+        if (got <= 0) break;
+        done += (size_t)got;
+    }
+    if (done < n)      // 取不到熵：退化成固定填充，绝不留未初始化字节
+        for (size_t i = done; i < n; i++) p[i] = (unsigned char)(0x5a + i);
+}
 // hid 的「设置」类 API 返回 void；内部会调 detail（需要真服务），
 // 现阶段直接吞掉，避免它们把未初始化的服务错误当成致命错误 Abort。
 static void za_hid_noop(void) { }
@@ -4386,6 +4405,8 @@ static const za_host_sym_t za_host_syms[] = {
     // ⚠ 这是**临时**接管（可逆）：真正的 hid 服务/共享内存实现后要撤掉，
     //   否则 GetNpadState 之类的调用会读到未初始化的服务状态。
     { "_ZN2nn3hid14InitializeNpadEv", (void *)za_hid_init_ok },
+    // Z-A 进 nnMain 的第一个调用；宿主熵源直接填，不走 csrng 服务 IPC
+    { "_ZN2nn6crypto36GenerateCryptographicallyRandomBytesEPvm", (void *)za_crypto_random },
     { "_ZN2nn3hid21InitializeTouchScreenEii", (void *)za_hid_init_ok },
     { "_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", (void *)za_hid_init_ok },
     { "_ZN2nn3hid22SetSupportedNpadIdTypeEPKjm", (void *)za_hid_noop },
