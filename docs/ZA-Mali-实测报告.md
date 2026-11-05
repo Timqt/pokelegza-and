@@ -349,3 +349,61 @@ CONFIRM → Ready!，进入了开场场景：
 我们对 nx2android 的全部本地改动（含本次 fd 修复与诊断日志、脏页 passive、
 present 模式、porter 的 Oodle 流式落盘）导出为
 [`patches/nx2android/local-patches-2026-11-04.patch`](../patches/nx2android/local-patches-2026-11-04.patch)。
+
+---
+
+## 10. 进游戏后黑屏（2026-11-05，调查未完结）
+
+### 10.1 症状
+
+Prism Tower 开场过场（「Your train has arrived…」之后）开始，3D 世界全黑
+（文字/UI 正常），Mali 反复报 `GROUP_ERROR_FATAL`（status 恒 `0x…2c3`，
+sideband 指向同一 VA 区），帧时间 32ms → 526ms → 7.8s，FPS 变 `--`；
+`GROUP_ERROR_TIMEOUT` 随后出现，进程最终被杀。昨晚游戏以 30 FPS 跑了
+8.8 小时（菜单+列车）未触发，推进到这段过场才崩。
+
+### 10.2 关键证据（PASSDUMP 导出过场全部 96 个 pass）
+
+- **世界几何画出来了**：pass_40 能看到楼群、街道、塔的剪影，但整个场景
+  只有环境光（~1/255，max 48）——**光照项整体丢失**；
+- pass_88 是 64×64 的光斑贴图（有内容）；pass_92–95 是 UI/文字（27% 非零）；
+- ⇒ 黑屏 = 无光照的世界 + 后续合成被 GPU 崩溃反复杀掉。
+
+### 10.3 排除项（全部做了对照）
+
+| 假设 | 实验 | 结果 |
+|---|---|---|
+| 我们的 fd 修复（§9） | `DM_VK_NO_ZEROCOPY=1` 回退复制池 | **照样崩**（22 FATAL 后进程死）|
+| Transform feedback | `DM_VK_XFB=0` | 照崩（12 FATAL）|
+| Compute | 过场帧调用表 | **无 Dispatch** |
+| Conservative raster | 回放层未实现；设备有扩展但不影响 | 无关 |
+| 跨 256MB 分块绑定 | across-two-chunks 日志 | 无 |
+
+过场帧 vs 菜单帧的调用差异：`DrawElementsInstanced=22`、
+`SetConservativeRasterEnable=2`、`SetLineWidth`、`ReportCounter=26/ResetCounter=37`。
+
+### 10.4 与上游的关系
+
+- nx2android 的 Z-A profile 在 Adreno 830 上**同一过场正常**（标 playable）
+  ⇒ Mali 特有的执行崩溃；
+- 上游 issue #80（Metroid Dread 光照丢失、场景压黑）是 Adreno 上的同类
+  症状但**无 GPU fatal** —— 回放层另一个正确性问题，与我们这里 Mali 驱动崩溃不同源。
+
+### 10.5 二分工具与已知坑
+
+- `DM_VK_SKIP_OPS=<op 号>`（枚举见 `nvn_obj.h`：25=DRAW 26=DRAW_IDX
+  27=DISPATCH 34=COPY_T2B 36=COPY_T2T 49=DRAW_TF…）逐类跳过 replay；
+- 过场前**没有存档**：每次重启都要触屏走完 语言→外观→取名→Ready；
+- 触屏假手柄流程的失败模式：**overlay（虚拟手柄）初始化失败**（日志无
+  `[overlay]` 行）时所有输入落到游戏触摸屏被忽略——多见于 GPU 崩溃循环
+  强杀之后的下一次启动；重启平板可恢复，重试启动有时也可恢复；
+- MIUI 重启后可能把应用置成半安装态（`pm path` 有、Activity 不存在），
+  需 `adb install -r` 并在平板上点「USB安装提示」。
+
+### 10.6 待办
+
+1. SKIP_OPS 二分：先 25,26,49（跳 draw），再 34/36/31（跳纹理拷贝），
+   再 5/37（跳计数器）——定位杀 GPU 的 op 类；
+2. 定位后针对性修（改 replay 或绕开该状态）；
+3. 拿 2.0.2 更新包重打（profile 真正调试过的版本）；
+4. Adreno 设备对照。
