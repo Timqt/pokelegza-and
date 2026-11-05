@@ -397,8 +397,11 @@ sideband 指向同一 VA 区），帧时间 32ms → 526ms → 7.8s，FPS 变 `-
 - 触屏假手柄流程的失败模式：**overlay（虚拟手柄）初始化失败**（日志无
   `[overlay]` 行）时所有输入落到游戏触摸屏被忽略——多见于 GPU 崩溃循环
   强杀之后的下一次启动；重启平板可恢复，重试启动有时也可恢复；
-- MIUI 重启后可能把应用置成半安装态（`pm path` 有、Activity 不存在），
-  需 `adb install -r` 并在平板上点「USB安装提示」。
+- MIUI 重启后可能把应用**禁用**（`pm path` 有、Activity 不存在、`enabled=0`）：
+  `adb shell pm enable org.nx2a.plza` 直接恢复，**不需要**重装 APK、不弹安装确认框；
+- 重启后 `/sdcard/Android/data/<pkg>`「整个消失」的真因是 **FBE 锁屏**：这台机器
+  全盘加密，重启后用户数据（连 `/data/media/0`）要**物理解锁一次**才挂载。
+  `pm enable` + 等解锁即可，与安装/数据包无关。
 
 ### 10.6 待办
 
