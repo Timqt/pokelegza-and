@@ -549,3 +549,52 @@ pass dump 65: 1x1 format 109 → pass_65.ppm
 
 - pass dump 支持 **R32G32B32A32_SFLOAT**，并对 **≤4 texel 的浮点目标**打印每个 texel
   （`texels: (...)`）——专门用来读曝光/统计这类微小目标。
+
+---
+
+## 13. 再往下：**场景（深度预通道 + G-buffer）一帧画都没有**（2026-11-06）
+
+### 13.1 因果链（已逐段实测）
+
+```
+场景深度预通道/G-buffer 没有 draw
+  → 深度缓冲全 0（pass dump: depth 1920x1080 format 129, values 0.000000 .. 0）
+  → 光照 pass（pass 21，format 122）读深度=+0 的 G-buffer，输出 0
+  → HDR/亮度链（format 122）全 0
+  → 自动曝光（1x1）= 0
+  → 最终合成 = 光照场景 × 0 + 自发光 = 黑底 + 自发光
+```
+
+### 13.2 证据
+
+**（a）光照 pass 的输入**（`DM_VK_LOG_FS=ead6e2a32540b19a`，pass 21 = 1920×1080 format 122，1 draw）：
+
+| binding | 纹理 | VkFormat |
+|---|---|---|
+| 1、2 | 1920×1080 nvn format 0x35 | **129 = 深度** |
+| 3、6 | 1920×1080 nvn format 0x25 | 37 = RGBA8 |
+| 4 | 1920×1080 nvn format 0x3f | **122 = B10G11R11（HDR）** |
+| 5 | 1920×1080 nvn format 0x38 | 43 = RGBA8_SRGB |
+| 7 | 1920×1080 nvn format 0x29 | 97 = RGBA16F |
+
+**（b）每个 pass 的 draw 数**（`DM_VK_TRACE_PASS=-2`）：
+场景 pass（`pass 4` format 122+深度、`pass 16` format 43+深度）**都是 0 draw**；
+有 draw 的全是后处理链（深度降采样 6–15、17、21、22…59）。
+
+**（c）子命令缓冲是空的**（`DM_NVN_ERLOG=1`）：每帧 333 个 `EndRecording` 的 `used` 都是 **8**
+（只有一条 END）；`DM_NVN_BRLOG=1` 显示 `BeginRecording` 时命令内存是 **全 0**（游戏没有直接预写）。
+`DM_VK_TRACE_CALLS=1` 显示这些 CALL 目标里只有 `BIND_STATE`/`BIND_TEX1`/`BIND_UBO`，**没有 DRAW**。
+
+**（d）回放确实看到了 draw**（`ops at submission N`）：DRAW 92 + DRAW_IDX 23 + CALL 535 + SET_RT 103 + CLEAR_COLOR 50
+——即后处理链的 draw；场景的 draw 不在其中。
+
+**（e）conditional render 不是原因**（`DM_VK_TRACE_RC=1`）：全部 `mode 1, values 0/0, known 0/0 -> skip 0`
+（未知 → 继续画）。打开 profile 的 `render_cond on` 也没有改变画面。
+
+### 13.3 下一步
+
+1. 场景的 draw 到底记录到哪里去了——`CommandBufferDrawArrays` 每帧只有 7+1+1 次（后处理），
+   而场景应有几百次；
+2. 检查主机对「游戏直接写命令内存 / 预录制命令缓冲」的处理（Z-A 的引擎可能在 `AddCommandMemory`
+   的环里自己写命令，而主机的 `cmd_alloc` 把 END 写在段首，**可能正好覆盖掉游戏预写的命令**）；
+3. 拿 2.0.2 更新包重打；Adreno 对照。
