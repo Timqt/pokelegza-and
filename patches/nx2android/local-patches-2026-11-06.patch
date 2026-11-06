@@ -1,0 +1,32 @@
+diff --git a/nxnative/dm/android/gfx_vk_exec.c b/nxnative/dm/android/gfx_vk_exec.c
+index 4c148f7..50bde74 100644
+--- a/nxnative/dm/android/gfx_vk_exec.c
++++ b/nxnative/dm/android/gfx_vk_exec.c
+@@ -2118,6 +2118,13 @@ static void copy_t2t(const p_copy_t2t *c) {
+     vk_end_pass();
+     vkimg_t *s = vk_tex(c->src), *d = vk_tex(c->dst);
+     if (!s || !d) return;
++    { static int cl = -1; if (cl < 0) { const char *e = getenv("DM_VK_TRACE_COPY"); cl = e && atoi(e); } static uint64_t nc; if (cl && nc++ < 40) VKLOG("COPY_T2T src %#llx fmt %d aspect %d %ux%u -> dst %#llx fmt %d aspect %d %ux%u", (unsigned long long)c->src, s->fmt, (int)s->aspect, s->w, s->h, (unsigned long long)c->dst, d->fmt, (int)d->aspect, d->w, d->h); }
++    {   // DM_VK_TRACE_COPY=1: depth<->colour blits. Vulkan cannot express these and the host skips them (Z-A's 2D engine blits D24S8 depth into a BGRA8 surface, ScarletNX #444)
++        static int ldc = -1; if (ldc < 0) { const char *e = getenv("DM_VK_TRACE_COPY"); ldc = e && atoi(e); }
++        int sdep = (s->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
++        int ddep = (d->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)) != 0;
++        if (ldc && sdep != ddep) { static uint64_t ndc; if (ndc++ < 60) VKLOG("COPY_DEPTH_COLOR src fmt %d aspect %d %ux%u -> dst fmt %d aspect %d %ux%u", s->fmt, (int)s->aspect, s->w, s->h, d->fmt, (int)d->aspect, d->w, d->h); }
++    }
+     vk_watch(s, "copy source"); vk_watch(d, "copy destination");
+     VkCommandBuffer cb = vk_cmd(); vk_tex_prepare(cb, s); vk_tex_prepare(cb, d); vk_img_barrier_all(cb);
+     VkImageSubresourceLayers ss = sub_of(s, &c->sv, c->has_sv, c->sr.zoffset), ds = sub_of(d, &c->dv, c->has_dv, c->dr.zoffset);
+@@ -2304,7 +2311,12 @@ static void exec_ops(const uint8_t *p) {
+         case OP_VIEWPORTS: { const p_viewports *v = (const p_viewports *)a; for (int i = 0; i < v->n && v->first + i < 16; i++) memcpy(S.vp[v->first + i], v->v[i], 16); break; }
+         case OP_SCISSOR: S.sc = *(const p_scissor *)a; S.sc_set = 1; break;
+         case OP_DEPTH_RANGE: { const p_depth_range *d = (const p_depth_range *)a; S.dnear = d->n; S.dfar = d->f; break; }
+-        case OP_BIND_PROGRAM: bind_program((const p_bind_program *)a); break;
++        case OP_BIND_PROGRAM: { const p_bind_program *bp = (const p_bind_program *)a; bind_program(bp);
++            {   // DM_VK_TRACE_PROG=1 (live): the fragment/vertex shader key of every program bind, by pass — to name a pass's shader
++                static int lb = -1; if (lb < 0) { const char *e = getenv("DM_VK_TRACE_PROG"); lb = e && atoi(e); }
++                static uint64_t np; if (lb && np++ < 3000) VKLOG("PROG pass %d frag %016llx vert %016llx", g_sub_pass - 1,
++                    S.sh[1] ? (unsigned long long)S.sh[1]->key : 0, S.sh[0] ? (unsigned long long)S.sh[0]->key : 0); }
++            break; }
+         case OP_BIND_STATE: { const p_bind_state *s = (const p_bind_state *)a;
+             switch (s->kind) {
+             case 0: { blend_st b; memcpy(&b, s->bytes, sizeof b); if (b.target < 8) S.blend[b.target] = b; break; }

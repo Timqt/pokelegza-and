@@ -667,3 +667,81 @@ pass dump 03: depth 1024x1024 format 126, values 0.000000 .. 0
 - 每帧 333 个录音、340 次 CALL，但 API 只有 9 次 draw——**录音和 draw 对不上**；
 - 最可疑的是主机对「子命令缓冲 / 命令内存环」的处理（`cmd_alloc` 的 END 位置、
   `AddCommandMemory` 的 0x400 小块、host-lent 段），需要拿一个能正常画场景的游戏做对照。
+
+---
+
+## 16. 重新评估（2026-11-06 晚）：§13–§15 的因果链**只适用于标题屏**
+
+§12–§15 把「黑屏」一路追到「场景（深度预通道）的 draw 没有进入回放」。把过场帧的
+pass dump 重新对一遍后，这条链在过场里**不成立**：
+
+| 事实 | 过场帧实测 |
+|---|---|
+| 场景**画出来了** | `pass 161` 的 1920×1080 **format 43** 目标 = 完整光照好的车站（`work/tmp/pd_cut/pass_162.png`）；`pass 210` 的 **format 122** = 完整黄昏光照场景（`work/tmp/pdl_pdlast/pass_11.png`） |
+| 深度**不是 0** | `pass 161` 深度 `0.000000 .. 0.0382659473`（标题屏的同一位置才是 `.. 0`） |
+| HDR **有内容** | `pass 171/173` 的 format 122 mean 0.10/0.13、max 2.81；过场每帧 874 draws + 3 dispatches |
+| 2D UI 正常 | 标题 logo / PRESS A / 字幕都在（2D engine 的 pass 不走过场那条链） |
+
+**决定性的新证据**：把过场截图（`ab_trace.png` / `ab_norobust.png`）增益 40–100 倍后，
+**整个场景都在**（站棚拱、列车、站台、地面纹理），只是大约 **1–2% 亮度**。
+场景缓冲自身 mean 是 0.12–0.40，屏幕只有 0.007–0.028。
+
+⇒ 不是「没画」，也不是「光照/HDR 为 0」，而是**最后 3D 合成那一步把画面乘了一个 ~0.02 的系数**。
+
+### 16.1 循环错在哪
+
+- 「曝光 = 0」是在**标题屏**测的：`pass 65` 的 1×1 format 109，15 次全是 `(0 0 0 0)`。
+- 标题屏的链是：`pass 4`（fmt 122 + 深度）**一帧画都没有** → fmt 122 降采样链全 0 → 曝光 0 → 黑。
+- 但过场的场景 pass 是 **`pass 161`（fmt 43 + 深度）**，它画了、也写了深度；过场的 fmt 122 也有内容。
+  **标题屏那条链套不到过场上。**
+- §14 已经更正过一次（子命令缓冲其实不空），但结论仍顺着「场景 draw 缺失」往下走——
+  这就是循环：一直在解释标题屏为什么黑，而过场黑是另一条路径。
+
+### 16.2 现在最该做的一件事
+
+找到**写出呈现缓冲的那个 pass**（每帧最后一个），dump 它的颜色目标 + 输入绑定：
+
+1. 它读的是场景缓冲（fmt 43/122），还是某个后处理缓冲（bloom / 高通）？
+2. 那个 ~0.02 的乘数是纹理还是 uniform，值是多少？
+3. 过场里**没有 1×1 曝光 pass**，所以这个乘数大概率是 **compute dispatch** 算的
+   （过场每帧 3 个 DISPATCH）——去 dump 那 3 个 dispatch 的输出缓冲。
+
+（顺带：过场深度的最大值 0.0382 与这个 ~0.02 的系数量级接近，是巧合还是有关，
+值得在实验里一并看。）
+
+---
+
+## 17. 2.0.2 更新包已入库并完成移植（2026-11-06）
+
+用户提供了 `Pokémon Legends Z-A v2.0.2 [0100F43008C44000][v393216][UPD].nsz`（1.87 GB，
+`D:\BaiduNetdiskDownload`）。porter 的 `inspect` 确认：
+
+```
+base: za.nsp
+update v393216: …[v393216][UPD].nsz
+packs v393216 (versions in the folder: v0, v393216)
+Android: playable, tested on v393216 Lenovo Legion Y700 TB322FC (Snapdragon 8 Elite, Adreno 830, Android 16)
+```
+
+### 17.1 构建结果（2026-11-06 13:44–13:59，APK 17:32 重打包）
+
+| 项 | 值 |
+|---|---|
+| main build id | `b1f12fd919eae86ab8a978317677e64b`（**与 profile 注册的受测构建一致**，v0 的 7222e13e… 才有「无补丁」警告） |
+| sdk build id | `df7a3960c74c3a4803f826c587153252` |
+| Oodle | 223,018 records，7206 MB，0 failed（游戏自带解码器在设备上跑） |
+| 着色器 | 28,603（compute 125 / pixel 16845 / vertex 11633）→ `shaders.dmsv` 315.9 MB |
+| `libdmhost.so` | 1723 KB（141 sources, 0 failed） |
+| APK | 2,076,037 bytes，signer SHA-256 `1c19e552…`（= `nx2a-home/signing-key.json`，与设备上现有数据同签名） |
+| 数据包 | `PokMonLegendsZA-data`：v393216 / display 2.0.2 / 6,438,292,639 bytes（RomFS 5.6 GB + mods 113 MB + shaders 316 MB） |
+
+> ⚠️ 打包必须用 `NX2A_HOME` 里那把 key（`D:/feiniukexinhome/Code/nx2a-home/signing-key.json`）；
+> 用 `%APPDATA%\nx2android\signing-key.json` 会新建 key → 签名变化 → `install -r` 报
+> `UPDATE_INCOMPATIBLE`，只能卸载（连带删设备上的数据）。
+
+### 17.2 设备现状
+
+- 目标平板 `SCXOHA8TCUN7RWJ7`（Mali-G925）**不在 adb 上**。
+- 在册的三台都是 **MuMu 模拟器**（x86_64 + Houdini/arm64 转译，虚拟 Adreno 640，Android 15，6 GB RAM），
+  游戏此前未安装。
+- 已在模拟器上装 APK 并推数据（6.14 GB）做对照测试；**结果待补**。
