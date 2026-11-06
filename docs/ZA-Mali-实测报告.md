@@ -598,3 +598,54 @@ pass dump 65: 1x1 format 109 → pass_65.ppm
 2. 检查主机对「游戏直接写命令内存 / 预录制命令缓冲」的处理（Z-A 的引擎可能在 `AddCommandMemory`
    的环里自己写命令，而主机的 `cmd_alloc` 把 END 写在段首，**可能正好覆盖掉游戏预写的命令**）；
 3. 拿 2.0.2 更新包重打；Adreno 对照。
+
+---
+
+## 14. 深度确认为 0，场景 draw 不在回放里（2026-11-06 续）
+
+### 14.1 深度确实是 0（修了 pass dump 的深度读取后）
+
+pass dump 原来把 D24S8 当 RGBA 读（`else` 分支），读出来恒为 0。补上
+`D24_UNORM_S8_UINT / D32_SFLOAT / D32_SFLOAT_S8_UINT / D16_UNORM` 的解码后，
+标题屏所有深度目标仍然是 **`values 0.000000 .. 0`**：
+
+```
+pass dump 01: depth 1920x1080 format 129, values 0.000000 .. 0
+pass dump 03: depth 1024x1024 format 126, values 0.000000 .. 0
+```
+
+⇒ 深度预通道真的没写。光照 pass 读深度=0 → 输出 0，与 §13 的链一致。
+
+### 14.2 命令流的实测结构
+
+| 项 | 实测 |
+|---|---|
+| 每帧 `BeginRecording`/`EndRecording` | 333 |
+| 每帧 `CallCommands` | 340 |
+| 每个子命令缓冲的 `used` | **8**（只有一条 END）——`DM_NVN_ERLOG=1` |
+| `BeginRecording` 时命令内存内容 | **全 0**——`DM_NVN_BRLOG=1`（游戏没有直接预写） |
+| 主命令缓冲（`used 760`）的 ops | `BIND_STATE…DEPTH_CLAMP…STENCIL×6…BLEND_COLOR…END`，**没有 DRAW** |
+| 有 DRAW 的子命令缓冲 | 只有 `(10 ops) BIND_STATE×3 BIND_UBO BIND_PROGRAM DRAW BIND_STATE×2`，约 10 个 |
+| 每帧 NVN API 的 draw | `DrawArrays 7 + DrawElements 1 + DrawArraysInstanced 1` |
+| 回放看到的 draw | DRAW 92 + DRAW_IDX 23（= 后处理链） |
+
+⇒ **场景的 draw 既不在主命令缓冲、也不在子命令缓冲里**。
+
+> **2026-11-06 更正**：上面这条**是错的**——当时 `DM_NVN_ERLOG` 只记了前 80 条。把上限提到 400 后，
+> 392 条 `EndRecording` 里有 **205 条 `used > 8`**，子命令缓冲**是有内容的**：
+> `0x77ccb4a400 (used 344) ops BIND_STATE×3 BIND_TEX1×2 BIND_PROGRAM DRAW BIND_STATE×2`、
+> `0x77ccb47800 (used 360) ops REPORT_COUNTER BIND_STATE×2 BIND_VATTR BIND_VSTREAM BIND_VBUF BIND_PROGRAM DRAW_IDX BARRIER …`。
+> `DM_VK_TRACE_CALLS=1`（带 pass 号）显示这些带 DRAW 的子命令缓冲被 **pass 0、6–15、17、20、21…** 调用。
+> 即：**场景的 draw 确实存在**，被后处理链的 pass 调用；而场景自己的 pass（4、16）既不带 draw 也不 CALL。
+> 这条线索还没解释清楚（pass 归属为何错位），但是目前最可疑的地方。
+
+### 14.3 结论
+
+断点已经定到最底层：**场景（深度预通道 + G-buffer）的 draw 没有进入主机的回放**，
+于是深度=0 → 光照=0 → HDR=0 → 曝光=0 → 画面黑。
+光照、HDR、曝光、合成这几级本身都是好的（它们忠实地把「没画的场景」算成 0）。
+
+下一步只能从「游戏把场景 draw 记录到哪里去了」入手：
+- 每帧 333 个录音、340 次 CALL，但 API 只有 9 次 draw——**录音和 draw 对不上**；
+- 最可疑的是主机对「子命令缓冲 / 命令内存环」的处理（`cmd_alloc` 的 END 位置、
+  `AddCommandMemory` 的 0x400 小块、host-lent 段），需要拿一个能正常画场景的游戏做对照。
