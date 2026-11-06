@@ -739,9 +739,17 @@ Android: playable, tested on v393216 Lenovo Legion Y700 TB322FC (Snapdragon 8 El
 > 用 `%APPDATA%\nx2android\signing-key.json` 会新建 key → 签名变化 → `install -r` 报
 > `UPDATE_INCOMPATIBLE`，只能卸载（连带删设备上的数据）。
 
-### 17.2 设备现状
+### 17.2 设备现状与模拟器对照（2026-11-06 晚）
 
 - 目标平板 `SCXOHA8TCUN7RWJ7`（Mali-G925）**不在 adb 上**。
 - 在册的三台都是 **MuMu 模拟器**（x86_64 + Houdini/arm64 转译，虚拟 Adreno 640，Android 15，6 GB RAM），
   游戏此前未安装。
-- 已在模拟器上装 APK 并推数据（6.14 GB）做对照测试；**结果待补**。
+- 已在模拟器上装 APK + 推数据（6.14 GB，2 分 34 秒）做对照：
+
+| 项 | 结果 |
+|---|---|
+| 运行 | **跑起来了**：30 FPS（帧 p50 33.4 ms）、swapchain 1920×1080 format 37 / 3 图 / fifo、footprint 1073 MiB、无 GROUP_ERROR、无崩溃（frame 2100+） |
+| 画面 | **验证不了**：pass dump 的 8 个 1920×1080 目标**全部读回纯黑**（mean 0.00000）；屏幕上只有宿主画的虚拟手柄，没有游戏内容（连 2D UI 都不出） |
+
+⇒ 虚拟 Adreno 640 + Houdini 这条链路**不能用来判断画面是否正确**。
+2.0.2 的**构建与运行**没问题，但**黑屏是否修复只能在 Mali 平板上验证**。
