@@ -410,3 +410,82 @@ sideband 指向同一 VA 区），帧时间 32ms → 526ms → 7.8s，FPS 变 `-
 2. 定位后针对性修（改 replay 或绕开该状态）；
 3. 拿 2.0.2 更新包重打（profile 真正调试过的版本）；
 4. Adreno 设备对照。
+
+---
+
+## 11. 装机 APK 一直是旧的：合并后**编译失败**，所有 11-05 上游修复都没进过机器（2026-11-06）
+
+### 11.1 现象
+
+设备上装的 APK（`lastUpdateTime=2026-10-05 23:51`，md5 `e2e753a2…`）与
+`za-port/0100F43008C44000_build/android/host/libdmhost.so`（**23:18 构建**）逐字节相同。
+用它跑整个 11-06 凌晨的实验，结论都是「旧构建」的。
+
+### 11.2 真因：两个编译错误让 23:44 / 23:51 两次重新构建都失败
+
+23:38 `git merge origin/main`（快进）把上游 11-05 的修复带进来，23:42/23:43 提交
+（`24c29ae`、`af2f420`）。之后两次 `porter port` 都失败（`port17.log` / `port18.log`）：
+
+| 文件 | 错误 | 原因 |
+|---|---|---|
+| `android/gfx_vk_exec.c:1917` | `xfb_end(...)` 少一个参数（期望 5，实到 4） | 上游 #107 把 `xfb_end` 签名加了第 5 个参数 `xf`；本地 `af2f420` 补的 indexed draw 调用点没跟上 |
+| `gfx/nvn/hle_nvn.c:487` | `NVN_TEXTURE_TARGET_CUBE` 未定义 | 本地那条未提交的 Z-A 补丁写错了枚举名，应为 `NVN_TEXTURE_TARGET_CUBEMAP` |
+
+两处都已修好（`gfx_vk_exec.c` 补 `xf`；`hle_nvn.c` 改枚举名），重编 **141 sources, 0 failed**，
+`.so` 从 1606 KB → 1717 KB。用 `NX2A_HOME` 里那把签名 key（`nx2a-home/signing-key.json`，
+SHA-256 `1c19e552…`）重打包，`versionCode` 递增到 3，`install -r` 成功。
+
+> ⚠️ 打包命令要么带 `NX2A_HOME`，要么把 key 路径写成 `D:/feiniukexinhome/Code/nx2a-home/signing-key.json`；
+> 用 `%APPDATA%\nx2android\signing-key.json` 会**新建一把 key**，签名变化 → `install -r` 报
+> `UPDATE_INCOMPATIBLE`，只能卸载（连带删掉 5GB 数据）。
+
+### 11.3 新构建实测
+
+| 指标 | 旧构建（23:18） | 新构建（11-06 重编） |
+|---|---|---|
+| 过场能跑到的 frame | ~700 就崩 | **3400+**（GPU 不再轻易挂死） |
+| `GROUP_ERROR_FATAL` | 有 | 0 |
+| `GROUP_ERROR_TIMEOUT` | — | robust ON 时 3–6 次/场 |
+| 世界光照 | 黑（只自发光） | **仍然黑（只自发光）** |
+
+### 11.4 顺带查清的：那条 Z-A cubemap 补丁的前提是错的
+
+未提交的 `hle_nvn.c` 补丁注释称「Z-A 的 light-probe cube maps 带 `NVN_TEXTURE_FLAGS_IMAGE`
+且是 CUBEMAP target，所以被上游 #80 的 IMAGE 排除挡掉」。实测（新加的 `DM_NVN_TEXDIAG=1`，
+见 §11.5）**不是这样**：
+
+```
+TEXDIAG ser=24954 tgt=4 flags=0x4 fmt=0x29 32x32x6  lv1  poolflags=0x21 virt=0 layout=1 pkg=0 data=1
+TEXDIAG ser=24955 tgt=4 flags=0x4 fmt=0x29 128x128x6 lv8 poolflags=0x21 virt=0 layout=1 pkg=0 data=1
+TEXDIAG ser=10   tgt=8 flags=0x8 fmt=0x27 4x4x1   lv1  poolflags=0xa1 virt=0 layout=0 pkg=0 data=0
+```
+
+- Z-A 的「cube map」是 **`NVN_TEXTURE_TARGET_2D_ARRAY`（tgt=4）6 层**，不是 `CUBEMAP`（tgt=8）；
+- 它们带 `IMAGE`（0x4）**且 `has_layout=1`**，走的是 Vulkan 后端的 `packaged_tex()` 上传路径
+  （`gfx_vk_tex.c`），**本来就会上传**——上游 #80 那条（还有本地那条收窄）在 Vulkan 后端根本轮不到；
+- 真的 CUBEMAP（tgt=8）那个是 4x4、`COMPRESSIBLE`、`data=0`，不是光照 probe。
+
+⇒ 「环境光 cubemap 没上传」这个假设**排除**。
+
+### 11.5 新增诊断开关：`DM_NVN_TEXDIAG=1`
+
+`nvnTextureInitialize` 里对「CPU_NO_ACCESS 池 或 cube map」的每条纹理打印
+`tgt/flags/fmt/poolflags/virt/layout/pkg/data/size`（最多 64 条）。
+
+> 为什么不能用现成的 `DM_NVN_LOG`：它在 `nvn_init_slots()` 里读，而那是 **library constructor**，
+> 跑在 `env.txt` 加载**之前**，所以 Android 上 OLOG 一行都不会出。
+
+### 11.6 robustBufferAccess 与 GPU 挂死
+
+- robust **ON**（当前默认）：`GROUP_ERROR_TIMEOUT` 3–6 次/场，画面仍黑；
+- robust **OFF**（`DM_VK_NO_ROBUST=1`）：**GPU 错误 0**，画面**仍然黑**。
+
+⇒ robust 不是光照黑的原因（但它确实是 GPU 挂死的原因）。**实验台请用 `DM_VK_NO_ROBUST=1`**。
+
+### 11.7 待办（更新）
+
+1. 用 robust OFF 做光照对照实验（不再有 GPU 挂死）；
+2. `DM_VK_PASSDUMP` + `DM_VK_PASSDUMP_TARGET=n` 逐 colour target 找光照 pass，
+   确认是「没写」还是「写了没被读」；
+3. 查灯光列表 buffer（compute 裁剪的输出）——直接光全没，最可能是它；
+4. 拿 2.0.2 更新包重打；Adreno 设备对照。
